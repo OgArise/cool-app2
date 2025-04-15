@@ -18,3 +18,5 @@ uvicorn[standard]
 
 # Optional CLI Interface
 typer[all]
+
+streamlit
