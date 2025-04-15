@@ -20,3 +20,4 @@ uvicorn[standard]
 typer[all]
 
 streamlit
+pandas # Add this for Streamlit DataFrame display
