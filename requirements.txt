@@ -1,6 +1,20 @@
-fastapi
-uvicorn[standard]
+# Core
 python-dotenv
 requests
+
+# Search/Scraping
 google-api-python-client
-google-search-results
+google-search-results # SerpApi client
+
+# LLM / NLP
+openai # Or other LLM client library (anthropic, cohere, etc.)
+
+# Knowledge Graph
+neo4j # Official Neo4j driver
+
+# Optional API Interface
+fastapi
+uvicorn[standard]
+
+# Optional CLI Interface
+typer[all]
