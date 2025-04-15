@@ -21,3 +21,7 @@ typer[all]
 
 streamlit
 pandas # Add this for Streamlit DataFrame display
+
+# Add Google auth libraries:
+google-auth-httplib2
+google-auth-oauthlib
