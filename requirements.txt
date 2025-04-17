@@ -28,3 +28,5 @@ google-auth-oauthlib
 
 # Add Google Generative AI library:
 google-generativeai
+
+pycountry
