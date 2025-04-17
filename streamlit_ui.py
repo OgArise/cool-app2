@@ -7,6 +7,10 @@ import os
 import requests
 import pandas as pd # Keep for table display
 
+# ===> ADD THIS IMPORT <===
+import config # Import config to get default model names
+# ===> END ADDITION <===
+
 # Attempt to import pycountry for country list
 try:
     import pycountry
@@ -16,33 +20,43 @@ except ImportError:
     pycountry_available = False
 
 # --- Configuration ---
-BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000")
+BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000") # Default to local for testing
 ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
 
-# --- LLM Options --- (Keep this section as is)
-LLM_PROVIDERS = { "Google AI": "google_ai", "OpenAI": "openai", "OpenRouter (via OpenAI SDK)": "openrouter" }
-DEFAULT_MODELS = { "google_ai": config.DEFAULT_GOOGLE_AI_MODEL, "openai": config.DEFAULT_OPENAI_MODEL, "openrouter": config.DEFAULT_OPENROUTER_MODEL }
-PROVIDER_LINKS = { "Google AI": "...", "OpenAI": "...", "OpenRouter": "..." } # Keep links
+# --- LLM Options ---
+LLM_PROVIDERS = {
+    "Google AI": "google_ai",
+    "OpenAI": "openai",
+    "OpenRouter (via OpenAI SDK)": "openrouter"
+}
+# Use the imported config for defaults
+DEFAULT_MODELS = {
+    "google_ai": config.DEFAULT_GOOGLE_AI_MODEL,
+    "openai": config.DEFAULT_OPENAI_MODEL,
+    "openrouter": config.DEFAULT_OPENROUTER_MODEL
+}
+PROVIDER_LINKS = {
+    "Google AI": "https://aistudio.google.com/app/apikey",
+    "OpenAI": "https://platform.openai.com/api-keys",
+    "OpenRouter": "https://openrouter.ai/keys"
+}
 
 # --- Country List Generation ---
 def get_country_options():
     options = {"Global": "global"} # Start with Global option
     if pycountry_available:
         try:
-            # Get countries and sort alphabetically by name
             countries = sorted([(country.name, country.alpha_2.lower()) for country in pycountry.countries])
-            for name, code in countries:
-                 options[name] = code
+            for name, code in countries: options[name] = code
         except Exception as e:
              print(f"Error loading countries from pycountry: {e}. Using basic list.")
-             options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"}) # Fallback basic list
+             options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"}) # Fallback
     else:
-         # Fallback basic list if pycountry not installed
-         options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"})
+         options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"}) # Fallback
     return options
 
-COUNTRY_OPTIONS = get_country_options() # Dictionary of Display Name -> Code
-COUNTRY_DISPLAY_NAMES = list(COUNTRY_OPTIONS.keys()) # List of names for selectbox
+COUNTRY_OPTIONS = get_country_options()
+COUNTRY_DISPLAY_NAMES = list(COUNTRY_OPTIONS.keys())
 
 # --- Streamlit App Layout ---
 st.set_page_config(page_title="AI Analyst Agent", layout="wide")
@@ -59,21 +73,10 @@ selected_provider_name = st.sidebar.selectbox( "Select LLM Provider", options=li
 selected_provider_key = LLM_PROVIDERS[selected_provider_name]
 
 default_model = DEFAULT_MODELS.get(selected_provider_key, "")
-# Use session state to remember last model used per provider
 session_key_model = f"{selected_provider_key}_model"
-if session_key_model not in st.session_state:
-    st.session_state[session_key_model] = default_model
-
-llm_model = st.sidebar.text_input(
-    f"Model Name for {selected_provider_name}",
-    key=session_key_model, # Link to session state
-    help=f"e.g., {default_model}"
-)
-
-# ===> ADDED NOTE <===
+if session_key_model not in st.session_state: st.session_state[session_key_model] = default_model
+llm_model = st.sidebar.text_input( f"Model Name for {selected_provider_name}", key=session_key_model, help=f"e.g., {default_model}" )
 st.sidebar.caption("✨ Tip: Google AI & OpenRouter offer free tier models. OpenAI requires paid credits.")
-# ===> END NOTE <===
-
 
 # --- Main Input Form ---
 with st.form("analysis_form"):
@@ -84,17 +87,8 @@ with st.form("analysis_form"):
         global_search_context = st.text_area("Global Search Context", "global financial news and legal filings for tax evasion", height=100)
         specific_search_context = st.text_area("Specific Search Context", "Search for specific company tax evasion examples and regulatory actions", height=100)
     with col2:
-        # ===> UPDATED COUNTRY SELECTBOX <===
-        # Default to Global
-        default_country_index = 0 # Index of "Global"
-        selected_country_name = st.selectbox(
-            "Specific Country Search Target",
-            options=COUNTRY_DISPLAY_NAMES, # Use the generated list including "Global"
-            index=default_country_index,
-            help="Select 'Global' or a specific country for the targeted search."
-        )
-        # ===> END UPDATE <===
-
+        default_country_index = 0 # Global
+        selected_country_name = st.selectbox( "Specific Country Search Target", options=COUNTRY_DISPLAY_NAMES, index=default_country_index, help="Select 'Global' or a specific country." )
         max_global_results = st.number_input("Max Global Results", min_value=1, max_value=50, value=5)
         max_specific_results = st.number_input("Max Specific Results", min_value=1, max_value=50, value=5)
 
@@ -111,20 +105,13 @@ if submitted:
         progress_bar = st.progress(0); status_text = st.empty()
         try:
             status_text.text("Sending request..."); progress_bar.progress(10)
-
-            # ===> Get Country Code (Handle "Global") <===
-            # If 'Global' is selected, send a default code like 'us' or let backend handle it.
-            # Sending 'us' allows the specific search step to still run, just broadly.
-            # Alternatively, you could modify the backend to *skip* Step 3 if 'global' is received.
-            specific_country_code_to_send = COUNTRY_OPTIONS.get(selected_country_name, "us") # Default to 'us' if global or error
+            specific_country_code_to_send = COUNTRY_OPTIONS.get(selected_country_name, "us")
             print(f"Selected Country: {selected_country_name}, Sending Code: {specific_country_code_to_send}")
-            # ===> END CHANGE <===
-
             payload = {
                 "query": initial_query,
                 "global_context": global_search_context,
                 "specific_context": specific_search_context,
-                "specific_country": specific_country_code_to_send, # Send the code
+                "specific_country": specific_country_code_to_send,
                 "max_global": max_global_results,
                 "max_specific": max_specific_results,
                 "llm_provider": selected_provider_key,
@@ -132,13 +119,12 @@ if submitted:
             }
 
             status_text.text("Waiting for backend analysis..."); progress_bar.progress(20)
-            response = requests.post(ANALYZE_ENDPOINT, json=payload, timeout=300) # Keep timeout
+            response = requests.post(ANALYZE_ENDPOINT, json=payload, timeout=300) # 5 min timeout
 
             progress_bar.progress(90); status_text.text("Processing response...")
 
-            # --- Process Backend Response (same as before) ---
+            # --- Process Backend Response ---
             if response.status_code == 200:
-                # ... (rest of the success display logic is the same) ...
                 results = response.json(); st.success("Analysis complete!")
                 st.subheader("Analysis Summary")
                 st.metric("LLM Used", results.get("llm_used", f"{selected_provider_name} ({llm_model})"))
@@ -154,7 +140,6 @@ if submitted:
                 with st.expander("Wayback Machine Results", expanded=False): st.json(results.get("wayback_results", []))
                 with st.expander("Full Raw Results JSON", expanded=False): st.json(results)
             else:
-                # ... (error display logic is the same) ...
                 st.error(f"Backend API request failed!"); st.metric("Status Code", response.status_code)
                 try: error_detail = response.json(); st.json(error_detail)
                 except json.JSONDecodeError: st.text("Raw error response:"); st.code(response.text)
