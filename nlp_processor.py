@@ -359,6 +359,77 @@ def extract_ownership_relationships(parent_entity_name: str,
 # ===> END NEW FUNCTION <===
 
 
+# ===> NEW FUNCTION for Analysis Summary <===
+def generate_analysis_summary(extracted_data: Dict, query: str, exposures_count: int,
+                              llm_provider: str, llm_model: str) -> str:
+    """Generates a concise, easy-to-understand summary of the analysis findings."""
+    print(f"\n--- Attempting Analysis Summary via {llm_provider} (Model: {llm_model}) ---")
+    if not llm_provider or not llm_model: return "Summary generation skipped: Missing LLM config."
+
+    # Prepare context for the summary prompt
+    summary_context = f"Original Query: {query}\n\nAnalysis Findings:\n"
+    entities = extracted_data.get("entities", [])
+    risks = extracted_data.get("risks", [])
+    relationships = extracted_data.get("relationships", [])
+
+    # Include key findings in the context for the LLM
+    if entities: summary_context += f"- Key Entities Found ({len(entities)}): " + ", ".join([f"{e.get('name')} ({e.get('type')})" for e in entities[:5]]) + ("..." if len(entities)>5 else "") + "\n"
+    if risks:
+        high_risks = [r for r in risks if r.get('severity') == 'HIGH']
+        med_risks = [r for r in risks if r.get('severity') == 'MEDIUM']
+        summary_context += f"- Potential Risks ({len(risks)}): "
+        if high_risks: summary_context += f"{len(high_risks)} High Severity (e.g., '{high_risks[0].get('description')[:80]}...'); "
+        if med_risks: summary_context += f"{len(med_risks)} Medium Severity (e.g., '{med_risks[0].get('description')[:80]}...'); "
+        summary_context += "\n"
+    if relationships: summary_context += f"- Key Relationships Found ({len(relationships)}): " + "; ".join([f"{rel.get('entity1')} {rel.get('relationship_type')} {rel.get('entity2')}" for rel in relationships[:3]]) + ("..." if len(relationships)>3 else "") + "\n"
+    if exposures_count > 0: summary_context += f"- Supply Chain Exposures Identified: {exposures_count}\n"
+
+    if not any([entities, risks, relationships]):
+        return "No significant entities, risks, or relationships were extracted from the search results to summarize."
+
+    # Define the summary prompt for a general audience
+    prompt = f"""You are a professional geopolitical and financial analyst summarizing automated research findings for a general public audience.
+    Based ONLY on the summarized findings provided below, write a concise (2-4 sentences) summary highlighting the most important takeaways. Focus on the key entities involved, the nature and severity of major risks, any significant connections found, and if any supply chain exposures were noted. Make it clear, direct, and easy to understand, avoiding jargon.
+
+    {summary_context}
+
+    Generate ONLY the summary paragraph."""
+
+    try:
+        # Use the dynamic client logic (already defined in _get_llm_client_and_model)
+        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
+        raw_content = ""
+
+        print(f"Sending summary request to {llm_provider} ({model_name_used})...")
+        if client_type == "openai_compatible":
+            response = client_or_lib.chat.completions.create( model=model_name_used, messages=[{"role": "user", "content": prompt}], temperature=0.6, max_tokens=300 ) # Allow more tokens
+            raw_content = response.choices[0].message.content.strip()
+        elif client_type == "google_ai":
+            # Ensure safety settings allow potentially summarizing sensitive topics if applicable
+            safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in [ "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT", ] ]
+            generation_config = genai.types.GenerationConfig(temperature=0.6, max_output_tokens=300)
+            response = client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
+            if not response.candidates: raise ValueError(f"Google AI summary response blocked. Feedback: {response.prompt_feedback}")
+            raw_content = response.text.strip()
+        else: raise ValueError("Unknown client type")
+
+        print(f"\nRaw {llm_provider} Response (Summary):\n>>>\n{raw_content}\n<<<")
+        # Basic cleaning
+        cleaned_summary = raw_content
+        prefixes_to_remove = ["Okay, here's a summary:", "Here is a summary:", "Summary:", "Based on the findings:", "Based on the analysis:", "Here's a summary:"]
+        for prefix in prefixes_to_remove:
+             if cleaned_summary.lower().startswith(prefix.lower()): cleaned_summary = cleaned_summary[len(prefix):].strip()
+        return cleaned_summary if cleaned_summary else "LLM returned an empty summary."
+
+    except Exception as e:
+        print(f"ERROR during summary generation via {llm_provider}: {e}")
+        # If rate limited during summary, just give a simpler message
+        if "429" in str(e):
+             return "Could not generate summary due to API rate limits during final step."
+        return f"Could not generate summary due to error: {type(e).__name__}"
+# ===> END NEW FUNCTION <===
+
+
 # --- Local Testing Block ---
 if __name__ == "__main__":
    print("\n--- Running Local NLP Processor Tests ---")
