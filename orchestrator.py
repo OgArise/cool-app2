@@ -4,14 +4,15 @@ import time
 from typing import Dict, List, Any
 import traceback
 import json
-from datetime import datetime
+# ===> CORRECTED DATETIME IMPORTS <===
+from datetime import datetime, timezone # Import timezone directly
 try:
     from zoneinfo import ZoneInfo
     zoneinfo_available = True
 except ImportError:
-    from datetime import timezone # Fallback
     zoneinfo_available = False
     print("Warning: zoneinfo not available. Timestamps will be UTC.")
+# ===> END CORRECTION <===
 
 
 # Google Sheets Imports
@@ -57,7 +58,6 @@ def _get_gsheet_service():
         except Exception as e: print(f"ERROR auth GSheets: {e}"); gsheet_service = None
     return gsheet_service
 
-
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     # ... (keep as before) ...
     if not service or not SHEET_ID: return False
@@ -72,37 +72,30 @@ def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
 
 
 def _save_analysis_to_gsheet(run_results: Dict):
-    """Saves the analysis results, including summary, to Google Sheets using Mountain Time."""
+    """Saves the analysis results to Google Sheets using Mountain Time."""
     print("Attempting to save analysis results to Google Sheets...")
     service = _get_gsheet_service()
     if not service: print("Aborting save: GSheet service unavailable."); return
 
-    # --- Generate Timestamp in Mountain Time ---
+    # ===> Generate Timestamp in Mountain Time (Corrected) <===
     run_timestamp_iso = "Timestamp Error"
     try:
-        dt_utc = datetime.now(timezone.utc)
+        dt_utc = datetime.now(timezone.utc) # Use datetime.timezone.utc
         if zoneinfo_available:
             mountain_tz = ZoneInfo("America/Denver")
             dt_mt = dt_utc.astimezone(mountain_tz)
-            run_timestamp_iso = dt_mt.isoformat()
+            run_timestamp_iso = dt_mt.isoformat(timespec='seconds') # Format without microseconds
             print(f"Generated Mountain Time timestamp: {run_timestamp_iso}")
         else:
-            run_timestamp_iso = dt_utc.isoformat() # Fallback to UTC
+            run_timestamp_iso = dt_utc.isoformat(timespec='seconds') # Format without microseconds
             print(f"Using UTC timestamp (zoneinfo unavailable): {run_timestamp_iso}")
     except Exception as e:
         print(f"ERROR generating timestamp: {e}")
-        run_timestamp_iso = datetime.now().isoformat() + "_Error"
+        run_timestamp_iso = datetime.now().isoformat(timespec='seconds') + "_Error"
+    # ===> END Timestamp Generation <===
 
-
-    # --- 1. Save Run Summary (Including new Analysis Summary) ---
-    run_summary_row = [
-        run_timestamp_iso,
-        run_results.get('query'),
-        run_results.get('run_duration_seconds'),
-        run_results.get('kg_update_status'),
-        run_results.get('error'),
-        run_results.get('analysis_summary', '')[:500] # Truncate summary for sheet cell limit
-    ]
+    # --- 1. Save Run Summary ---
+    run_summary_row = [ run_timestamp_iso, run_results.get('query'), run_results.get('run_duration_seconds'), run_results.get('kg_update_status'), run_results.get('error'), run_results.get('analysis_summary', '')[:500] ]
     _append_to_gsheet(service, SHEET_NAME_RUNS, [run_summary_row])
 
     # --- 2. Save Extracted Data (Entities, Risks, Relationships) ---
@@ -117,6 +110,8 @@ def _save_analysis_to_gsheet(run_results: Dict):
     if exposures:
         exposure_rows = [ [run_timestamp_iso, exp.get('problematic_sub_affiliate'), exp.get('relationship_type'), exp.get('parent_company'), exp.get('reason_involved'), exp.get('risk_source_url'), exp.get('ownership_source_url') ] for exp in exposures if isinstance(exp, dict) and exp.get('problematic_sub_affiliate')]
         _append_to_gsheet(service, SHEET_NAME_EXPOSURES, exposure_rows)
+    # else: # Optional: Log that no exposures were saved
+        # print("No supply chain exposures found in results to save.")
 
     print("Google Sheets save process finished.")
 
@@ -134,7 +129,7 @@ def run_analysis(initial_query: str,
     results = { # Initialize results structure
         "query": initial_query, "steps": [], "llm_used": f"{llm_provider} ({llm_model})",
         "final_extracted_data": {"entities": [], "risks": [], "relationships": []},
-        "supply_chain_exposures": [], "analysis_summary": "Summary not generated.", # Init summary
+        "supply_chain_exposures": [], "analysis_summary": "Summary not generated.",
         "wayback_results": [], "kg_update_status": "not_run",
         "run_duration_seconds": 0, "error": None,
     }
@@ -170,24 +165,14 @@ def run_analysis(initial_query: str,
         # --- Step 3: Specific Country Data ---
         print(f"\n--- Running Step 3: Specific Search ({specific_query} in {specific_country_code}) ---")
         step3_start = time.time(); specific_raw_results = []; specific_search_source = 'unknown_specific'; specific_engine = 'baidu' if specific_country_code == 'cn' else 'google'; specific_lang = 'zh-CN' if specific_country_code == 'cn' else 'en'
-        # ===> CORRECTED Search Logic to use country code <===
-        if specific_engine == 'baidu' and config.SERPAPI_KEY and search_engines.serpapi_available:
-            print(f"Using SerpApi Baidu (cc={specific_country_code})...")
-            specific_raw_results = search_engines.search_via_serpapi(specific_query, engine='baidu', country_code=specific_country_code, num=max_specific_results); specific_search_source = 'serpapi_baidu'
-        elif specific_engine == 'google': # If not Baidu/cn, use Google
-            # Prioritize Google Official API if available
-            if config.GOOGLE_API_KEY_SEARCH and config.GOOGLE_CX and search_engines.google_api_client_available:
-                print(f"Using Google Official API for specific search (lr=lang_{specific_lang})...")
-                specific_raw_results = search_engines.search_google_official(specific_query, lang=specific_lang, num=max_specific_results); specific_search_source = 'google_api'
-            # Fallback to SerpApi Google
-            elif config.SERPAPI_KEY and search_engines.serpapi_available:
-                print(f"Using SerpApi Google for specific search (gl={specific_country_code}, hl={specific_lang})...")
-                specific_raw_results = search_engines.search_via_serpapi(specific_query, engine='google', country_code=specific_country_code, lang_code=specific_lang, num=max_specific_results); specific_search_source = 'serpapi_google'
+        if specific_engine == 'baidu' and config.SERPAPI_KEY and search_engines.serpapi_available: print(f"Using SerpApi Baidu (cc={specific_country_code})..."); specific_raw_results = search_engines.search_via_serpapi(specific_query, engine='baidu', country_code=specific_country_code, num=max_specific_results); specific_search_source = 'serpapi_baidu'
+        elif specific_engine == 'google':
+            if config.GOOGLE_API_KEY_SEARCH and config.GOOGLE_CX and search_engines.google_api_client_available: print(f"Using Google Official API (lr=lang_{specific_lang})..."); specific_raw_results = search_engines.search_google_official(specific_query, lang=specific_lang, num=max_specific_results); specific_search_source = 'google_api'
+            elif config.SERPAPI_KEY and search_engines.serpapi_available: print(f"Using SerpApi Google (gl={specific_country_code}, hl={specific_lang})..."); specific_raw_results = search_engines.search_via_serpapi(specific_query, engine='google', country_code=specific_country_code, lang_code=specific_lang, num=max_specific_results); specific_search_source = 'serpapi_google'
             else: print(f"Warning: No Google search engine available for specific search in {specific_country_code}.")
         else: print(f"Warning: Cannot perform Baidu search for {specific_country_code} without SerpApi key/library.")
-        # ===> END CORRECTION <===
         specific_search_results = [res for res in (search_engines.standardize_result(r, specific_search_source) for r in specific_raw_results) if res]; print(f"Found {len(specific_search_results)} standardized specific results.")
-        specific_extracted_data = nlp_processor.extract_data_from_results(specific_search_results, specific_search_context, llm_provider, llm_model); print(f"Extracted {len(specific_extracted_data.get('entities',[]))} entities, {len(specific_extracted_data.get('risks',[]))} risks specifically.")
+        specific_extracted_data = nlp_processor.extract_data_from_results(specific_search_results, specific_search_context, llm_provider, llm_model, focus_on_china=(specific_country_code == 'cn')); print(f"Extracted {len(specific_extracted_data.get('entities',[]))} entities, {len(specific_extracted_data.get('risks',[]))} risks specifically (China focus: {specific_country_code == 'cn'}).")
         results["steps"].append({"name": "Specific Search & Extraction", "duration": round(time.time() - step3_start, 2),"search_results_count": len(specific_search_results), "extracted_data": specific_extracted_data, "status": "OK"})
         results["final_extracted_data"]["entities"].extend(specific_extracted_data.get('entities',[])); results["final_extracted_data"]["risks"].extend(specific_extracted_data.get('risks',[])); results["final_extracted_data"]["relationships"].extend(specific_extracted_data.get('relationships',[]))
 
@@ -242,24 +227,15 @@ def run_analysis(initial_query: str,
         else: print("Skipping KG update: driver not available.")
         results["kg_update_status"] = kg_status_message; results["steps"].append({"name": "Knowledge Graph Update", "duration": round(time.time() - step5_start, 2), "status": results["kg_update_status"]})
 
-        # ===> Step 5.5: Generate Final Summary <===
+        # --- Step 5.5: Generate Final Summary ---
         print(f"\n--- Running Step 5.5: Generating Analysis Summary ---")
-        step5_5_start = time.time()
-        summary = "Summary generation skipped or failed."
-        # Check if there's anything worth summarizing
+        step5_5_start = time.time(); summary = "Summary generation skipped or failed."
+        # Generate summary based on final extracted data AND exposure count
         if results["final_extracted_data"]["entities"] or results["final_extracted_data"]["risks"] or results["final_extracted_data"]["relationships"] or results["supply_chain_exposures"]:
-             summary = nlp_processor.generate_analysis_summary(
-                 extracted_data=results["final_extracted_data"],
-                 query=initial_query,
-                 exposures_count=len(results["supply_chain_exposures"]), # Pass exposure count
-                 llm_provider=llm_provider,
-                 llm_model=llm_model
-             )
+             summary = nlp_processor.generate_analysis_summary( extracted_data=results["final_extracted_data"], query=initial_query, exposures_count=len(results["supply_chain_exposures"]), llm_provider=llm_provider, llm_model=llm_model )
         else: summary = "No significant data extracted to generate a summary."
         results["analysis_summary"] = summary # Store the summary
         results["steps"].append({"name": "Analysis Summary Generation", "duration": round(time.time() - step5_5_start, 2), "status": "OK" if not summary.startswith("Could not generate") else "Error"})
-        # ===> END Step 5.5 <===
-
 
         # --- Step 6: Learning / Adapting (Placeholder) ---
         print("\n--- Step 6: Learning/Adapting (Deferred) ---")
