@@ -30,3 +30,5 @@ google-auth-oauthlib
 google-generativeai
 
 pycountry
+
+tzdata # Add this for robust timezone support
