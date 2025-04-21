@@ -5,8 +5,12 @@ from typing import Dict, List, Any
 import traceback
 import json
 from datetime import datetime, timezone # Import timezone directly
-try: from zoneinfo import ZoneInfo; zoneinfo_available = True
-except ImportError: zoneinfo_available = False; print("Warning: zoneinfo not available. Timestamps will be UTC.")
+try:
+    from zoneinfo import ZoneInfo
+    zoneinfo_available = True
+except ImportError:
+    zoneinfo_available = False
+    print("Warning: zoneinfo not available. Timestamps will be UTC.")
 
 # Google Sheets Imports
 try:
@@ -14,55 +18,67 @@ try:
     from googleapiclient.discovery import build
     import os
     google_sheets_available = True
-except ImportError: print("Warning: Google API libs not installed. Saving to GSheets disabled."); google_sheets_available = False; service_account = None; build = None
+except ImportError:
+    print("Warning: Google API libraries not installed (`google-api-python-client google-auth-httplib2 google-auth-oauthlib`). Saving to Google Sheets disabled.")
+    google_sheets_available = False
+    service_account = None # Define for checks later
+    build = None # Define for checks later
 
 # Custom Modules
 import search_engines
-import nlp_processor
+import nlp_processor # Assumes this uses the dynamic LLM approach reading keys from config
 import knowledge_graph
-import config
+import config # Used for Search/DB/Sheets config and LLM keys
 
 # --- Google Sheets Configuration & Functions ---
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SHEET_ID = config.GOOGLE_SHEET_ID
 SERVICE_ACCOUNT_INFO = None
 GCP_JSON_STR = config.GCP_SERVICE_ACCOUNT_JSON_STR
+
 if google_sheets_available and GCP_JSON_STR:
-    try: SERVICE_ACCOUNT_INFO = json.loads(GCP_JSON_STR)
-    except Exception as e: print(f"ERROR parsing GCP JSON: {e}"); SERVICE_ACCOUNT_INFO = None
-elif google_sheets_available and not GCP_JSON_STR: print("Warning: GCP_SERVICE_ACCOUNT_JSON_STR missing.")
+    try:
+        SERVICE_ACCOUNT_INFO = json.loads(GCP_JSON_STR)
+        # print("Successfully parsed GCP Service Account JSON from environment.") # Optional debug
+    except Exception as e:
+        print(f"ERROR parsing GCP JSON environment variable: {e}")
+        SERVICE_ACCOUNT_INFO = None # Ensure it's None if parsing fails
+elif google_sheets_available and not GCP_JSON_STR:
+    # Only warn if library installed but config missing
+    print("Warning: GCP_SERVICE_ACCOUNT_JSON_STR environment variable not set or empty.")
 
-SHEET_NAME_RUNS = 'Runs'; SHEET_NAME_ENTITIES = 'Entities'; SHEET_NAME_RISKS = 'Risks'
-SHEET_NAME_RELATIONSHIPS = 'Relationships'; SHEET_NAME_EXPOSURES = 'Supply Chain Exposures'
-gsheet_service = None
+SHEET_NAME_RUNS = 'Runs'
+SHEET_NAME_ENTITIES = 'Entities'
+SHEET_NAME_RISKS = 'Risks'
+SHEET_NAME_RELATIONSHIPS = 'Relationships'
+SHEET_NAME_EXPOSURES = 'Supply Chain Exposures'
 
-# ===> CORRECTED FUNCTION FORMATTING <===
+gsheet_service = None # Global variable for the service
+
 def _get_gsheet_service():
     """Authenticates and builds the Google Sheets service object (singleton)."""
     global gsheet_service
-    if not google_sheets_available:
-        return None
+    if not google_sheets_available: return None
     if gsheet_service is None: # Only initialize if not already done
         if not SERVICE_ACCOUNT_INFO:
-            print("Cannot authenticate to Google Sheets: Service account info missing or invalid.")
+            # print("Cannot authenticate to Google Sheets: Service account info missing or invalid.") # Already printed above
             return None
         try:
             creds = service_account.Credentials.from_service_account_info(
                 SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+            # Use cache_discovery=False for serverless/ephemeral environments like Render free tier
             gsheet_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
             print("Google Sheets service authenticated successfully.")
         except Exception as e:
             print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}")
             gsheet_service = None # Ensure it's None on failure
             # No return needed inside except, will fall through to final return
-    # Return the current state of gsheet_service (which is None if init failed)
     return gsheet_service
-# ===> END CORRECTION <===
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     """Appends rows of values to a specific sheet."""
     if not service or not SHEET_ID:
-        print(f"Skipping append to {sheet_name}: Missing GSheet service or Sheet ID.")
+        # print(f"Skipping append to {sheet_name}: Missing GSheet service or Sheet ID.") # Can be noisy
         return False
     if not values: # Don't try to append empty list
         # print(f"Skipping append to {sheet_name}: No data provided.")
@@ -91,7 +107,7 @@ def _save_analysis_to_gsheet(run_results: Dict):
     # Generate Timestamp in Mountain Time
     run_timestamp_iso = "Timestamp Error"
     try:
-        dt_utc = datetime.now(timezone.utc)
+        dt_utc = datetime.now(timezone.utc) # Use imported timezone
         if zoneinfo_available:
             mountain_tz = ZoneInfo("America/Denver")
             dt_mt = dt_utc.astimezone(mountain_tz)
@@ -105,33 +121,52 @@ def _save_analysis_to_gsheet(run_results: Dict):
         run_timestamp_iso = datetime.now().isoformat(timespec='seconds') + "_Error"
 
     # --- 1. Save Run Summary ---
-    run_summary_row = [ run_timestamp_iso, run_results.get('query'), run_results.get('run_duration_seconds'), run_results.get('kg_update_status'), run_results.get('error'), run_results.get('analysis_summary', '')[:500] ]
+    run_summary_row = [
+        run_timestamp_iso,
+        run_results.get('query'),
+        run_results.get('run_duration_seconds'),
+        run_results.get('kg_update_status'),
+        run_results.get('error'),
+        run_results.get('analysis_summary', '')[:500] # Add Summary (truncated)
+    ]
     _append_to_gsheet(service, SHEET_NAME_RUNS, [run_summary_row])
 
     # --- 2. Save Extracted Data ---
     extracted = run_results.get("final_extracted_data", {})
     entities = extracted.get("entities", []); risks = extracted.get("risks", []); relationships = extracted.get("relationships", [])
 
-    # ===> CORRECTED LIST COMPREHENSION FORMATTING (Multi-line for readability) <===
+    # Save Entities
     if entities:
         entity_rows = [
             [run_timestamp_iso, e.get('name'), e.get('type'), json.dumps(e.get('mentions', []))]
             for e in entities if isinstance(e, dict) and e.get('name')
         ]
         _append_to_gsheet(service, SHEET_NAME_ENTITIES, entity_rows)
+
+    # Save Risks (with default for severity)
     if risks:
         risk_rows = [
-            [run_timestamp_iso, r.get('description'), r.get('severity'), json.dumps(r.get('related_entities', [])), json.dumps(r.get('source_urls', []))]
+            [
+                run_timestamp_iso,
+                r.get('description'),
+                # ===> CORRECTED LINE: Provide default if severity is missing <===
+                r.get('severity', 'UNKNOWN'), # Use 'UNKNOWN' or 'Not Specified'
+                # ===> END CORRECTION <===
+                json.dumps(r.get('related_entities', [])),
+                json.dumps(r.get('source_urls', []))
+            ]
+            # Ensure description exists
             for r in risks if isinstance(r, dict) and r.get('description')
         ]
         _append_to_gsheet(service, SHEET_NAME_RISKS, risk_rows)
+
+    # Save Relationships
     if relationships:
         rel_rows = [
             [run_timestamp_iso, rel.get('entity1'), rel.get('relationship_type'), rel.get('entity2'), json.dumps(rel.get('context_urls', []))]
             for rel in relationships if isinstance(rel, dict) and rel.get('entity1') and rel.get('relationship_type') and rel.get('entity2')
         ]
         _append_to_gsheet(service, SHEET_NAME_RELATIONSHIPS, rel_rows)
-    # ===> END CORRECTION <===
 
     # --- 3. Save Supply Chain Exposures ---
     exposures = run_results.get("supply_chain_exposures", [])
@@ -155,9 +190,17 @@ def run_analysis(initial_query: str,
                  max_specific_results: int = 10
                  ) -> Dict[str, Any]:
     start_run_time = time.time()
-    results = { "query": initial_query, "steps": [], "llm_used": f"{llm_provider} ({llm_model})", "final_extracted_data": {"entities": [], "risks": [], "relationships": []}, "supply_chain_exposures": [], "analysis_summary": "Summary not generated.", "wayback_results": [], "kg_update_status": "not_run", "run_duration_seconds": 0, "error": None, }
+    results = { # Initialize results structure
+        "query": initial_query, "steps": [], "llm_used": f"{llm_provider} ({llm_model})",
+        "final_extracted_data": {"entities": [], "risks": [], "relationships": []},
+        "supply_chain_exposures": [], "analysis_summary": "Summary not generated.",
+        "wayback_results": [], "kg_update_status": "not_run",
+        "run_duration_seconds": 0, "error": None,
+    }
+    # Init Neo4j driver
     kg_driver_available = bool(knowledge_graph.get_driver())
     if not kg_driver_available: results["kg_update_status"] = "skipped_no_connection"
+    # Check LLM params
     if not llm_provider or not llm_model:
         results["error"] = "Missing LLM configuration."; print(f"ERROR: {results['error']}")
         results["run_duration_seconds"] = round(time.time() - start_run_time, 2)
