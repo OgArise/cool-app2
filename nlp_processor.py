@@ -249,6 +249,116 @@ def extract_data_from_results(search_results: List[Dict[str, Any]], extraction_c
     return validated_data
 
 
+# ===> NEW FUNCTION for Ownership Extraction <===
+def extract_ownership_relationships(parent_entity_name: str,
+                                    related_entity_name: str,
+                                    text_snippets: List[Dict[str, Any]], # Snippets potentially mentioning ownership
+                                    llm_provider: str, llm_model: str) -> Dict | None:
+    """
+    Uses LLM to analyze text snippets for ownership percentage/control between two entities.
+
+    Args:
+        parent_entity_name: The name of the entity assumed to be the potential owner.
+        related_entity_name: The name of the entity assumed to be potentially owned.
+        text_snippets: A list of search result dicts (containing 'snippet', 'url')
+                       from targeted searches for ownership documents.
+        llm_provider: The LLM provider ('google_ai', 'openai', 'openrouter').
+        llm_model: The specific model name.
+
+    Returns:
+        A dictionary like {"relationship_type": "SUBSIDIARY|AFFILIATE|UNRELATED/OTHER",
+                          "ownership_percentage": "% string or Not Stated",
+                          "source_url": "URL or Not Stated"}
+        Returns None if the LLM call fails or parsing fails.
+    """
+    print(f"\n--- Analyzing ownership: '{parent_entity_name}' owning '{related_entity_name}'? ---")
+    if not llm_provider or not llm_model: return None # Need LLM config
+    if not text_snippets: print("No text snippets provided for ownership check."); return None
+
+    # Prepare context specifically for ownership check
+    context = f"Analyze the potential ownership relationship where '{parent_entity_name}' is the owner/investor and '{related_entity_name}' is the owned/investee entity. Base your analysis ONLY on the following text snippets extracted from potential financial reports or official documents.\n\nFocus *only* on stated ownership percentages or clear descriptions of control/significant influence (e.g., 'wholly owned subsidiary', 'minority stake', 'equity method investment', 'consolidated entity', 'joint venture', '% stake'). Ignore mentions of simple supplier, customer, or partnership relationships unless ownership is explicitly stated.\n\nText Snippets:\n"
+    max_chars = 7000 # Slightly smaller context for this focused task
+    char_count = len(context)
+    added_snippets = 0
+    for snip in text_snippets:
+        snippet_text = snip.get('snippet', '')
+        if snippet_text and not snippet_text.isspace():
+            entry = f"---\nSource URL: {snip.get('url', 'N/A')}\nSnippet: {snippet_text}\n"
+            if char_count + len(entry) <= max_chars:
+                context += entry; char_count += len(entry); added_snippets += 1
+            else: break
+    if added_snippets == 0: print("No valid snippets for ownership check."); return None
+    print(f"Prepared ownership context using {added_snippets} snippets.")
+
+
+    # Define desired JSON output structure for this task
+    ownership_schema_desc = """
+    {
+      "relationship_type": "SUBSIDIARY | AFFILIATE | UNRELATED/OTHER", // Based on >50% ownership for SUBSIDIARY, 5-50% for AFFILIATE, or lack of evidence/other relationship
+      "ownership_percentage": "Specific % found (e.g., '75%', 'approx 30%') OR 'Control Mentioned' OR 'Influence Mentioned' OR 'Not Stated'", // Report % if found, otherwise describe evidence
+      "source_url": "The single most relevant Source URL from the snippets supporting the conclusion OR 'Multiple Sources' OR 'Not Stated'" // URL providing the evidence
+    }"""
+
+    prompt = f"""{context}
+
+    Based ONLY on the text snippets provided above, determine the ownership relationship where '{parent_entity_name}' owns/invests in '{related_entity_name}'.
+
+    Use these definitions:
+    - SUBSIDIARY: Evidence of >50% ownership or explicit control statement.
+    - AFFILIATE: Evidence of 5% to 50% ownership or explicit significant influence statement.
+    - UNRELATED/OTHER: Evidence of <5% ownership, a different relationship, or no clear ownership evidence found in the snippets.
+
+    Your response MUST be ONLY a single valid JSON object matching the structure described below. Do not include explanations outside the JSON.
+    ```json
+    {ownership_schema_desc}
+    ```"""
+
+    raw_content = None
+    parsed_json = None
+    api_error = None
+
+    try:
+        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
+        print(f"Sending ownership request to {llm_provider} ({model_name_used})...")
+
+        if client_type == "openai_compatible":
+             request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "response_format": {"type": "json_object"}}
+             try:
+                 response = client_or_lib.chat.completions.create(**request_params)
+                 raw_content = response.choices[0].message.content
+             except Exception as e_json_mode:
+                 print(f"WARNING: {llm_provider} ownership check failed JSON mode ({e_json_mode}). Retrying...")
+                 del request_params["response_format"]
+                 response = client_or_lib.chat.completions.create(**request_params)
+                 raw_content = response.choices[0].message.content
+        elif client_type == "google_ai":
+            generation_config = genai.types.GenerationConfig(temperature=0.1)
+            response = client_or_lib.generate_content(prompt, generation_config=generation_config)
+            if not response.candidates: raise ValueError(f"Google AI ownership response blocked. Feedback: {response.prompt_feedback}")
+            raw_content = response.text
+        else: raise ValueError("Unknown client type")
+
+        print(f"Raw {llm_provider} ownership response:\n>>>\n{raw_content}\n<<<")
+        cleaned_content = raw_content.strip().replace("```json", "").replace("```", "").strip()
+        parsed_json = json.loads(cleaned_content)
+
+    except json.JSONDecodeError as json_e: print(f"ERROR: Failed to decode JSON from {llm_provider} ownership response: {json_e}\nRaw content: {raw_content}"); api_error = json_e
+    except Exception as e: print(f"ERROR during ownership extraction call via {llm_provider}: {e}"); api_error = e
+
+    # Validate and return
+    if parsed_json and isinstance(parsed_json, dict) and parsed_json.get("relationship_type") in ["SUBSIDIARY", "AFFILIATE", "UNRELATED/OTHER"]:
+        print("Successfully parsed ownership info.")
+        # Ensure default values if keys are missing
+        parsed_json.setdefault("ownership_percentage", "Not Stated")
+        parsed_json.setdefault("source_url", "Not Stated")
+        return parsed_json
+    else:
+        print(f"Failed to get valid ownership structure. Error: {api_error}")
+        return None # Indicate failure or invalid structure
+
+# ===> END NEW FUNCTION <===
+
+
 # --- Local Testing Block ---
 if __name__ == "__main__":
    print("\n--- Running Local NLP Processor Tests ---")
@@ -285,5 +395,51 @@ if __name__ == "__main__":
        extracted_data_test = extract_data_from_results(sample_results_test, sample_extraction_context_test, provider_to_test, model_to_test)
        print("\nFinal Extracted Data Result:")
        print(json.dumps(extracted_data_test, indent=2))
+
+   # ===> ADD Local Test for Ownership Extraction <===
+   print("\nTesting Ownership Extraction...")
+   provider_to_test = None; model_to_test = None # Determine provider as before
+   if config.GOOGLE_AI_API_KEY: provider_to_test = "google_ai"; model_to_test = config.DEFAULT_GOOGLE_AI_MODEL; print("--> Using Google AI")
+   elif config.OPENAI_API_KEY: provider_to_test = "openai"; model_to_test = config.DEFAULT_OPENAI_MODEL; print("--> Using OpenAI")
+   elif config.OPENROUTER_API_KEY: provider_to_test = "openrouter"; model_to_test = config.DEFAULT_OPENROUTER_MODEL; print("--> Using OpenRouter")
+
+   if provider_to_test:
+       sample_ownership_snippets = [
+           {'url': 'http://example.com/report1', 'snippet': 'In 2022, ParentCorp acquired a 60% controlling stake in SubCo Inc.'},
+           {'url': 'http://example.com/news1', 'snippet': 'ParentCorp holds a significant minority investment (approx 30%) in AffiliateCorp.'},
+           {'url': 'http://example.com/report2', 'snippet': 'ParentCorp and Unrelated Inc entered into a strategic partnership.'},
+           {'url': 'http/example.com/sec', 'snippet': 'Exhibit 21 lists SubCo Inc as a subsidiary.'}
+       ]
+       ownership_result = extract_ownership_relationships(
+           parent_entity_name="ParentCorp",
+           related_entity_name="SubCo Inc",
+           text_snippets=sample_ownership_snippets,
+           llm_provider=provider_to_test,
+           llm_model=model_to_test
+       )
+       print("\nOwnership Result (ParentCorp owning SubCo Inc):")
+       print(json.dumps(ownership_result, indent=2))
+
+       ownership_result_2 = extract_ownership_relationships(
+           parent_entity_name="ParentCorp",
+           related_entity_name="AffiliateCorp",
+           text_snippets=sample_ownership_snippets,
+           llm_provider=provider_to_test,
+           llm_model=model_to_test
+       )
+       print("\nOwnership Result (ParentCorp owning AffiliateCorp):")
+       print(json.dumps(ownership_result_2, indent=2))
+
+       ownership_result_3 = extract_ownership_relationships(
+           parent_entity_name="ParentCorp",
+           related_entity_name="Unrelated Inc",
+           text_snippets=sample_ownership_snippets,
+           llm_provider=provider_to_test,
+           llm_model=model_to_test
+       )
+       print("\nOwnership Result (ParentCorp owning Unrelated Inc):")
+       print(json.dumps(ownership_result_3, indent=2))
+   else:
+       print("Skipping ownership tests - No LLM configured.")
 
    print("\n--- Local Tests Complete ---")
