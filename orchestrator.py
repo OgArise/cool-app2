@@ -434,12 +434,12 @@ def run_analysis(initial_query: str,
                   linkup_global_results = search_engines.search_linkup_snippets(query=step1_all_queries) # Removed num and country_code params from the call
                   if linkup_global_results:
                       print(f"    Linkup Snippet Search returned {len(linkup_global_results)} unique results after internal deduplication.")
-                      # Apply the max_global_results limit *after* collecting from all Linkup queries
-                      linkup_global_results_limited = linkup_global_results[:max_global_results]
-                      if len(linkup_global_results) > len(linkup_global_results_limited):
-                          print(f"    Truncating Linkup results to max_global_results: {len(linkup_global_results_limited)} results kept.")
+                      # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
+                      # linkup_global_results_limited = linkup_global_results[:max_global_results]
+                      # if len(linkup_global_results) > len(linkup_global_results_limited):
+                      #     print(f"    Truncating Linkup results to max_global_results: {len(linkup_global_results_limited)} results kept.")
 
-                      for r in linkup_global_results_limited: # Iterate through the *limited* list
+                      for r in linkup_global_results: # Iterate through the *full* list returned by search_linkup_snippets
                            if isinstance(r, dict) and r.get('url') and isinstance(r.get('url'), str) and r['url'] not in all_search_results_map:
                                # Preserve source if already set by search_engines, default to 'linkup_snippet_step1'
                                r['source'] = r.get('source', 'linkup_snippet_step1')
@@ -830,6 +830,7 @@ def run_analysis(initial_query: str,
              try:
                   # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
+                  # Pass the combined query to search_linkup_snippets.
                   linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Removed num and country_code
                   if linkup_specific_results:
                        print(f"    Linkup Snippet Search returned {len(linkup_specific_results)} unique results after internal deduplication.")
@@ -883,7 +884,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step3_search_results) < max_specific_results and len(step3_search_results) < required_for_threshold:
-            print("[Step 3 Search] Running SerpApi queries...")
+            print("[Step 3 Search] Running Serpapi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step3_all_queries # Use all queries including Chinese ones for Serpapi (especially Baidu)
             for q_idx, query_text in enumerate(queries_for_serpapi):
