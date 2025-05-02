@@ -12,7 +12,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_GOOGLE_AI_MODEL = os.getenv("DEFAULT_GOOGLE_AI_MODEL", "models/gemini-1.5-flash-latest")
 DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_OPENROUTER_MODEL = os.getenv("DEFAULT_OPENROUTER_MODEL", "google/gemini-flash-1.5")
+DEFAULT_OPENROUTER_MODEL = os.getenv("DEFAULT_OPENROUTER_MODEL", "qwen/qwen3-235b-a22b:free")
 
 OPENROUTER_HEADERS = {
   "HTTP-Referer": os.getenv("YOUR_SITE_URL", "http://localhost"),
