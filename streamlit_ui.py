@@ -4,7 +4,7 @@ import streamlit as st
 import json
 from datetime import datetime
 import os
-import requests # User provided code uses requests
+import requests
 import pandas as pd
 import traceback
 
@@ -26,11 +26,7 @@ except ImportError:
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
-# Note: The user provided code doesn't have the trailing slash fix.
-# Sticking strictly to correcting the indentation error in the provided code.
-# CLEANED_BACKEND_API_URL = BACKEND_API_URL.rstrip('/')
-ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze" # Using the provided definition
-
+ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
 GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
 # Define the specific GID for the Exposures tab if known
@@ -48,14 +44,6 @@ DEFAULT_MODELS = {
     "openai": getattr(config, 'DEFAULT_OPENAI_MODEL', "gpt-4o-mini") if config else "gpt-4o-mini",
     "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "google/gemini-flash-1.5") if config else "google/gemini-flash-1.5"
 }
-
-# Determine the default provider key based on the name 'OpenAI'
-# Find the index of 'OpenAI' in the list of provider names
-try:
-    default_provider_index = list(LLM_PROVIDERS.keys()).index("OpenAI")
-except ValueError:
-    default_provider_index = 0 # Fallback to the first provider if OpenAI is not in the list
-
 
 def get_country_options():
     options = {"Global": "global"}
@@ -87,30 +75,20 @@ def update_contexts():
     """Updates the default context fields based on the initial query input."""
     query = st.session_state.get("initial_query_input", "")
     # Only update if the query has changed AND the contexts haven't been manually edited
-    # Check if contexts are still the *original* default ones before overriding
-    current_global = st.session_state.get("global_context_input", "")
-    current_specific = st.session_state.get("specific_context_input", "")
-    original_default_global = "Global financial news and legal filings for compliance issues"
-    original_default_specific = "Search for specific company examples and regulatory actions"
-
     if query and query != st.session_state.get("_last_updated_query", ""):
-         # Check if contexts are still the *last auto-generated* ones based on the previous query OR the original defaults
-         last_auto_global = f"Global financial news and legal filings for '{st.session_state.get('_last_updated_query', '')}'"
-         last_auto_specific = f"Search for specific company examples and regulatory actions related to '{st.session_state.get('_last_updated_query', '')}'"
-
-         if current_global in [original_default_global, last_auto_global] and \
-            current_specific in [original_default_specific, last_auto_specific]:
+        # Check if contexts are still the default ones before overriding
+        current_global = st.session_state.get("global_context_input", "")
+        current_specific = st.session_state.get("specific_context_input", "")
+        if current_global == "Global financial news and legal filings for compliance issues" and \
+           current_specific == "Search for specific company examples and regulatory actions":
             st.session_state.global_context_input = f"Global financial news and legal filings for '{query}'"
             st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
             print(f"Updated contexts based on query: '{query}'")
-
-         # --- CORRECTED INDENTATION ---
-         st.session_state._last_updated_query = query # Always update the last processed query
+        st.session_state._last_updated_query = query # Always update the last processed query
     elif not query:
         # Reset to default generic contexts if query is cleared
-        st.session_state.global_context_input = original_default_global
-        st.session_state.specific_context_input = original_default_specific
-        # --- CORRECTED INDENTATION ---
+        st.session_state.global_context_input = "Global financial news and legal filings for compliance issues"
+        st.session_state.specific_context_input = "Search for specific company examples and regulatory actions"
         st.session_state._last_updated_query = ""
         print("Query cleared, reset contexts to default.")
 
@@ -123,8 +101,6 @@ if 'analysis_payload' not in st.session_state: st.session_state.analysis_payload
 if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
 if 'error_message' not in st.session_state: st.session_state.error_message = None
 if '_last_updated_query' not in st.session_state: st.session_state._last_updated_query = ""
-# Set initial query default to blank
-if "initial_query_input" not in st.session_state: st.session_state.initial_query_input = ""
 
 # Initialize LLM model text inputs for each provider
 for provider_key in LLM_PROVIDERS.values():
@@ -140,13 +116,11 @@ st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 # Display backend URL status
 if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
 elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
-# Note: Using the provided URL definition without the trailing slash fix
 else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
 
 st.sidebar.title("LLM Selection")
 # Use LLM_PROVIDERS keys for display, values for internal logic
-# Set default index based on finding 'OpenAI'
-selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=default_provider_index, key='sidebar_llm_provider_name_select' )
+selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=0, key='sidebar_llm_provider_name_select' )
 selected_provider_key = LLM_PROVIDERS[selected_provider_name]
 
 # Get the current model value for the selected provider from session state
@@ -169,17 +143,18 @@ llm_model = st.sidebar.text_input(
 st.sidebar.caption("✨ Tip: Google AI & OpenRouter often have free tiers. OpenAI requires paid credits.")
 
 st.subheader("1. Enter Your Initial Query")
-# Set initial query default to blank
 initial_query_value = st.text_input(
     "Initial Search Query:",
-    value=st.session_state.get("initial_query_input", ""), # Default to blank
+    st.session_state.get("initial_query_input", "Corporate tax evasion cases 2020-2023"),
     key="initial_query_input",
     on_change=update_contexts, # Trigger context update when query changes
     help="Enter the primary query to initiate the analysis."
 )
-# Ensure contexts are updated on initial load if the default wasn't blank and hasn't been processed
-if st.session_state.initial_query_input and not st.session_state.get("_last_updated_query"):
-    update_contexts()
+# Manual trigger for context update if needed (e.g., user clears and re-types)
+# This check is redundant with on_change, but good as a safety if on_change misbehaves
+# if st.session_state.initial_query_input and st.session_state.initial_query_input != st.session_state.get("_last_updated_query", ""):
+#     update_contexts()
+#     st.rerun() # Rerun to update textareas
 
 
 st.subheader("2. Configure Search & Run Analysis")
@@ -194,15 +169,14 @@ with st.form("analysis_form"):
     with col1:
         # Find the index for the default country ('cn') for the selectbox
         try:
-            default_country_index_select = COUNTRY_DISPLAY_NAMES.index("China") if "China" in COUNTRY_DISPLAY_NAMES else 0
+            default_country_index = COUNTRY_DISPLAY_NAMES.index("China") if "China" in COUNTRY_DISPLAY_NAMES else 0
         except ValueError:
-            default_country_index_select = 0 # Fallback if China is not in the list for some reason
-
+            default_country_index = 0 # Fallback if China is not in the list for some reason
 
         selected_country_name_widget_value = st.selectbox(
             "Specific Country Search Target",
             options=COUNTRY_DISPLAY_NAMES,
-            index=default_country_index_select,
+            index=default_country_index,
             key='country_select',
             help="Select 'Global' or a specific country for the targeted search."
         )
@@ -237,9 +211,9 @@ if submitted and st.session_state.analysis_status != "RUNNING":
         validation_errors.append("Please select a valid LLM Provider and Model in the sidebar.")
     if BACKEND_API_URL.startswith("YOUR_"):
          validation_errors.append("Backend API URL needs configuration. Please set the `BACKEND_API_URL` environment variable.")
-    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('payload_specific_context','').lower() and st.session_state.get('_last_updated_query','').lower() not in st.session_state.get('specific_context_input','').lower())):
-         # Warn if country is Global but specific context is still country-focused based on default text
-         st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still seems focused on specific companies/actions related to a country. Consider adjusting the specific context for a global search.")
+    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or 'related to' in st.session_state.get('payload_specific_context','')):
+         # Warn if country is Global but specific context is still country-focused
+         st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still mentions 'specific company examples and regulatory actions related to...'. Consider adjusting the specific context for a global search.")
          # Decided not to block, just warn
 
 
@@ -301,8 +275,6 @@ elif st.session_state.analysis_status == "RUNNING":
                 # Assuming backend timeout is 2000s as discussed, let's use 1800s (30 minutes)
                 # It should match or be slightly less than the backend's processing timeout.
                 api_timeout_seconds = 1800 # 30 minutes
-                # Note: The user provided code uses requests instead of httpx.
-                # Sticking strictly to correcting the indentation error in the provided code.
                 response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=api_timeout_seconds)
 
                 if response.status_code == 200:
@@ -327,11 +299,11 @@ elif st.session_state.analysis_status == "RUNNING":
                                error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
                                error_msg += f"\nDetail: {error_detail}"
                           else:
-                               error_detail = response.text[:200] + '...'
+                               error_msg += f"\nResponse: {response.text[:200]}..."
                           print(f"Backend non-200 response: {response.text}") # Log full response for debugging
                      except json.JSONDecodeError:
                           # If response is not JSON, use raw text
-                          error_detail = response.text[:200] + '...'
+                          error_msg += f"\nResponse: {response.text[:200]}..."
                           print(f"Backend non-200 response (non-JSON): {response.text}") # Log full response for debugging
 
                      st.session_state.analysis_status = "ERROR" # General ERROR status for API request failures
@@ -395,7 +367,7 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
              st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
     elif GOOGLE_SHEET_URL:
          st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
-         st.caption("Note: Google Sheet Exposures tab link not configured.")
+         st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` if you know the correct GID for the Exposures tab for a direct link.")
     else:
          st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
 
