@@ -129,9 +129,9 @@ for provider_key in LLM_PROVIDERS.values():
      if session_key_model not in st.session_state:
           st.session_state[session_key_model] = DEFAULT_MODELS.get(provider_key, "")
 
-# Initialize a state variable to track the background task
-if 'analysis_task' not in st.session_state:
-    st.session_state.analysis_task = None
+# Remove the analysis_task initialization as it's no longer used for polling
+# if 'analysis_task' not in st.session_state:
+#     st.session_state.analysis_task = None
 
 
 st.set_page_config(page_title="AI Analyst Agent", layout="wide")
@@ -208,6 +208,7 @@ with st.form("analysis_form"):
         )
     with col2:
         max_global_results = st.number_input("Max Global Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_global_input', help="Maximum number of search results requested from *each* enabled global search engine.")
+        # Corrected the key for max_specific_input to match the assignment in the submitted block
         max_specific_results = st.number_input("Max Specific Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_specific_input', help="Maximum number of search results requested from *each* enabled country-specific search engine.")
 
     submitted = st.form_submit_button("Run Analysis")
@@ -262,9 +263,23 @@ async def run_analysis_async(payload):
         return {"status": "ERROR", "results": None, "error_message": error_msg}
 
 
+# --- Synchronous Wrapper to Run Async Code ---
+def run_analysis_sync_wrapper(payload):
+    """Synchronously runs the async API call and returns its result."""
+    try:
+        # Use asyncio.run to execute the async function
+        return asyncio.run(run_analysis_async(payload))
+    except Exception as e:
+        # Catch any exceptions from asyncio.run or the async function itself
+        error_msg = f"Error during synchronous async execution: {type(e).__name__}: {e}"
+        print(f"--- ERROR IN SYNC ASYNC WRAPPER ---")
+        traceback.print_exc()
+        return {"status": "ERROR", "results": None, "error_message": error_msg}
+
+
 # --- Analysis Trigger and Execution Logic ---
-# This block now handles the state transitions and async task management
-if submitted and st.session_state.analysis_status != "RUNNING":
+# This block now directly calls the synchronous wrapper and updates state afterwards
+if submitted: # Remove the status check here, as the wrapper will block anyway
     # Capture form values into session state payload variables upon submission
     st.session_state.payload_query = st.session_state.initial_query_input
     st.session_state.payload_global_context = st.session_state.global_context_input
@@ -303,7 +318,6 @@ if submitted and st.session_state.analysis_status != "RUNNING":
         st.session_state.analysis_payload = None # Clear payload on validation failure
         st.session_state.error_message = "Validation failed. Check inputs."
         st.session_state.analysis_results = None # Clear previous results
-        st.session_state.analysis_task = None # Clear any old task
         print(f"Form submission failed validation: {validation_errors}")
     else:
         # Inputs are valid, prepare payload for API call
@@ -324,64 +338,25 @@ if submitted and st.session_state.analysis_status != "RUNNING":
         st.session_state.analysis_results = None # Clear previous results
         st.session_state.error_message = None # Clear previous error
         st.session_state.analysis_status = "RUNNING" # Set status to RUNNING
-        st.session_state.analysis_task = asyncio.ensure_future(run_analysis_async(payload)) # Start the async task
 
-        print(f"Form submitted successfully. Payload set in state. Starting async API task.")
-        st.rerun() # Rerun immediately to show spinner
+        print(f"Form submitted successfully. Payload set in state. Starting synchronous API task via wrapper.")
 
-# --- Analysis Execution / Status Polling ---
-# This block runs if the status is "RUNNING" and the async task is in session state
-if st.session_state.analysis_status == "RUNNING" and st.session_state.analysis_task:
-    st.info(f"Analysis in progress... Calling backend API ({ANALYZE_ENDPOINT}).")
-    payload_to_send = st.session_state.get('analysis_payload')
-    llm_display = f"{payload_to_send.get('llm_provider','?')}: {payload_to_send.get('llm_model','?')}"
-    st.write(f"Using LLM: {llm_display}")
+        # --- Execute the synchronous wrapper for the async API call ---
+        with st.spinner("Analysis in progress... Please wait. (Calling backend API...)"):
+            task_result = run_analysis_sync_wrapper(payload)
 
-    # Use st.empty() for the spinner
-    spinner_placeholder = st.empty()
+        # Update session state based on the result received from the wrapper
+        st.session_state.analysis_status = task_result.get("status", "ERROR") # Use status from task result
+        st.session_state.analysis_results = task_result.get("results")
+        st.session_state.error_message = task_result.get("error_message")
 
-    # Check if the async task is done
-    if st.session_state.analysis_task.done():
-        try:
-            # Get the result from the completed task
-            task_result = st.session_state.analysis_task.result()
-
-            # Update session state based on the task result
-            st.session_state.analysis_status = task_result.get("status", "ERROR") # Use status from task result
-            st.session_state.analysis_results = task_result.get("results")
-            st.session_state.error_message = task_result.get("error_message")
-
-            st.session_state.analysis_task = None # Clear the task from state
-            spinner_placeholder.empty() # Clear the spinner
-            st.rerun() # Rerun to move to the display block
-
-        except Exception as e:
-             # Handle exceptions that might occur *when getting the result*
-             error_msg = f"An error occurred retrieving task results: {type(e).__name__}: {e}"
-             print(f"--- UNEXPECTED ERROR RETRIEVING TASK RESULT ---")
-             traceback.print_exc()
-             st.session_state.analysis_status = "ERROR"
-             st.session_state.error_message = error_msg
-             st.session_state.analysis_task = None # Clear the task
-             spinner_placeholder.empty() # Clear spinner
-             st.rerun() # Rerun to display error state
-
-    else:
-        # Task is still running, show spinner and rerun to poll status
-        with spinner_placeholder.container():
-             st.spinner("Analysis in progress... Please wait. (Checking backend status...)")
-        # Streamlit will automatically rerun the script periodically while the spinner is active,
-        # and specifically when the async task completes, allowing the logic to eventually
-        # hit the task_result check above. No explicit time.sleep or st.rerun needed here
-        # beyond the initial one that triggered this block.
+        # No need for rerun here, as the script execution continues after the blocking call
 
 
 # --- Analysis Complete/Error Display Block ---
-# This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR
-elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR", "ERROR"]: # Include ERROR here
-    # Ensure the spinner is cleared if we land in this state
-    spinner_placeholder = st.empty()
-    spinner_placeholder.empty()
+# This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR (or IDLE initially)
+# The previous 'elif analysis_status == "RUNNING"' block is removed
+if st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR", "ERROR"]: # Include ERROR here
 
     # Display error message if status is ERROR or COMPLETE_WITH_ERROR
     if st.session_state.analysis_status == "ERROR":
