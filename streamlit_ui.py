@@ -4,9 +4,7 @@ import streamlit as st
 import json
 from datetime import datetime
 import os
-# import requests # Switched to httpx for async
-import httpx # Import httpx
-import asyncio # Import asyncio
+import requests
 import pandas as pd
 import traceback
 
@@ -28,10 +26,7 @@ except ImportError:
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
-# Ensure BACKEND_API_URL does not have a trailing slash before appending the endpoint path
-CLEANED_BACKEND_API_URL = BACKEND_API_URL.rstrip('/')
-ANALYZE_ENDPOINT = f"{CLEANED_BACKEND_API_URL}/analyze"
-
+ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
 GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
 # Define the specific GID for the Exposures tab if known
@@ -105,8 +100,7 @@ def update_contexts():
             st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
             print(f"Updated contexts based on query: '{query}'")
 
-         st.session_state._last_updated_query = query # Always update the last processed query
-
+        st.session_state._last_updated_query = query # Always update the last processed query
     elif not query:
         # Reset to default generic contexts if query is cleared
         st.session_state.global_context_input = original_default_global
@@ -132,10 +126,6 @@ for provider_key in LLM_PROVIDERS.values():
      if session_key_model not in st.session_state:
           st.session_state[session_key_model] = DEFAULT_MODELS.get(provider_key, "")
 
-# Remove the analysis_task initialization as it's no longer used for polling
-# if 'analysis_task' not in st.session_state:
-#     st.session_state.analysis_task = None
-
 
 st.set_page_config(page_title="AI Analyst Agent", layout="wide")
 st.title("🕵️ AI Analyst Agent Interface")
@@ -144,8 +134,7 @@ st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 # Display backend URL status
 if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
 elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
-# Use the cleaned URL for display
-else: st.info(f"Targeting Backend API: {CLEANED_BACKEND_API_URL}")
+else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
 
 st.sidebar.title("LLM Selection")
 # Use LLM_PROVIDERS keys for display, values for internal logic
@@ -212,92 +201,24 @@ with st.form("analysis_form"):
         )
     with col2:
         max_global_results = st.number_input("Max Global Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_global_input', help="Maximum number of search results requested from *each* enabled global search engine.")
-        # Corrected the key for max_specific_input to match the assignment in the submitted block
         max_specific_results = st.number_input("Max Specific Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_specific_input', help="Maximum number of search results requested from *each* enabled country-specific search engine.")
 
     submitted = st.form_submit_button("Run Analysis")
 
-# --- Asynchronous API Call Function ---
-# This function will be run in the background by asyncio
-async def run_analysis_async(payload):
-    """Makes the asynchronous API call to the backend."""
-    try:
-        # Use httpx.AsyncClient for asynchronous requests
-        # Use a timeout that is reasonable for the API to respond
-        # It should be less than Streamlit's overall script timeout if possible
-        api_timeout_seconds = 1800 # 30 minutes (should match or be less than backend processing timeout)
-        async with httpx.AsyncClient(timeout=api_timeout_seconds) as client:
-            print(f"Streamlit making async API call to {ANALYZE_ENDPOINT}")
-            response = await client.post(ANALYZE_ENDPOINT, json=payload)
-
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-
-        results_data = response.json()
-        print(f"Streamlit received backend analysis response. Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
-
-        # Check if the backend reported an error in the response body
-        if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
-             return {"status": "COMPLETE_WITH_ERROR", "results": results_data, "error_message": f"Backend Orchestrator reported an error: {results_data['error']}"}
-        else:
-             return {"status": "COMPLETE", "results": results_data, "error_message": None}
-
-    except httpx.TimeoutException:
-        error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
-        print(error_msg)
-        return {"status": "ERROR", "results": None, "error_message": error_msg}
-    except httpx.RequestError as e:
-        error_msg = f"An HTTP request error occurred calling backend API at {ANALYZE_ENDPOINT}: {e}"
-        print(error_msg)
-        traceback.print_exc()
-        return {"status": "ERROR", "results": None, "error_message": error_msg}
-    except httpx.HTTPStatusError as e:
-         error_msg = f"Backend API returned HTTP error {e.response.status_code} for {e.request.url}"
-         try:
-              error_detail = e.response.json().get('detail', e.response.text[:200] + '...')
-              error_msg += f"\nDetail: {json.dumps(error_detail)}"
-         except json.JSONDecodeError:
-              error_msg += f"\nResponse: {e.response.text[:200]}..."
-         print(error_msg)
-         traceback.print_exc()
-         return {"status": "ERROR", "results": None, "error_message": error_msg}
-    except Exception as e:
-        error_msg = f"An unexpected error occurred during the API request: {type(e).__name__}: {e}"
-        print(f"--- UNEXPECTED ERROR IN STREAMLIT ASYNC CALL ---")
-        traceback.print_exc()
-        return {"status": "ERROR", "results": None, "error_message": error_msg}
-
-
-# --- Synchronous Wrapper to Run Async Code ---
-def run_analysis_sync_wrapper(payload):
-    """Synchronously runs the async API call and returns its result."""
-    try:
-        # Use asyncio.run to execute the async function
-        return asyncio.run(run_analysis_async(payload))
-    except Exception as e:
-        # Catch any exceptions from asyncio.run or the async function itself
-        error_msg = f"Error during synchronous async execution: {type(e).__name__}: {e}"
-        print(f"--- ERROR IN SYNC ASYNC WRAPPER ---")
-        traceback.print_exc()
-        return {"status": "ERROR", "results": None, "error_message": error_msg}
-
-
-# --- Analysis Trigger and Execution Logic ---
-# This block now directly calls the synchronous wrapper and updates state afterwards
-if submitted: # Remove the status check here, as the wrapper will block anyway
+# --- Analysis Trigger and Execution ---
+# This block runs when the form is submitted OR st.rerun() is called while status is RUNNING
+if submitted and st.session_state.analysis_status != "RUNNING":
     # Capture form values into session state payload variables upon submission
     st.session_state.payload_query = st.session_state.initial_query_input
     st.session_state.payload_global_context = st.session_state.global_context_input
     st.session_state.payload_specific_context = st.session_state.specific_context_input
     st.session_state.payload_specific_country_name = st.session_state.country_select # Store name, convert to code for API
     st.session_state.payload_max_global = st.session_state.max_global_input
-    # Corrected line: Assign value from max_specific_input widget
     st.session_state.payload_max_specific = st.session_state.max_specific_input
 
     # Capture selected LLM provider and model
-    selected_provider_name_from_state = st.session_state.sidebar_llm_provider_name_select # Use sidebar selectbox value
-    st.session_state.payload_llm_provider = LLM_PROVIDERS[selected_provider_name_from_state] # Get the key from the name
-    st.session_state.payload_llm_model = st.session_state.get(f"{st.session_state.payload_llm_provider}_model_input") # Use the stored model input for that key
-
+    st.session_state.payload_llm_provider = selected_provider_key
+    st.session_state.payload_llm_model = st.session_state.get(f"{selected_provider_key}_model_input")
 
     # --- Input Validation ---
     validation_errors = []
@@ -309,7 +230,7 @@ if submitted: # Remove the status check here, as the wrapper will block anyway
         validation_errors.append("Please select a valid LLM Provider and Model in the sidebar.")
     if BACKEND_API_URL.startswith("YOUR_"):
          validation_errors.append("Backend API URL needs configuration. Please set the `BACKEND_API_URL` environment variable.")
-    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('specific_context_input','').lower() and "global financial news" not in st.session_state.get('specific_context_input','').lower())):
+    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('payload_specific_context','').lower() and st.session_state.get('_last_updated_query','').lower() not in st.session_state.get('specific_context_input','').lower())):
          # Warn if country is Global but specific context is still country-focused based on default text
          st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still seems focused on specific companies/actions related to a country. Consider adjusting the specific context for a global search.")
          # Decided not to block, just warn
@@ -337,161 +258,284 @@ if submitted: # Remove the status check here, as the wrapper will block anyway
             "llm_provider": st.session_state.payload_llm_provider,
             "llm_model": st.session_state.payload_llm_model
         }
-
         st.session_state.analysis_payload = payload # Store payload in state
         st.session_state.analysis_results = None # Clear previous results
         st.session_state.error_message = None # Clear previous error
         st.session_state.analysis_status = "RUNNING" # Set status to RUNNING
+        print(f"Form submitted successfully. Payload set in state. Triggering rerun for API call.")
+        # print(f"Captured Payload: {payload}") # Avoid logging sensitive details like full contexts
+        st.rerun() # Rerun the script to execute the API call block
 
-        print(f"Form submitted successfully. Payload set in state. Starting synchronous API task via wrapper.")
+# --- API Call Execution Block ---
+# This block runs if the status is "RUNNING"
+elif st.session_state.analysis_status == "RUNNING":
+     st.info(f"Analysis in progress... Sending request to backend API ({ANALYZE_ENDPOINT}).")
+     payload_to_send = st.session_state.get('analysis_payload')
 
-        # --- Execute the synchronous wrapper for the async API call ---
-        with st.spinner("Analysis in progress... Please wait. (Calling backend API...)"):
-            task_result = run_analysis_sync_wrapper(payload)
+     if not payload_to_send or not isinstance(payload_to_send, dict):
+         # Should not happen if validation worked, but safety check
+         error_msg = "Internal error: Analysis payload not found or is invalid in session state."
+         st.error(error_msg)
+         st.session_state.analysis_status = "ERROR"
+         st.session_state.error_message = error_msg
+         st.session_state.analysis_payload = None # Clear invalid payload
+         print(f"--- STREAMLIT STATE ERROR: {error_msg} ---")
+         st.rerun() # Rerun to show error state
+     else:
+         # Display LLM being used based on the payload
+         llm_display = f"{payload_to_send.get('llm_provider','?')}: {payload_to_send.get('llm_model','?')}"
+         st.write(f"Using LLM: {llm_display}")
 
-        # Update session state based on the result received from the wrapper
-        st.session_state.analysis_status = task_result.get("status", "ERROR") # Use status from task result
-        st.session_state.analysis_results = task_result.get("results")
-        st.session_state.error_message = task_result.get("error_message")
+         with st.spinner("Analysis in progress... This may take several minutes."):
+            results_data = None; error_msg = None
+            try:
+                print(f"Making API call with payload...")
+                # Use a timeout that's less than the Uvicorn worker timeout if possible, but long enough for analysis
+                # Assuming backend timeout is 2000s as discussed, let's use 1800s (30 minutes)
+                # It should match or be slightly less than the backend's processing timeout.
+                api_timeout_seconds = 1800 # 30 minutes
+                response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=api_timeout_seconds)
 
-        # --- IMPORTANT: Rerun the script to display the completed state ---
-        st.rerun()
+                if response.status_code == 200:
+                    results_data = response.json()
+                    print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
+                    if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
+                        # Backend reported an error, but API call was successful (status 200)
+                        error_msg = f"Backend Orchestrator reported an error: {results_data['error']}"
+                        st.session_state.analysis_status = "COMPLETE_WITH_ERROR" # Use a distinct status
+                        print(f"Backend reported error: {results_data['error']}")
+                    else:
+                        # Analysis completed successfully with no backend error reported
+                        st.session_state.analysis_status = "COMPLETE"
+                        print("Analysis completed successfully.")
+                else:
+                     # Handle non-200 status codes from the API
+                     error_msg = f"Backend API request failed! Status Code: {response.status_code}"
+                     try:
+                          # Try to get error detail from JSON response
+                          error_json = response.json()
+                          if 'detail' in error_json:
+                               error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
+                               error_msg += f"\nDetail: {error_detail}"
+                          else:
+                               error_detail = response.text[:200] + '...'
+                          print(f"Backend non-200 response: {response.text}") # Log full response for debugging
+                     except json.JSONDecodeError:
+                          # If response is not JSON, use raw text
+                          error_detail = response.text[:200] + '...'
+                          print(f"Backend non-200 response (non-JSON): {response.text}") # Log full response for debugging
 
+                     st.session_state.analysis_status = "ERROR" # General ERROR status for API request failures
+
+
+            except requests.exceptions.Timeout:
+                error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
+                st.session_state.analysis_status = "ERROR" # Consider timeout as an error in the UI for now
+                print(f"API Request Timeout after {api_timeout_seconds}s.")
+            except requests.exceptions.ConnectionError as e:
+                 error_msg = f"Could not connect to backend API at {ANALYZE_ENDPOINT}: {e}. Is the backend running?"
+                 st.session_state.analysis_status = "ERROR"
+                 print(f"API Connection Error: {e}")
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Request Exception calling backend: {type(e).__name__}: {e}"
+                st.session_state.analysis_status = "ERROR"
+                print(f"API Request Exception: {e}")
+                traceback.print_exc() # Log traceback for unexpected request errors
+            except Exception as e:
+                error_msg = f"Unexpected error during analysis request: {type(e).__name__}: {e}"
+                st.session_state.analysis_status = "ERROR"
+                print(f"--- UNEXPECTED ERROR IN STREAMLIT RUNNING BLOCK ---")
+                traceback.print_exc()
+
+            # Update session state with results and error message
+            st.session_state.analysis_results = results_data
+            st.session_state.error_message = error_msg
+            # Trigger a rerun to move to the display block
+            st.rerun()
 
 # --- Analysis Complete/Error Display Block ---
-# This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR (or IDLE initially)
-# The previous 'elif analysis_status == "RUNNING"' block is removed
-if st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR", "ERROR"]: # Include ERROR here
-
-    # Display error message if status is ERROR or COMPLETE_WITH_ERROR
-    if st.session_state.analysis_status == "ERROR":
-        st.error("Analysis Failed!")
-        if st.session_state.error_message:
-            st.error(st.session_state.error_message)
-        else:
-            st.error("An unknown error occurred during processing.")
+# This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR
+elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
+    results = st.session_state.analysis_results
+    if st.session_state.analysis_status == "COMPLETE":
+        st.success("Analysis complete!")
     elif st.session_state.analysis_status == "COMPLETE_WITH_ERROR":
         st.warning("Analysis completed with reported backend errors.")
-        if st.session_state.error_message:
-             st.error(st.session_state.error_message)
+
+    st.subheader("Analysis Summary")
+    st.markdown("**Key Takeaways:**")
+    # Display the analysis summary text
+    summary_text = results.get("analysis_summary", "Summary could not be generated or analysis failed early.")
+    st.info(summary_text)
+
+    # Display key metrics in columns
+    col_metrics1, col_metrics2, col_metrics3, col_metrics4 = st.columns(4)
+    with col_metrics1: st.metric("LLM Used", results.get("llm_used", "N/A"))
+    with col_metrics2: st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A"))
+    with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
+
+    # Get exposures count from the results dictionary
+    exposures_list_from_results = results.get("high_risk_exposures", [])
+    exposures_count = len(exposures_list_from_results)
+    with col_metrics4: st.metric("High Risk Exposures Found", exposures_count)
+
+    # Add link to Google Sheet Exposures tab
+    if GOOGLE_EXPOSURES_SHEET_URL:
+         st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
+         if EXPOSURES_SHEET_GID == "YOUR_EXPOSURES_SHEET_GID":
+             st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
+    elif GOOGLE_SHEET_URL:
+         st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
+         st.caption("Note: Google Sheet Exposures tab link not configured.")
+    else:
+         st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
 
 
-    # Proceed to display results if analysis_results are available, even in error state
-    if st.session_state.get('analysis_results') and isinstance(st.session_state.analysis_results, dict):
-        results = st.session_state.analysis_results
-
-        st.subheader("Analysis Summary")
-        st.markdown("**Key Takeaways:**")
-        # Display the analysis summary text
-        summary_text = results.get("analysis_summary", "Summary could not be generated or analysis failed early.")
-        st.info(summary_text)
-
-        # Display key metrics in columns
-        col_metrics1, col_metrics2, col_metrics3, col_metrics4 = st.columns(4)
-        with col_metrics1: st.metric("LLM Used", results.get("llm_used", "N/A"))
-        with col_metrics2: st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A"))
-        with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
-
-        # Get exposures count from the results dictionary
-        exposures_list_from_results = results.get("high_risk_exposures", [])
-        exposures_count = len(exposures_list_from_results)
-        with col_metrics4: st.metric("High Risk Exposures Found", exposures_count)
-
-        # Add link to Google Sheet Exposures tab
-        if GOOGLE_EXPOSURES_SHEET_URL:
-             st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
-             if EXPOSURES_SHEET_GID == "1468712289": # Check if the default GID is still the placeholder
-                 st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link to your sheet's Exposures tab.")
-             elif GOOGLE_EXPOSURES_SHEET_URL != GOOGLE_SHEET_URL:
-                  st.caption(f"Linking directly to Exposures tab (GID: {EXPOSURES_SHEET_GID}).")
-             # else it's just the base sheet link
-
-        elif GOOGLE_SHEET_URL:
-             st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
-             st.caption("Note: Google Sheet Exposures tab GID not configured for a direct link.")
-        else:
-             st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
+    # --- Display High Risk Exposures Table ---
+    st.subheader("Identified High Risk Exposures (Current Run)")
+    if exposures_list_from_results:
+        try:
+            # Create a Pandas DataFrame from the exposures list
+            exposures_df = pd.DataFrame(exposures_list_from_results)
+            # Select and order columns for display
+            display_cols = ["Entity", "Subsidiary/Affiliate", "Parent Company", "Risk_Severity", "Risk_Type", "Explanation", "Main_Sources"]
+            # Ensure all display_cols exist in the DataFrame before selecting
+            existing_cols = [col for col in display_cols if col in exposures_df.columns]
+            st.dataframe(exposures_df[existing_cols], use_container_width=True)
+        except Exception as exp_df_e:
+            st.warning(f"Error displaying exposures table: {exp_df_e}")
+            # Fallback to displaying JSON if table creation fails
+            st.json(exposures_list_from_results)
+    else:
+        st.write("No high risk exposures identified in this run.")
 
 
-        # --- Display High Risk Exposures Table ---
-        st.subheader("Identified High Risk Exposures (Current Run)")
-        if exposures_list_from_results:
+    # Display any backend errors reported (status 200 but error field present)
+    if results.get("error") and results["error"] != "None" and results["error"] != "":
+        st.error(f"Backend Orchestrator reported an error: {results['error']}")
+        # You might want to display more details here if available in the results dict
+
+    # --- Optional Expanders for Detailed Data ---
+    st.markdown("---") # Separator
+
+    with st.expander("Run Steps & Details", expanded=False):
+        st.subheader("Run Steps & Durations");
+        if results.get("steps"):
             try:
-                # Create a Pandas DataFrame from the exposures list
-                exposures_df = pd.DataFrame(exposures_list_from_results)
-                # Select and order columns for display
-                # Ensure 'Main_Sources' is included if it exists
-                display_cols = ["Entity", "Subsidiary/Affiliate", "Parent Company", "Risk_Severity", "Risk_Type", "Explanation", "Main_Sources"]
-                # Ensure all display_cols exist in the DataFrame before selecting
-                existing_cols = [col for col in display_cols if col in exposures_df.columns]
-                st.dataframe(exposures_df[existing_cols], use_container_width=True)
-            except Exception as exp_df_e:
-                st.warning(f"Error displaying exposures table: {exp_df_e}")
-                # Fallback to displaying JSON if table creation fails
-                st.json(exposures_list_from_results)
+                steps_data = []
+                for step in results["steps"]:
+                     if isinstance(step, dict):
+                          steps_data.append({
+                              "Name": step.get("name", "N/A"),
+                              "Duration (s)": step.get("duration", "N/A"),
+                              "Status": step.get("status", "N/A"),
+                              "Search Results": step.get("search_results_count", "N/A"),
+                              "Structured Results": step.get("structured_results_count", "N/A"),
+                              "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
+                              "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
+                              "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
+                              # Display counts from extracted_data_counts if available
+                              "Entities Extracted": step.get("extracted_data_counts", {}).get("entities", "N/A"),
+                              "Risks Extracted": step.get("extracted_data_counts", {}).get("risks", "N/A"),
+                              "Relationships Extracted": step.get("extracted_data_counts", {}).get("relationships", "N/A"),
+                              "Error Message": step.get("error_message", "") # Error message from any step
+                          })
+                     else:
+                          steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
+                steps_df = pd.DataFrame(steps_data)
+                # Define column order and drop columns where all values are N/A, "", or None
+                col_order = [
+                    "Name", "Status", "Duration (s)", "Error Message",
+                    "Search Results", "Structured Results",
+                    "Entities Extracted", "Risks Extracted", "Relationships Extracted",
+                    "Exposures Found", "URLs Checked", "KG Status",
+                ]
+                # Filter for columns that exist in the DataFrame and are not all empty/N/A
+                cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
+
+                steps_df = steps_df.reindex(columns=cols_to_display)
+                st.dataframe(steps_df, use_container_width=True)
+            except Exception as df_e:
+                st.warning(f"Error displaying steps table: {df_e}")
+                st.json(results.get("steps", "No steps data."))
+        else: st.write("No step details available.")
+
+    with st.expander("Final Extracted Data (Combined Raw)", expanded=False):
+        st.subheader("Final Extracted Data (Before Filtering for Sheet/KG)")
+        final_data = results.get("final_extracted_data", {})
+        if final_data:
+             st.json(final_data)
         else:
-            st.write("No high risk exposures identified in this run.")
+             st.write("No final extracted data available.")
 
+    with st.expander("Linkup Raw Structured Data", expanded=False):
+        st.subheader("Raw Structured Data Collected from Linkup")
+        structured_data_list = results.get("linkup_structured_data", [])
+        if structured_data_list:
+             st.json(structured_data_list)
+        else:
+             st.write("No raw structured data collected from Linkup.")
 
-        # --- Optional Expanders for Detailed Data ---
-        st.markdown("---") # Separator
+    with st.expander("Wayback Machine Results", expanded=False):
+        st.subheader("Wayback Machine Check Results")
+        wayback_results_list = results.get("wayback_results", [])
+        if wayback_results_list:
+            st.json(wayback_results_list)
+        else:
+             st.write("No wayback machine results available.")
 
-        with st.expander("Run Steps & Details", expanded=False):
+    with st.expander("Full Raw Results JSON", expanded=False):
+        st.subheader("Complete Raw JSON Output")
+        # Ensure the original high_risk_exposures list is included in the full raw JSON
+        # (It's already there as results["high_risk_exposures"])
+        st.json(results)
+
+# --- Error Display Block ---
+# This block runs if the status is ERROR (API request failed, timeout, etc.)
+elif st.session_state.analysis_status == "ERROR":
+    st.error("Analysis Failed!")
+    if st.session_state.error_message:
+        st.error(st.session_state.error_message)
+    else:
+        st.error("An unknown error occurred during processing.")
+
+    # Optionally display any partial results or steps if available, even in error state
+    if st.session_state.get('analysis_results') and isinstance(st.session_state.analysis_results, dict):
+         st.subheader("Partial Results (if any)")
+         partial_results = st.session_state.analysis_results
+         # Display partial metrics
+         col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
+         with col_metrics1: st.metric("LLM Used", partial_results.get("llm_used", "N/A"))
+         with col_metrics2: st.metric("Partial Duration (s)", partial_results.get("run_duration_seconds", "N/A"))
+         with col_metrics3: st.metric("KG Update Status (Partial)", partial_results.get("kg_update_status", "N/A"))
+
+         # Display partial steps
+         with st.expander("Completed Steps (Partial Run)", expanded=True):
             st.subheader("Run Steps & Durations");
-            if results.get("steps"):
+            if partial_results.get("steps"):
                 try:
                     steps_data = []
-                    for step in results["steps"]:
+                    for step in partial_results["steps"]:
                          if isinstance(step, dict):
                               steps_data.append({
                                   "Name": step.get("name", "N/A"),
                                   "Duration (s)": step.get("duration", "N/A"),
                                   "Status": step.get("status", "N/A"),
-                                  "Search Results": step.get("search_results_count", "N/A"),
-                                  "Structured Results": step.get("structured_results_count", "N/A"),
-                                  "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
-                                  "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
-                                  "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
-                                  # Display counts from extracted_data_counts if available
-                                  "Entities Extracted": step.get("extracted_data_counts", {}).get("entities", "N/A"),
-                                  "Risks Extracted": step.get("extracted_data_counts", {}).get("risks", "N/A"),
-                                  "Relationships Extracted": step.get("extracted_data_counts", {}).get("relationships", "N/A"),
-                                  "Error Message": step.get("error_message", "") # Error message from any step
+                                  "Error Message": step.get("error_message", "") # Show error message if step failed
                               })
-                         else:
-                              steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
+                         else: steps_data.append({"Name": "Invalid Step Data", "Status": "Error"})
                     steps_df = pd.DataFrame(steps_data)
-                    # Define column order and drop columns where all values are N/A, "", or None
-                    col_order = [
-                        "Name", "Status", "Duration (s)", "Error Message",
-                        "Search Results", "Structured Results",
-                        "Entities Extracted", "Risks Extracted", "Relationships Extracted",
-                        "Exposures Found", "URLs Checked", "KG Status",
-                    ]
-                    # Filter for columns that exist in the DataFrame and are not all empty/N/A
-                    cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
-
-                    steps_df = steps_df.reindex(columns=cols_to_display)
                     st.dataframe(steps_df, use_container_width=True)
                 except Exception as df_e:
-                    st.warning(f"Error displaying steps table: {df_e}")
-                    st.json(results.get("steps", "No steps data."))
+                    st.warning(f"Error displaying partial steps table: {df_e}")
+                    st.json(partial_results.get("steps", "No steps data."))
             else: st.write("No step details available.")
 
-        # Removed the expanders for raw Extracted Data, Structured Data, and Wayback Results
-        # based on the request to simplify the display and focus only on Exposures table + Summary
+         with st.expander("Partial Extracted Data (if any)", expanded=False):
+              st.json(partial_results.get("final_extracted_data", "No partial extracted data."))
+         with st.expander("Partial Structured Data (if any)", expanded=False):
+              st.json(partial_results.get("linkup_structured_data", "No partial structured data."))
 
-
-        with st.expander("Full Raw Results JSON", expanded=False):
-            st.subheader("Complete Raw JSON Output")
-            # Ensure the original high_risk_exposures list is included in the full raw JSON
-            # (It's already there as results["high_risk_exposures"])
-            st.json(results)
-
-    # --- Display error message if analysis_results are None (e.g., API call failed before returning data) ---
-    elif st.session_state.analysis_status == "ERROR" and st.session_state.get('analysis_results') is None:
-         # Error message already displayed above
-         pass # Nothing more to display if no results were returned
 
 # --- Initial/Idle State Display ---
 else:
