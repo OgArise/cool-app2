@@ -232,10 +232,11 @@ def translate_text(text: str, target_language: str, llm_provider: str, llm_model
 
 
     prompt = f"""Translate the following text into {target_lang_name}.
-IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phrases, explanations, or markdown.
+IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phrases, explanations, or markdown."""
 
-Text to translate:
-{text}"""
+    # Put text to translate separately to avoid issues with f-string and user text
+    full_prompt = f"{prompt}\n\nText to translate:\n{text}"
+
 
     raw_content = None
     api_error = None
@@ -248,7 +249,7 @@ Text to translate:
                  print("Warning: OpenAI library not available for translation.")
                  return None
 
-            request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": min(len(text) * 3, 2000)}
+            request_params = {"model": model_name_used, "messages": [{"role": "user", "content": full_prompt}], "temperature": 0.1, "max_tokens": min(len(text) * 3, 2000)}
             response = client_or_lib.chat.completions.create(**request_params)
             raw_content = response.choices[0].message.content
 
@@ -260,7 +261,7 @@ Text to translate:
 
             safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
             generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=min(len(text) * 3, 2000));
-            response_obj = client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
+            response_obj = client_or_lib.generate_content(full_prompt, generation_config=generation_config, safety_settings=safety_settings);
 
             if response_obj and response_obj.candidates and response_obj.candidates[0].content and response_obj.candidates[0].content.parts:
                  raw_content = response_obj.text
