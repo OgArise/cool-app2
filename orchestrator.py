@@ -111,7 +111,7 @@ def _get_gsheet_service():
             creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
             gsheet_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
             print("Google Sheets service authenticated successfully.")
-        except Exception as e: print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}"); gsheet_service = None
+        except Exception as e: print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}"); gheet_service = None
     return gsheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
@@ -483,7 +483,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step1_search_results) < max_global_results and len(step1_search_results) < search_threshold_results:
-            print("[Step 1 Search] Running SerpApi queries...")
+            print("[Step 1 Search] Running Serpapi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step1_all_queries
             for q_idx, query_text in enumerate(queries_for_serpapi):
@@ -828,9 +828,8 @@ def run_analysis(initial_query: str,
         if linkup_snippet_search_available:
              print(f"[Step 3 Search] Attempting Linkup snippet search: q='{specific_query_base}' (and variants)") # Removed num= param from log
              try:
-                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
+                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
-                  # Pass the combined query to search_linkup_snippets.
                   linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Removed num and country_code
                   if linkup_specific_results:
                        print(f"    Linkup Snippet Search returned {len(linkup_specific_results)} unique results after internal deduplication.")
@@ -884,7 +883,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step3_search_results) < max_specific_results and len(step3_search_results) < required_for_threshold:
-            print("[Step 3 Search] Running Serpapi queries...")
+            print("[Step 3 Search] Running SerpApi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step3_all_queries # Use all queries including Chinese ones for Serpapi (especially Baidu)
             for q_idx, query_text in enumerate(queries_for_serpapi):
@@ -1158,8 +1157,7 @@ def run_analysis(initial_query: str,
                            parent_col_value = other_chinese_company_name
                            sub_aff_col_value = triggering_company_name
                            exposure_risk_type_label = "Subsidiary Risk" # Risk on subsidiary affects parent
-                      else: continue # Should not happen
-
+                      else: continue
 
                  elif r_type_upper == "SUBSIDIARY_OF":
                       # Inverse of PARENT_COMPANY_OF
