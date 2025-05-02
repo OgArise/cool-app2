@@ -216,7 +216,7 @@ if submitted and st.session_state.analysis_status != "RUNNING":
     st.session_state.payload_specific_context = st.session_state.specific_context_input
     st.session_state.payload_specific_country_name = st.session_state.country_select # Store name, convert to code for API
     st.session_state.payload_max_global = st.session_state.max_global_input
-    st.session_state.payload_max_specific = st.session_state.payload_max_specific
+    st.session_state.payload_max_specific = st.session_state.max_specific_input
 
     # Capture selected LLM provider and model
     selected_provider_name_from_state = st.session_state.sidebar_llm_provider_name_select # Use sidebar selectbox value
@@ -310,7 +310,7 @@ elif st.session_state.analysis_status == "RUNNING":
                  print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
                  if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
                      # Backend reported an error, but API call was successful (status 200)
-                     error_msg = f"Backend Orchestrator reported an error: {results['error']}" # Access error from results_data, not results
+                     error_msg = f"Backend Orchestrator reported an error: {results_data['error']}" # Access error from results_data
                      st.session_state.analysis_status = "COMPLETE_WITH_ERROR" # Use a distinct status
                      print(f"Backend reported error: {results_data['error']}")
                  else:
@@ -327,11 +327,11 @@ elif st.session_state.analysis_status == "RUNNING":
                             error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
                             error_msg += f"\nDetail: {error_detail}"
                        else:
-                            error_msg += f"\nResponse: {response.text[:200]}..."
+                            error_detail = response.text[:200] + '...'
                        print(f"Backend non-200 response: {response.text}") # Log full response for debugging
                   except json.JSONDecodeError:
                        # If response is not JSON, use raw text
-                       error_msg += f"\nResponse: {response.text[:200]}..."
+                       error_detail = response.text[:200] + '...'
                        print(f"Backend non-200 response (non-JSON): {response.text}") # Log full response for debugging
 
                   st.session_state.analysis_status = "ERROR" # General ERROR status for API request failures
