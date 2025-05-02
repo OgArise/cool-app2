@@ -724,7 +724,7 @@ def link_entities_to_risk(risks: List[Dict],
               if isinstance(risk, dict):
                    risk["related_entities"] = []
                    other_risks.append(risk)
-         return other_risks
+         return risks
 
 
     updated_risks_from_linking = [] # This will hold the risks after attempting linking
