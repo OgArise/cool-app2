@@ -743,7 +743,8 @@ def link_entities_to_risk(risks: List[Dict],
         risk_desc = risk['description']; risk_urls = risk['source_urls']
         # Prepare context with snippets associated with this specific risk
         risk_context_text = ""; added_snippets = 0; max_chars = 7000
-        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [{', '.join([f"'{name}'" for name in list_of_entity_names])}]\n\nRelevant Text Snippets:\n"
+        # Corrected f-string syntax: Added spaces around the { } expression within the brackets
+        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [ {', '.join([f"'{name}'" for name in list_of_entity_names])} ]\n\nRelevant Text Snippets:\n"
         char_count = len(context_intro) # Start char count with intro length
 
         snippets_for_this_risk = [all_snippets_map.get(url) for url in risk_urls if url in all_snippets_map]
@@ -851,9 +852,11 @@ Schema:
 
 Focus ONLY on relationships where BOTH entity1 and entity2 are from the provided list of identified COMPANY or ORGANIZATION entities.
 The relationship_type MUST be one of: SUBSIDIARY_OF, PARENT_COMPANY_OF, AFFILIATE_OF, or JOINT_VENTURE_PARTNER.
-Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
+Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. No explanations or markdown.
 
-
+Begin analysis of text snippets:
+{context_text}
+"""
     parsed_json = _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_relationships = []
@@ -1369,7 +1372,7 @@ def generate_analysis_summary(results: Dict[str, Any], query: str, exposures_cou
     risks = results.get("final_extracted_data", {}).get("risks", [])
     relationships = results.get("final_extracted_data", {}).get("relationships", [])
     structured_raw_data_list = results.get("linkup_structured_data", [])
-    exposures_list = results.get("high_risk_exposures", []) # Use the list of generated exposures
+    exposures_list = results.get("high_risk_exposures", []) # Get the actual list of exposures
 
 
     if not any([entities, risks, relationships, exposures_count > 0, structured_raw_data_list]): return "No significant data extracted or exposures identified to generate a summary."
@@ -1556,7 +1559,7 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
                  print("Warning: Google Generative AI library not available for summary generation.")
                  return "Summary generation skipped: Google Generative AI library missing."
 
-            safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED];
+            safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
             generation_config = genai.types.GenerationConfig(temperature=temperature, max_output_tokens=max_tokens);
             response_obj = client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
 
@@ -1579,7 +1582,7 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
             cleaned_summary = cleaned_content.strip()
 
             conversational_fillers = ["sorry", "apologize", "cannot", "unable", "provide", "based", "above", "text", "hello", "hi"]
-            if not cleaned_summary or len(cleaned_summary) < 50 or any(re.search(r'\b' + word + r'\b', cleaned_summary.lower()) for word in conversational_fillers):
+            if not cleaned_summary or len(cleaned_summary) < 50 or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers):
                 print("Warning: Summary short/empty/apologetic.");
                 return f"Could not generate a meaningful summary based on the extracted data."
         else:
@@ -1720,7 +1723,7 @@ if __name__ == "__main__":
             print("\nExtracted Relationships (Ownership/Affiliate/JV only):")
             print(json.dumps(test_relationships_ownership, indent=2))
         else:
-            print("\nSkipping ownership relationship extraction - no COMPANY/ORGANIZATION entities found.")
+            print("\nSkipping ownership relationship extraction.")
         time.sleep(1)
 
         print("\nExtracting Regulatory/Sanction Relationships from Combined/Translated Snippets...")
@@ -1732,7 +1735,7 @@ if __name__ == "__main__":
             print("\nExtracted Regulatory/Sanction Relationships:")
             print(json.dumps(test_relationships_reg_sanc, indent=2))
         else:
-            print("\nSkipping regulatory/sanction relationship extraction - no entities found.")
+            print("\nSkipping regulatory/sanction relationship extraction.")
         time.sleep(1)
 
         # Combine all relationships for the test output
