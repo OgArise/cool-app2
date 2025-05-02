@@ -271,7 +271,8 @@ if submitted and st.session_state.analysis_status != "RUNNING":
     st.session_state.payload_specific_context = st.session_state.specific_context_input
     st.session_state.payload_specific_country_name = st.session_state.country_select # Store name, convert to code for API
     st.session_state.payload_max_global = st.session_state.max_global_input
-    st.session_state.payload_max_specific = st.session_state.payload_max_specific
+    # Corrected line: Assign value from max_specific_input widget
+    st.session_state.payload_max_specific = st.session_state.max_specific_input
 
     # Capture selected LLM provider and model
     selected_provider_name_from_state = st.session_state.sidebar_llm_provider_name_select # Use sidebar selectbox value
