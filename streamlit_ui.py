@@ -354,7 +354,8 @@ if submitted: # Remove the status check here, as the wrapper will block anyway
         st.session_state.analysis_results = task_result.get("results")
         st.session_state.error_message = task_result.get("error_message")
 
-        # No need for rerun here, as the script execution continues after the blocking call
+        # --- IMPORTANT: Rerun the script to display the completed state ---
+        st.rerun()
 
 
 # --- Analysis Complete/Error Display Block ---
