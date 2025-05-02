@@ -4,7 +4,7 @@ import streamlit as st
 import json
 from datetime import datetime
 import os
-import requests
+import requests # User provided code uses requests
 import pandas as pd
 import traceback
 
@@ -26,7 +26,11 @@ except ImportError:
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
-ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
+# Note: The user provided code doesn't have the trailing slash fix.
+# Sticking strictly to correcting the indentation error in the provided code.
+# CLEANED_BACKEND_API_URL = BACKEND_API_URL.rstrip('/')
+ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze" # Using the provided definition
+
 GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
 # Define the specific GID for the Exposures tab if known
@@ -100,11 +104,13 @@ def update_contexts():
             st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
             print(f"Updated contexts based on query: '{query}'")
 
-        st.session_state._last_updated_query = query # Always update the last processed query
+         # --- CORRECTED INDENTATION ---
+         st.session_state._last_updated_query = query # Always update the last processed query
     elif not query:
         # Reset to default generic contexts if query is cleared
         st.session_state.global_context_input = original_default_global
         st.session_state.specific_context_input = original_default_specific
+        # --- CORRECTED INDENTATION ---
         st.session_state._last_updated_query = ""
         print("Query cleared, reset contexts to default.")
 
@@ -134,6 +140,7 @@ st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 # Display backend URL status
 if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
 elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
+# Note: Using the provided URL definition without the trailing slash fix
 else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
 
 st.sidebar.title("LLM Selection")
@@ -294,6 +301,8 @@ elif st.session_state.analysis_status == "RUNNING":
                 # Assuming backend timeout is 2000s as discussed, let's use 1800s (30 minutes)
                 # It should match or be slightly less than the backend's processing timeout.
                 api_timeout_seconds = 1800 # 30 minutes
+                # Note: The user provided code uses requests instead of httpx.
+                # Sticking strictly to correcting the indentation error in the provided code.
                 response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=api_timeout_seconds)
 
                 if response.status_code == 200:
