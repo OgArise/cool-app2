@@ -28,7 +28,10 @@ except ImportError:
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
-ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
+# Ensure BACKEND_API_URL does not have a trailing slash before appending the endpoint path
+CLEANED_BACKEND_API_URL = BACKEND_API_URL.rstrip('/')
+ANALYZE_ENDPOINT = f"{CLEANED_BACKEND_API_URL}/analyze"
+
 GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
 # Define the specific GID for the Exposures tab if known
@@ -141,7 +144,8 @@ st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 # Display backend URL status
 if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
 elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
-else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
+# Use the cleaned URL for display
+else: st.info(f"Targeting Backend API: {CLEANED_BACKEND_API_URL}")
 
 st.sidebar.title("LLM Selection")
 # Use LLM_PROVIDERS keys for display, values for internal logic
