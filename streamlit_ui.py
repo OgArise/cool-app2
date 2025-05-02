@@ -100,7 +100,9 @@ def update_contexts():
             st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
             print(f"Updated contexts based on query: '{query}'")
 
-        st.session_state._last_updated_query = query # Always update the last processed query
+         # Corrected indentation: This line should be part of the outer if block, aligned with the inner if statement.
+         st.session_state._last_updated_query = query # Always update the last processed query
+
     elif not query:
         # Reset to default generic contexts if query is cleared
         st.session_state.global_context_input = original_default_global
@@ -214,7 +216,7 @@ if submitted and st.session_state.analysis_status != "RUNNING":
     st.session_state.payload_specific_context = st.session_state.specific_context_input
     st.session_state.payload_specific_country_name = st.session_state.country_select # Store name, convert to code for API
     st.session_state.payload_max_global = st.session_state.max_global_input
-    st.session_state.payload_max_specific = st.session_state.max_specific_input
+    st.session_state.payload_max_specific = st.session_state.payload_max_specific
 
     # Capture selected LLM provider and model
     selected_provider_name_from_state = st.session_state.sidebar_llm_provider_name_select # Use sidebar selectbox value
@@ -308,7 +310,7 @@ elif st.session_state.analysis_status == "RUNNING":
                  print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
                  if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
                      # Backend reported an error, but API call was successful (status 200)
-                     error_msg = f"Backend Orchestrator reported an error: {results_data['error']}"
+                     error_msg = f"Backend Orchestrator reported an error: {results['error']}" # Access error from results_data, not results
                      st.session_state.analysis_status = "COMPLETE_WITH_ERROR" # Use a distinct status
                      print(f"Backend reported error: {results_data['error']}")
                  else:
@@ -325,7 +327,7 @@ elif st.session_state.analysis_status == "RUNNING":
                             error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
                             error_msg += f"\nDetail: {error_detail}"
                        else:
-                            error_detail = response.text[:200] + '...'
+                            error_msg += f"\nResponse: {response.text[:200]}..."
                        print(f"Backend non-200 response: {response.text}") # Log full response for debugging
                   except json.JSONDecodeError:
                        # If response is not JSON, use raw text
@@ -391,7 +393,7 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
 
     # Add link to Google Sheet Exposures tab
     if GOOGLE_EXPOSURES_SHEET_URL:
-         st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEhet_URL})")
+         st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
          if EXPOSURES_SHEET_GID == "1468712289": # Check if the default GID is still the placeholder
              st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link to your sheet's Exposures tab.")
          elif GOOGLE_EXPOSURES_SHEET_URL != GOOGLE_SHEET_URL:
