@@ -6,6 +6,10 @@ requests
 google-api-python-client
 google-search-results # SerpApi client
 
+httpx # Added for async API calls
+
+asyncio
+
 # LLM / NLP
 openai # Or other LLM client library (anthropic, cohere, etc.)
 
