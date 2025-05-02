@@ -744,8 +744,10 @@ def link_entities_to_risk(risks: List[Dict],
         risk_desc = risk['description']; risk_urls = risk['source_urls']
         # Prepare context with snippets associated with this specific risk
         risk_context_text = ""; added_snippets = 0; max_chars = 7000
-        # Corrected f-string syntax: Added spaces around the { } expression within the brackets
-        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [ {', '.join([f"'{name}'" for name in list_of_entity_names])} ]\n\nRelevant Text Snippets:\n"
+        # Corrected f-string syntax for the potential entities list string
+        potential_entities_str = ', '.join([f"'{name}'" for name in list_of_entity_names])
+        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [ {potential_entities_str} ]\n\nRelevant Text Snippets:\n"
+
         char_count = len(context_intro) # Start char count with intro length
 
         snippets_for_this_risk = [all_snippets_map.get(url) for url in risk_urls if url in all_snippets_map]
