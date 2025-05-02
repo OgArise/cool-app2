@@ -4,7 +4,10 @@ import streamlit as st
 import json
 from datetime import datetime
 import os
-import requests
+# Replaced requests with httpx as needed for async function used with asyncio.run
+# import requests
+import httpx # Import httpx
+import asyncio # Import asyncio
 import pandas as pd
 import traceback
 
@@ -26,7 +29,10 @@ except ImportError:
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
-ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
+# Ensure BACKEND_API_URL does not have a trailing slash before appending the endpoint path
+CLEANED_BACKEND_API_URL = BACKEND_API_URL.rstrip('/')
+ANALYZE_ENDPOINT = f"{CLEANED_BACKEND_API_URL}/analyze"
+
 GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
 # Define the specific GID for the Exposures tab if known
@@ -44,6 +50,14 @@ DEFAULT_MODELS = {
     "openai": getattr(config, 'DEFAULT_OPENAI_MODEL', "gpt-4o-mini") if config else "gpt-4o-mini",
     "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "google/gemini-flash-1.5") if config else "google/gemini-flash-1.5"
 }
+
+# Determine the default provider key based on the name 'OpenAI'
+# Find the index of 'OpenAI' in the list of provider names
+try:
+    default_provider_index = list(LLM_PROVIDERS.keys()).index("OpenAI")
+except ValueError:
+    default_provider_index = 0 # Fallback to the first provider if OpenAI is not in the list
+
 
 def get_country_options():
     options = {"Global": "global"}
@@ -75,20 +89,28 @@ def update_contexts():
     """Updates the default context fields based on the initial query input."""
     query = st.session_state.get("initial_query_input", "")
     # Only update if the query has changed AND the contexts haven't been manually edited
+    # Check if contexts are still the *original* default ones before overriding
+    current_global = st.session_state.get("global_context_input", "")
+    current_specific = st.session_state.get("specific_context_input", "")
+    original_default_global = "Global financial news and legal filings for compliance issues"
+    original_default_specific = "Search for specific company examples and regulatory actions"
+
     if query and query != st.session_state.get("_last_updated_query", ""):
-        # Check if contexts are still the default ones before overriding
-        current_global = st.session_state.get("global_context_input", "")
-        current_specific = st.session_state.get("specific_context_input", "")
-        if current_global == "Global financial news and legal filings for compliance issues" and \
-           current_specific == "Search for specific company examples and regulatory actions":
+         # Check if contexts are still the *last auto-generated* ones based on the previous query OR the original defaults
+         last_auto_global = f"Global financial news and legal filings for '{st.session_state.get('_last_updated_query', '')}'"
+         last_auto_specific = f"Search for specific company examples and regulatory actions related to '{st.session_state.get('_last_updated_query', '')}'"
+
+         if current_global in [original_default_global, last_auto_global] and \
+            current_specific in [original_default_specific, last_auto_specific]:
             st.session_state.global_context_input = f"Global financial news and legal filings for '{query}'"
             st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
             print(f"Updated contexts based on query: '{query}'")
-        st.session_state._last_updated_query = query # Always update the last processed query
+
+         st.session_state._last_updated_query = query # Always update the last processed query
     elif not query:
         # Reset to default generic contexts if query is cleared
-        st.session_state.global_context_input = "Global financial news and legal filings for compliance issues"
-        st.session_state.specific_context_input = "Search for specific company examples and regulatory actions"
+        st.session_state.global_context_input = original_default_global
+        st.session_state.specific_context_input = original_default_specific
         st.session_state._last_updated_query = ""
         print("Query cleared, reset contexts to default.")
 
@@ -101,12 +123,18 @@ if 'analysis_payload' not in st.session_state: st.session_state.analysis_payload
 if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
 if 'error_message' not in st.session_state: st.session_state.error_message = None
 if '_last_updated_query' not in st.session_state: st.session_state._last_updated_query = ""
+# Set initial query default to blank
+if "initial_query_input" not in st.session_state: st.session_state.initial_query_input = ""
 
 # Initialize LLM model text inputs for each provider
 for provider_key in LLM_PROVIDERS.values():
      session_key_model = f"{provider_key}_model_input"
      if session_key_model not in st.session_state:
           st.session_state[session_key_model] = DEFAULT_MODELS.get(provider_key, "")
+
+# Remove the analysis_task initialization as it's no longer used for polling
+# if 'analysis_task' not in st.session_state:
+#     st.session_state.analysis_task = None
 
 
 st.set_page_config(page_title="AI Analyst Agent", layout="wide")
@@ -116,11 +144,13 @@ st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 # Display backend URL status
 if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
 elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
-else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
+# Use the cleaned URL for display
+else: st.info(f"Targeting Backend API: {CLEANED_BACKEND_API_URL}")
 
 st.sidebar.title("LLM Selection")
 # Use LLM_PROVIDERS keys for display, values for internal logic
-selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=0, key='sidebar_llm_provider_name_select' )
+# Set default index based on finding 'OpenAI'
+selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=default_provider_index, key='sidebar_llm_provider_name_select' )
 selected_provider_key = LLM_PROVIDERS[selected_provider_name]
 
 # Get the current model value for the selected provider from session state
@@ -143,18 +173,17 @@ llm_model = st.sidebar.text_input(
 st.sidebar.caption("✨ Tip: Google AI & OpenRouter often have free tiers. OpenAI requires paid credits.")
 
 st.subheader("1. Enter Your Initial Query")
+# Set initial query default to blank
 initial_query_value = st.text_input(
     "Initial Search Query:",
-    st.session_state.get("initial_query_input", "Corporate tax evasion cases 2020-2023"),
+    value=st.session_state.get("initial_query_input", ""), # Default to blank
     key="initial_query_input",
     on_change=update_contexts, # Trigger context update when query changes
     help="Enter the primary query to initiate the analysis."
 )
-# Manual trigger for context update if needed (e.g., user clears and re-types)
-# This check is redundant with on_change, but good as a safety if on_change misbehaves
-# if st.session_state.initial_query_input and st.session_state.initial_query_input != st.session_state.get("_last_updated_query", ""):
-#     update_contexts()
-#     st.rerun() # Rerun to update textareas
+# Ensure contexts are updated on initial load if the default wasn't blank and hasn't been processed
+if st.session_state.initial_query_input and not st.session_state.get("_last_updated_query"):
+    update_contexts()
 
 
 st.subheader("2. Configure Search & Run Analysis")
@@ -169,14 +198,15 @@ with st.form("analysis_form"):
     with col1:
         # Find the index for the default country ('cn') for the selectbox
         try:
-            default_country_index = COUNTRY_DISPLAY_NAMES.index("China") if "China" in COUNTRY_DISPLAY_NAMES else 0
+            default_country_index_select = COUNTRY_DISPLAY_NAMES.index("China") if "China" in COUNTRY_DISPLAY_NAMES else 0
         except ValueError:
-            default_country_index = 0 # Fallback if China is not in the list for some reason
+            default_country_index_select = 0 # Fallback if China is not in the list for some reason
+
 
         selected_country_name_widget_value = st.selectbox(
             "Specific Country Search Target",
             options=COUNTRY_DISPLAY_NAMES,
-            index=default_country_index,
+            index=default_country_index_select,
             key='country_select',
             help="Select 'Global' or a specific country for the targeted search."
         )
@@ -185,6 +215,78 @@ with st.form("analysis_form"):
         max_specific_results = st.number_input("Max Specific Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_specific_input', help="Maximum number of search results requested from *each* enabled country-specific search engine.")
 
     submitted = st.form_submit_button("Run Analysis")
+
+# --- Asynchronous API Call Function ---
+# This function will be run in the background by asyncio
+async def run_analysis_async(payload):
+    """Makes the asynchronous API call to the backend."""
+    try:
+        # Use httpx.AsyncClient for asynchronous requests
+        # Use a timeout that is reasonable for the API to respond
+        # It should be less than Streamlit's overall script timeout if possible
+        api_timeout_seconds = 1800 # 30 minutes (should match or be less than backend processing timeout)
+        async with httpx.AsyncClient(timeout=api_timeout_seconds) as client:
+            print(f"Streamlit making async API call to {ANALYZE_ENDPOINT}")
+            response = await client.post(ANALYZE_ENDPOINT, json=payload)
+
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        results_data = response.json()
+        print(f"Streamlit received backend analysis response. Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
+
+        # Check if the backend reported an error in the response body
+        if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
+             return {"status": "COMPLETE_WITH_ERROR", "results": results_data, "error_message": f"Backend Orchestrator reported an error: {results_data['error']}"}
+        else:
+             return {"status": "COMPLETE", "results": results_data, "error_message": None}
+
+    except httpx.TimeoutException:
+        error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
+        print(error_msg)
+        return {"status": "ERROR", "results": None, "error_message": error_msg}
+    except httpx.RequestError as e:
+        error_msg = f"An HTTP request error occurred calling backend API at {ANALYZE_ENDPOINT}: {e}"
+        print(error_msg)
+        traceback.print_exc()
+        return {"status": "ERROR", "results": None, "error_message": error_msg}
+    except httpx.HTTPStatusError as e:
+         error_msg = f"Backend API returned HTTP error {e.response.status_code} for {e.request.url}"
+         try:
+              # Safely attempt to get JSON detail, fallback to text
+              error_json = e.response.json()
+              if 'detail' in error_json:
+                   # Use json.dumps to handle potential list/dict details nicely
+                   error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
+                   error_msg += f"\nDetail: {error_detail}"
+              else:
+                   # If no 'detail' key, just take the start of the response text
+                   error_msg += f"\nResponse: {e.response.text[:200]}..."
+         except json.JSONDecodeError:
+              # If response is not JSON, use raw text
+              error_msg += f"\nResponse: {e.response.text[:200]}..."
+         print(error_msg)
+         traceback.print_exc()
+         return {"status": "ERROR", "results": None, "error_message": error_msg}
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during the API request: {type(e).__name__}: {e}"
+        print(f"--- UNEXPECTED ERROR IN STREAMLIT ASYNC CALL ---")
+        traceback.print_exc()
+        return {"status": "ERROR", "results": None, "error_message": error_msg}
+
+
+# --- Synchronous Wrapper to Run Async Code ---
+def run_analysis_sync_wrapper(payload):
+    """Synchronously runs the async API call and returns its result."""
+    try:
+        # Use asyncio.run to execute the async function
+        return asyncio.run(run_analysis_async(payload))
+    except Exception as e:
+        # Catch any exceptions from asyncio.run or the async function itself
+        error_msg = f"Error during synchronous async execution: {type(e).__name__}: {e}"
+        print(f"--- ERROR IN SYNC ASYNC WRAPPER ---")
+        traceback.print_exc()
+        return {"status": "ERROR", "results": None, "error_message": error_msg}
+
 
 # --- Analysis Trigger and Execution ---
 # This block runs when the form is submitted OR st.rerun() is called while status is RUNNING
@@ -211,9 +313,9 @@ if submitted and st.session_state.analysis_status != "RUNNING":
         validation_errors.append("Please select a valid LLM Provider and Model in the sidebar.")
     if BACKEND_API_URL.startswith("YOUR_"):
          validation_errors.append("Backend API URL needs configuration. Please set the `BACKEND_API_URL` environment variable.")
-    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or 'related to' in st.session_state.get('payload_specific_context','')):
-         # Warn if country is Global but specific context is still country-focused
-         st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still mentions 'specific company examples and regulatory actions related to...'. Consider adjusting the specific context for a global search.")
+    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('payload_specific_context','').lower() and st.session_state.get('_last_updated_query','').lower() not in st.session_state.get('specific_context_input','').lower())):
+         # Warn if country is Global but specific context is still country-focused based on default text
+         st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still seems focused on specific companies/actions related to a country. Consider adjusting the specific context for a global search.")
          # Decided not to block, just warn
 
 
@@ -268,71 +370,18 @@ elif st.session_state.analysis_status == "RUNNING":
          st.write(f"Using LLM: {llm_display}")
 
          with st.spinner("Analysis in progress... This may take several minutes."):
-            results_data = None; error_msg = None
-            try:
-                print(f"Making API call with payload...")
-                # Use a timeout that's less than the Uvicorn worker timeout if possible, but long enough for analysis
-                # Assuming backend timeout is 2000s as discussed, let's use 1800s (30 minutes)
-                # It should match or be slightly less than the backend's processing timeout.
-                api_timeout_seconds = 1800 # 30 minutes
-                response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=api_timeout_seconds)
+            # --- Call the synchronous wrapper which runs the async API call ---
+            task_result = run_analysis_sync_wrapper(payload_to_send)
 
-                if response.status_code == 200:
-                    results_data = response.json()
-                    print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
-                    if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
-                        # Backend reported an error, but API call was successful (status 200)
-                        error_msg = f"Backend Orchestrator reported an error: {results_data['error']}"
-                        st.session_state.analysis_status = "COMPLETE_WITH_ERROR" # Use a distinct status
-                        print(f"Backend reported error: {results_data['error']}")
-                    else:
-                        # Analysis completed successfully with no backend error reported
-                        st.session_state.analysis_status = "COMPLETE"
-                        print("Analysis completed successfully.")
-                else:
-                     # Handle non-200 status codes from the API
-                     error_msg = f"Backend API request failed! Status Code: {response.status_code}"
-                     try:
-                          # Try to get error detail from JSON response
-                          error_json = response.json()
-                          if 'detail' in error_json:
-                               error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
-                               error_msg += f"\nDetail: {error_detail}"
-                          else:
-                               error_msg += f"\nResponse: {response.text[:200]}..."
-                          print(f"Backend non-200 response: {response.text}") # Log full response for debugging
-                     except json.JSONDecodeError:
-                          # If response is not JSON, use raw text
-                          error_msg += f"\nResponse: {response.text[:200]}..."
-                          print(f"Backend non-200 response (non-JSON): {response.text}") # Log full response for debugging
+            # Update session state based on the result received from the wrapper
+            st.session_state.analysis_status = task_result.get("status", "ERROR") # Use status from task result
+            st.session_state.analysis_results = task_result.get("results")
+            st.session_state.error_message = task_result.get("error_message")
 
-                     st.session_state.analysis_status = "ERROR" # General ERROR status for API request failures
+         # --- IMPORTANT: Trigger a rerun to move to the display block ---
+         # This ensures the UI updates after the blocking spinner and state change
+         st.rerun()
 
-
-            except requests.exceptions.Timeout:
-                error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
-                st.session_state.analysis_status = "ERROR" # Consider timeout as an error in the UI for now
-                print(f"API Request Timeout after {api_timeout_seconds}s.")
-            except requests.exceptions.ConnectionError as e:
-                 error_msg = f"Could not connect to backend API at {ANALYZE_ENDPOINT}: {e}. Is the backend running?"
-                 st.session_state.analysis_status = "ERROR"
-                 print(f"API Connection Error: {e}")
-            except requests.exceptions.RequestException as e:
-                error_msg = f"Request Exception calling backend: {type(e).__name__}: {e}"
-                st.session_state.analysis_status = "ERROR"
-                print(f"API Request Exception: {e}")
-                traceback.print_exc() # Log traceback for unexpected request errors
-            except Exception as e:
-                error_msg = f"Unexpected error during analysis request: {type(e).__name__}: {e}"
-                st.session_state.analysis_status = "ERROR"
-                print(f"--- UNEXPECTED ERROR IN STREAMLIT RUNNING BLOCK ---")
-                traceback.print_exc()
-
-            # Update session state with results and error message
-            st.session_state.analysis_results = results_data
-            st.session_state.error_message = error_msg
-            # Trigger a rerun to move to the display block
-            st.rerun()
 
 # --- Analysis Complete/Error Display Block ---
 # This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR
@@ -367,7 +416,7 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
              st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
     elif GOOGLE_SHEET_URL:
          st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
-         st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` if you know the correct GID for the Exposures tab for a direct link.")
+         st.caption("Note: Google Sheet Exposures tab link not configured.")
     else:
          st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
 
