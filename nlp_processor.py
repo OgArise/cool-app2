@@ -166,7 +166,8 @@ IMPORTANT: Your entire response must contain ONLY the comma-separated list of ke
 
             safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
             generation_config = genai.types.GenerationConfig(temperature=0.2, max_output_tokens=150)
-            response = client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
+            response = client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
+
             if not response.candidates:
                 feedback = getattr(response, 'prompt_feedback', None)
                 block_reason = getattr(feedback, 'block_reason', 'Unknown')
@@ -416,7 +417,7 @@ def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: str,
             except Exception as e_call:
                  # Retry without JSON mode if the error suggests response_format issue
                  if attempt_json_mode and llm_provider == "openai" and "response_format" in request_params and \
-                    any(err_txt in str(e_call).lower() for err_txt in ["response_format", "json_object", "messages must contain the word 'json'", "invalid response format"]):
+                    any(err_txt in str(e_call).lower() for err_txt in ["response_format", "json_object", "messages must contain the word 'json", "invalid response format"]):
                      print(f"--- [{function_name}] WARNING: OpenAI JSON mode likely failed ({type(e_call).__name__}). Retrying WITHOUT JSON mode... ---")
                      del request_params["response_format"]
                      try:
@@ -744,9 +745,11 @@ def link_entities_to_risk(risks: List[Dict],
         risk_desc = risk['description']; risk_urls = risk['source_urls']
         # Prepare context with snippets associated with this specific risk
         risk_context_text = ""; added_snippets = 0; max_chars = 7000
-        # Corrected f-string syntax for the potential entities list string
-        potential_entities_str = ', '.join([f"'{name}'" for name in list_of_entity_names])
-        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [ {potential_entities_str} ]\n\nRelevant Text Snippets:\n"
+        # Construct the list of potential entities string separately
+        potential_entities_list_str = ', '.join([f"'{name}'" for name in list_of_entity_names])
+        # Construct the context_intro string, embedding the pre-formatted list string
+        context_intro = f"The following risk was identified: \"{risk_desc}\". It was found in text snippets from these sources: {', '.join(risk_urls)}. Identify which of the following entities are directly mentioned *within the context of this specific risk* in the snippets.\n\nList of Potential Entities: [ {potential_entities_list_str} ]\n\nRelevant Text Snippets:\n"
+
 
         char_count = len(context_intro) # Start char count with intro length
 
@@ -1786,6 +1789,7 @@ if __name__ == "__main__":
                           "stake_percentage": 100,
                           "source_date": "2022-11-01",
                           "source_description": "SEC Filing",
+                           # Ensured source_url is included
                           "source_url": "https://linkup.so/source/filing_789"
                       },
                        { # Another relationship for Beta Industries
@@ -1795,6 +1799,7 @@ if __name__ == "__main__":
                            "stake_percentage": 51,
                            "source_date": "2023-03-15",
                            "source_description": "Annual Report",
+                            # Ensured source_url is included
                            "source_url": "https://linkup.so/source/annual_report_111"
                        }
                   ]
@@ -1811,6 +1816,7 @@ if __name__ == "__main__":
                           "description": "Investigation into anti-competitive practices",
                           "affected_entities": ["Company S", "Company T"], # List of affected companies
                           "source_date": "2024-04-01",
+                           # Ensured source_url is included
                           "source_url": "https://linkup.so/source/samr_action_1"
                       }
                   ]

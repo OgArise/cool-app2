@@ -223,6 +223,7 @@ def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, country_
         try:
             print(f"  Linkup Query: '{q[:50]}...'") # Print truncated query
 
+            # Construct parameters dictionary *excluding* 'num' and 'country_code' as direct keyword arguments
             params = {
                 "query": q,
                 "depth": "standard", # or "deep" depending on desired depth
@@ -235,7 +236,10 @@ def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, country_
             # Removed 'country_code' as a direct parameter based on previous errors.
             # Country context should ideally be in the query string itself for Linkup.
 
-            response = linkup_client.search(**params) # Corrected params no longer include 'num' or 'country_code'
+            # Pass the parameters to the Linkup search method using **params
+            # If LinkupClient.search *does* support a 'num' parameter, the SDK's documentation would specify it.
+            # Based on the errors, it does not support 'num' or 'country_code' as keyword args here.
+            response = linkup_client.search(**params)
 
             if isinstance(response, LinkupSearchResults) and hasattr(response, 'results') and isinstance(response.results, list):
                  linkup_results_list_for_query = response.results
@@ -245,7 +249,7 @@ def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, country_
                  for item in linkup_results_list_for_query:
                       # Standardize each item. standardize_result handles LinkupSDK objects.
                       standardized = standardize_result(item, source='linkup_snippet_search')
-                      if standardized and standardized.get('url') and standardized['url'] not in processed_urls:
+                      if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in processed_urls:
                            all_linkup_results.append(standardized)
                            processed_urls.add(standardized['url'])
             else:
@@ -282,6 +286,7 @@ def search_linkup_structured(query: str, structured_output_schema: str, depth: s
 
     try:
         print(f"Executing Linkup Structured Search: q='{query[:50]}...', depth='{depth}', requested_country_code={country_code}") # Print truncated query
+        # Construct parameters dictionary *excluding* 'country_code' as a direct keyword argument
         params = {
             "query": query,
             "depth": depth,
@@ -291,6 +296,7 @@ def search_linkup_structured(query: str, structured_output_schema: str, depth: s
             # Removed country_code here as it caused TypeError. Rely on query string.
         }
 
+        # Pass the parameters to the Linkup search method using **params
         response = linkup_client.search(**params) # Corrected params no longer include 'country_code'
 
         if response is not None:
@@ -437,17 +443,19 @@ def search_for_ownership_docs(entity_name: str,
          linkup_attempted = True
          print(f"Using Linkup Snippet Search for ownership docs (q='{entity_name} ownership', num={num_per_query}, country={country_code})...")
          # Use a combined query approach for Linkup snippet search
-         linkup_query_combined = f'"{entity_name}" ownership OR subsidiary OR affiliate OR stake OR filing OR "joint venture" OR "acquired" OR parent OR "equity method" {country_code}' # Add country code to query
+         # Add country code to query string as Linkup API doesn't take it as a parameter
+         linkup_query_combined = f'"{entity_name}" ownership OR subsidiary OR affiliate OR stake OR filing OR "joint venture" OR "acquired" OR parent OR "equity method" {country_code}'
          try:
-              # search_linkup_snippets now returns all unique results found for the queries it runs
+              # search_linkup_snippets handles multiple queries and returns combined unique results.
+              # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
               # Pass the combined query and num to search_linkup_snippets. Removed country_code parameter here.
-              linkup_results_list = search_linkup_snippets(linkup_query_combined, num=num_per_query)
+              linkup_results_list = search_linkup_snippets(linkup_query_combined, num=num_per_query) # Pass num
               if linkup_results_list:
                    print(f"    Linkup Snippet Search found {len(linkup_results_list)} unique results.")
                    for r in linkup_results_list:
                        # standardize_result handles LinkupSDK objects and dicts
                        standardized = standardize_result(r, source='linkup_snippet_search')
-                       if standardized and standardized.get('url') and standardized['url'] not in all_raw_results_map:
+                       if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
                             all_raw_results_map[standardized['url']] = standardized # Store standardized result directly
          except Exception as e:
               print(f"ERROR during Linkup snippet ownership search: {type(e).__name__}: {e}")
@@ -472,7 +480,7 @@ def search_for_ownership_docs(entity_name: str,
                      google_results_list = search_google_official(q, lang=lang_code, num=num_per_query);
                      for r in google_results_list:
                          standardized = standardize_result(r, source=f'google_cse_ownership_q{q_idx+1}')
-                         if standardized and standardized.get('url') and standardized['url'] not in all_raw_results_map:
+                         if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
                               all_raw_results_map[standardized['url']] = standardized
                      time.sleep(0.3) # Small delay between Google CSE calls
                 except Exception as e: print(f"    Google CSE call failed for query '{q[:50]}...': {type(e).__name__}: {e}"); traceback.print_exc()
@@ -544,14 +552,14 @@ def search_for_ownership_docs(entity_name: str,
                            print(f"    SerpApi {serpapi_engine} found {len(serpapi_results_list)} raw results.")
                            for r in serpapi_results_list:
                                standardized = standardize_result(r, source=f'serpapi_{serpapi_engine}_ownership_q{q_idx+1}')
-                               # Attempt to set original language if not already set by standardize_result
+                               # standardize_result attempts to set original_language. If not set, default based on engine
                                if standardized and standardized.get('original_language') is None:
                                    # For Baidu, assume Chinese unless it clearly wasn't the search language
                                    if serpapi_engine == 'baidu': standardized['original_language'] = 'zh'
                                    # For Google, it's less certain, can leave as None or default to 'en'
                                    # The NLP translation step will handle non-English snippets anyway.
 
-                               if standardized and standardized.get('url') and standardized['url'] not in all_raw_results_map:
+                               if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
                                     all_raw_results_map[standardized['url']] = standardized
                            else: print(f"    SerpApi {serpapi_engine} returned no results for this query.")
                       time.sleep(0.5) # Small delay between SerpApi calls
@@ -703,7 +711,7 @@ def standardize_result(item: Any, source: str) -> dict | None:
 
 if __name__ == "__main__":
     print("\n--- Running Local Search Engine Tests ---")
-    print("NOTE: Requires API keys for Google CSE, SerpApi, Linkup configured in .env")
+    print("NOTE: Local testing requires API keys for Google CSE, SerpApi, Linkup configured in .env")
 
     print("\nTesting Linkup Credit Check...")
     test_balance = check_linkup_balance()
@@ -789,11 +797,20 @@ if __name__ == "__main__":
          print("\nSkipping Linkup Structured Search test: Linkup search is not enabled.")
 
 
+    print("\nTesting Wayback Machine Check...")
+    wayback_result = check_wayback_machine("https://www.example.com")
+    print(f"Wayback Check Result: {wayback_result}")
+    wayback_result_404 = check_wayback_machine("https://www.example.com/nonexistent-page-12345")
+    print(f"Wayback Check Result (404): {wayback_result_404}")
+    wayback_result_invalid = check_wayback_machine("")
+    print(f"Wayback Check Result (Invalid URL): {wayback_result_invalid}")
+
+
     print("\nTesting Targeted Ownership Docs Search (Combines sources)...")
     # This function calls the individual search functions. num_per_query is passed to those functions.
     # Removed country_code parameter from this call as search_linkup_snippets no longer accepts it.
     # Rely on the query generation within search_for_ownership_docs to add country context.
-    ownership_docs_results = search_for_ownership_docs("Example Chinese Company", num_per_query=10, country_code='cn')
+    ownership_docs_results = search_for_ownership_docs("Example Chinese Company", num_per_query=10, country_code='cn') # num_per_query affects internal search calls
     print(f"Found {len(ownership_docs_results)} unique potential ownership documents across sources.") # Report total unique found
     # print(json.dumps(ownership_docs_results[:5], indent=2)) # Print sample
 

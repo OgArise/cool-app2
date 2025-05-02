@@ -426,19 +426,20 @@ def run_analysis(initial_query: str,
         print(f"[Step 1 Search] Running searches for {len(step1_all_queries)} query variants (max num per search: {max_global_results})...")
 
         if linkup_snippet_search_available:
-             print(f"[Step 1 Search] Attempting broad Linkup snippet search: q='{initial_query}' (and variants), num={max_global_results}")
+             print(f"[Step 1 Search] Attempting broad Linkup snippet search: q='{initial_query}' (and variants)") # Removed num= param from log
              try:
                   # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
-                  linkup_global_results = search_engines.search_linkup_snippets(query=step1_all_queries) # Removed num and country_code
+                  # Pass the combined query to search_linkup_snippets.
+                  linkup_global_results = search_engines.search_linkup_snippets(query=step1_all_queries) # Removed num and country_code params from the call
                   if linkup_global_results:
                       print(f"    Linkup Snippet Search returned {len(linkup_global_results)} unique results after internal deduplication.")
-                      # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
-                      # linkup_global_results_limited = linkup_global_results[:max_global_results]
-                      # if len(linkup_global_results) > len(linkup_global_results_limited):
-                      #     print(f"    Truncating Linkup results to max_global_results: {len(linkup_global_results_limited)} results kept.")
+                      # Apply the max_global_results limit *after* collecting from all Linkup queries
+                      linkup_global_results_limited = linkup_global_results[:max_global_results]
+                      if len(linkup_global_results) > len(linkup_global_results_limited):
+                          print(f"    Truncating Linkup results to max_global_results: {len(linkup_global_results_limited)} results kept.")
 
-                      for r in linkup_global_results: # Iterate through the *full* list returned by search_linkup_snippets
+                      for r in linkup_global_results_limited: # Iterate through the *limited* list
                            if isinstance(r, dict) and r.get('url') and isinstance(r.get('url'), str) and r['url'] not in all_search_results_map:
                                # Preserve source if already set by search_engines, default to 'linkup_snippet_step1'
                                r['source'] = r.get('source', 'linkup_snippet_step1')
@@ -498,8 +499,8 @@ def run_analysis(initial_query: str,
                            for r in serpapi_results_list:
                                standardized = search_engines.standardize_result(r, source=f'serpapi_{serpapi_engine}_q{q_idx+1}')
                                # standardize_result attempts to set original_language. If not set, default based on engine
-                               if standardized and standardized.get('original_language') is None:
-                                   standardized['original_language'] = 'zh' if serpapi_engine == 'baidu' else 'en'
+                               if serpapi_engine == 'baidu': standardized['original_language'] = 'zh'
+                               elif serpapi_engine == 'google': standardized['original_language'] = 'en'
 
                                if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
                                     step1_search_results.append(standardized)
@@ -825,19 +826,19 @@ def run_analysis(initial_query: str,
 
         linkup_specific_results = []
         if linkup_snippet_search_available:
-             print(f"[Step 3 Search] Attempting Linkup snippet search: q='{specific_query_base}' (and variants), num={max_specific_results}, country={specific_country_code}")
+             print(f"[Step 3 Search] Attempting Linkup snippet search: q='{specific_query_base}' (and variants)") # Removed num= param from log
              try:
-                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results
+                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
                   linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Removed num and country_code
                   if linkup_specific_results:
                        print(f"    Linkup Snippet Search returned {len(linkup_specific_results)} unique results after internal deduplication.")
-                       # Apply the max_specific_results limit *after* collecting from all Linkup queries
-                       linkup_specific_results_limited = linkup_specific_results[:max_specific_results]
-                       if len(linkup_specific_results) > len(linkup_specific_results_limited):
-                            print(f"    Truncating Linkup results to max_specific_results: {len(linkup_specific_results_limited)} results kept.")
+                       # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
+                       # linkup_specific_results_limited = linkup_specific_results[:max_specific_results]
+                       # if len(linkup_specific_results) > len(linkup_specific_results_limited):
+                       #      print(f"    Truncating Linkup results to max_specific_results: {len(linkup_specific_results_limited)} results kept.")
 
-                       for r in linkup_specific_results_limited:
+                       for r in linkup_specific_results: # Iterate through the *full* list returned by search_linkup_snippets
                             if isinstance(r, dict) and r.get('url') and isinstance(r.get('url'), str) and r['url'] not in all_search_results_map:
                                 r['source'] = r.get('source', 'linkup_snippet_step3') # Preserve source
                                 step3_search_results.append(r) # Add directly to final list for step 3
@@ -1068,7 +1069,7 @@ def run_analysis(initial_query: str,
             rel for rel in all_collected_relationships
             if isinstance(rel, dict)
             and rel.get('relationship_type') == "SUBJECT_TO"
-            and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str)
+            and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) # Ensure both entity names are strings
             and rel.get('entity1').lower() in likely_chinese_company_org_names_lower # Entity1 is a Chinese Company/Org
             and rel.get('entity2').lower() in chinese_reg_sanc_names_lower # Entity2 is a Chinese Regulator/Sanction
         ]
@@ -1142,7 +1143,7 @@ def run_analysis(initial_query: str,
                  # Determine the roles for the Exposure columns (Parent, Subsidiary/Affiliate)
                  parent_col_value = ""
                  sub_aff_col_value = ""
-                 exposure_risk_type_label = r_type_raw.replace('_', ' ').title() # Default label based on relationship type (e.g., "Parent Company Of")
+                 exposure_risk_type_label = r_type_raw.replace('_', ' ').title() # Default label based on relationship type
 
 
                  if r_type_upper == "PARENT_COMPANY_OF":
