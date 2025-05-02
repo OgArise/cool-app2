@@ -6,15 +6,16 @@ from datetime import datetime
 import os
 import requests
 import pandas as pd
+import traceback
 
-# Try to import config - handle gracefully
+# Import config
 try:
     import config
 except ImportError:
     config = None
     st.warning("config.py not found. Using default values.")
 
-# Attempt to import pycountry
+# Import pycountry
 try:
     import pycountry
     pycountry_available = True
@@ -22,225 +23,501 @@ except ImportError:
     print("Warning: 'pycountry' not installed. Using basic country list.")
     pycountry_available = False
 
-# --- Configuration ---
+
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_URL)
 ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
-# Safely get Sheet ID from config or set to None
-GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None)
-GOOGLE_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID_FROM_CONFIG}/edit" if GOOGLE_SHEET_ID_FROM_CONFIG else None
+GOOGLE_SHEET_ID_FROM_CONFIG = getattr(config, 'GOOGLE_SHEET_ID', None) if config else None
 
-# --- LLM Options ---
+# Define the specific GID for the Exposures tab if known
+# You can find this GID in the URL when you are viewing the specific tab in Google Sheets:
+# https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=YOUR_EXPOSURES_SHEET_GID
+EXPOSURES_SHEET_GID = "1468712289" # Replace with the actual GID of your Exposures tab if different
+
+GOOGLE_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID_FROM_CONFIG}/edit" if GOOGLE_SHEET_ID_FROM_CONFIG else None
+GOOGLE_EXPOSURES_SHEET_URL = f"{GOOGLE_SHEET_URL}#gid={EXPOSURES_SHEET_GID}" if GOOGLE_SHEET_URL and EXPOSURES_SHEET_GID else None
+
+
 LLM_PROVIDERS = { "Google AI": "google_ai", "OpenAI": "openai", "OpenRouter": "openrouter" }
 DEFAULT_MODELS = {
-    "google_ai": getattr(config, 'DEFAULT_GOOGLE_AI_MODEL', "models/gemini-1.5-flash-latest"),
-    "openai": getattr(config, 'DEFAULT_OPENAI_MODEL', "gpt-4o"),
-    "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "google/gemini-flash-1.5")
+    "google_ai": getattr(config, 'DEFAULT_GOOGLE_AI_MODEL', "models/gemini-1.5-flash-latest") if config else "models/gemini-1.5-flash-latest",
+    "openai": getattr(config, 'DEFAULT_OPENAI_MODEL', "gpt-4o-mini") if config else "gpt-4o-mini",
+    "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "google/gemini-flash-1.5") if config else "google/gemini-flash-1.5"
 }
-# PROVIDER_LINKS = { ... } # Optional
 
-# --- Country List Generation ---
 def get_country_options():
-    options = {"Global": "global"} # Start with Global option
+    options = {"Global": "global"}
     if pycountry_available:
         try:
             countries = sorted([(country.name, country.alpha_2.lower()) for country in pycountry.countries])
-            # Prepare preferred order
             preferred_order = {"Global": "global", "China": "cn", "United States": "us"}
             final_options = {}
-            # Add preferred in order
+            # Add preferred countries first in specified order
             for name, code in preferred_order.items():
-                 if name == "Global" or name in dict(countries):
+                 if name == "Global" or any(c_name == name or c_code == code for c_name, c_code in countries):
                       final_options[name] = code
-            # Add remaining sorted countries
+            # Add all other countries alphabetically
             for name, code in countries:
-                 if name not in final_options:
+                 if name not in final_options and code not in final_options.values():
                       final_options[name] = code
             options = final_options
         except Exception as e:
              print(f"Error loading countries from pycountry: {e}. Using basic list.")
-             options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"}) # Fallback
+             options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"})
     else:
-         options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"}) # Fallback
+         options.update({"China": "cn", "United States": "us", "United Kingdom": "uk", "India": "in", "Germany": "de"})
     return options
 
-COUNTRY_OPTIONS = get_country_options() # Dictionary of Display Name -> Code
-COUNTRY_DISPLAY_NAMES = list(COUNTRY_OPTIONS.keys()) # List of names for selectbox
+COUNTRY_OPTIONS = get_country_options()
+COUNTRY_DISPLAY_NAMES = list(COUNTRY_OPTIONS.keys())
 
-# --- Callback Function to Update Contexts ---
 def update_contexts():
+    """Updates the default context fields based on the initial query input."""
     query = st.session_state.get("initial_query_input", "")
-    if query:
-        st.session_state.global_context_input = f"Global financial news and legal filings for '{query}'"
-        st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
-    else: # Reset to defaults if query is cleared
+    # Only update if the query has changed AND the contexts haven't been manually edited
+    if query and query != st.session_state.get("_last_updated_query", ""):
+        # Check if contexts are still the default ones before overriding
+        current_global = st.session_state.get("global_context_input", "")
+        current_specific = st.session_state.get("specific_context_input", "")
+        if current_global == "Global financial news and legal filings for compliance issues" and \
+           current_specific == "Search for specific company examples and regulatory actions":
+            st.session_state.global_context_input = f"Global financial news and legal filings for '{query}'"
+            st.session_state.specific_context_input = f"Search for specific company examples and regulatory actions related to '{query}'"
+            print(f"Updated contexts based on query: '{query}'")
+        st.session_state._last_updated_query = query # Always update the last processed query
+    elif not query:
+        # Reset to default generic contexts if query is cleared
         st.session_state.global_context_input = "Global financial news and legal filings for compliance issues"
         st.session_state.specific_context_input = "Search for specific company examples and regulatory actions"
+        st.session_state._last_updated_query = ""
+        print("Query cleared, reset contexts to default.")
 
-# --- Initialize Session State ---
+
+# Initialize session state variables if they don't exist
 if "global_context_input" not in st.session_state: st.session_state.global_context_input = "Global financial news and legal filings for compliance issues"
 if "specific_context_input" not in st.session_state: st.session_state.specific_context_input = "Search for specific company examples and regulatory actions"
 if 'analysis_status' not in st.session_state: st.session_state.analysis_status = "IDLE"
 if 'analysis_payload' not in st.session_state: st.session_state.analysis_payload = None
 if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
 if 'error_message' not in st.session_state: st.session_state.error_message = None
+if '_last_updated_query' not in st.session_state: st.session_state._last_updated_query = ""
+
+# Initialize LLM model text inputs for each provider
+for provider_key in LLM_PROVIDERS.values():
+     session_key_model = f"{provider_key}_model_input"
+     if session_key_model not in st.session_state:
+          st.session_state[session_key_model] = DEFAULT_MODELS.get(provider_key, "")
 
 
-# --- Streamlit App Layout ---
 st.set_page_config(page_title="AI Analyst Agent", layout="wide")
 st.title("🕵️ AI Analyst Agent Interface")
 st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 
-if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config.")
-elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info("Targeting local backend API.")
+# Display backend URL status
+if BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL needs config. Please set the `BACKEND_API_URL` environment variable.")
+elif BACKEND_API_URL == DEFAULT_BACKEND_URL: st.info(f"Targeting local backend API ({BACKEND_API_URL})..")
 else: st.info(f"Targeting Backend API: {BACKEND_API_URL}")
 
-
-# --- LLM Configuration UI (Sidebar) ---
 st.sidebar.title("LLM Selection")
-selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=0 )
+# Use LLM_PROVIDERS keys for display, values for internal logic
+selected_provider_name = st.sidebar.selectbox("Select LLM Provider", options=list(LLM_PROVIDERS.keys()), index=0, key='sidebar_llm_provider_name_select' )
 selected_provider_key = LLM_PROVIDERS[selected_provider_name]
-default_model = DEFAULT_MODELS.get(selected_provider_key, "")
-session_key_model = f"{selected_provider_key}_model"
-if session_key_model not in st.session_state: st.session_state[session_key_model] = default_model
-llm_model = st.sidebar.text_input( f"Model Name for {selected_provider_name}", key=session_key_model, help=f"e.g., {default_model}" )
+
+# Get the current model value for the selected provider from session state
+session_key_model = f"{selected_provider_key}_model_input"
+llm_model_value_for_input = st.session_state.get(session_key_model)
+
+# If the value is empty (e.g., first time selecting this provider), populate with default
+if not llm_model_value_for_input:
+     llm_model_value_for_input = DEFAULT_MODELS.get(selected_provider_key, "")
+     st.session_state[session_key_model] = llm_model_value_for_input # Update session state with default
+
+# Text input for the model name, linked to the session state key
+llm_model = st.sidebar.text_input(
+    f"Model Name for {selected_provider_name}",
+    value=llm_model_value_for_input,
+    key=session_key_model,
+    help=f"e.g., {DEFAULT_MODELS.get(selected_provider_key, 'default')}"
+)
+
 st.sidebar.caption("✨ Tip: Google AI & OpenRouter often have free tiers. OpenAI requires paid credits.")
 
-
-# --- Query Input OUTSIDE the Form ---
 st.subheader("1. Enter Your Initial Query")
-initial_query_value = st.text_input( "Initial Search Query:", st.session_state.get("initial_query_input", "Corporate tax evasion cases 2020-2023"), key="initial_query_input", on_change=update_contexts )
+initial_query_value = st.text_input(
+    "Initial Search Query:",
+    st.session_state.get("initial_query_input", "Corporate tax evasion cases 2020-2023"),
+    key="initial_query_input",
+    on_change=update_contexts, # Trigger context update when query changes
+    help="Enter the primary query to initiate the analysis."
+)
+# Manual trigger for context update if needed (e.g., user clears and re-types)
+# This check is redundant with on_change, but good as a safety if on_change misbehaves
+# if st.session_state.initial_query_input and st.session_state.initial_query_input != st.session_state.get("_last_updated_query", ""):
+#     update_contexts()
+#     st.rerun() # Rerun to update textareas
 
 
-# --- Main Input Form ---
 st.subheader("2. Configure Search & Run Analysis")
 with st.form("analysis_form"):
     st.markdown("**Search Contexts (Auto-updated based on query)**")
-    global_context = st.text_area( "Global Search Context", key="global_context_input", height=100 )
-    specific_context = st.text_area( "Specific Search Context", key="specific_context_input", height=100 )
+    # Link text areas directly to session state keys managed by update_contexts
+    global_context = st.text_area( "Global Search Context", value=st.session_state.global_context_input, key="global_context_input", height=100, help="Describes the focus area for broad searches." )
+    specific_context = st.text_area( "Specific Search Context", value=st.session_state.specific_context_input, key="specific_context_input", height=100, help="Describes the focus area for country-specific searches." )
+
     st.markdown("**Other Parameters**")
     col1, col2 = st.columns(2)
     with col1:
-        # ===> SET DEFAULT COUNTRY TO CHINA <===
+        # Find the index for the default country ('cn') for the selectbox
         try:
-            # Find the index of 'China' in the generated list
-            default_country_index = COUNTRY_DISPLAY_NAMES.index("China")
+            default_country_index = COUNTRY_DISPLAY_NAMES.index("China") if "China" in COUNTRY_DISPLAY_NAMES else 0
         except ValueError:
-            # If 'China' is not found for any reason, default to 'Global' (index 0)
-            print("Warning: 'China' not found in country list, defaulting to 'Global'.")
-            default_country_index = 0
+            default_country_index = 0 # Fallback if China is not in the list for some reason
 
-        selected_country_name = st.selectbox(
+        selected_country_name_widget_value = st.selectbox(
             "Specific Country Search Target",
-            options=COUNTRY_DISPLAY_NAMES, # Use the generated list
-            index=default_country_index,    # Use the calculated index for China (or 0)
+            options=COUNTRY_DISPLAY_NAMES,
+            index=default_country_index,
+            key='country_select',
             help="Select 'Global' or a specific country for the targeted search."
         )
-        # ===> END CHANGE <===
     with col2:
-        max_global_results = st.number_input("Max Global Results", min_value=1, max_value=50, value=5)
-        max_specific_results = st.number_input("Max Specific Results", min_value=1, max_value=50, value=5)
+        max_global_results = st.number_input("Max Global Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_global_input', help="Maximum number of search results requested from *each* enabled global search engine.")
+        max_specific_results = st.number_input("Max Specific Results Per Search Engine", min_value=1, max_value=50, value=20, key='max_specific_input', help="Maximum number of search results requested from *each* enabled country-specific search engine.")
 
     submitted = st.form_submit_button("Run Analysis")
 
-# --- Execution Logic (Triggered on Form Submit) ---
-if submitted:
-    # Read current values directly from widgets/state
-    query_to_run = st.session_state.get("initial_query_input", "")
-    provider_to_run = selected_provider_key
-    model_to_run = llm_model
-    glob_context_to_run = global_context
-    spec_context_to_run = specific_context
-    country_to_run = selected_country_name # Read selected country NAME
-    max_glob_to_run = max_global_results
-    max_spec_to_run = max_specific_results
+# --- Analysis Trigger and Execution ---
+# This block runs when the form is submitted OR st.rerun() is called while status is RUNNING
+if submitted and st.session_state.analysis_status != "RUNNING":
+    # Capture form values into session state payload variables upon submission
+    st.session_state.payload_query = st.session_state.initial_query_input
+    st.session_state.payload_global_context = st.session_state.global_context_input
+    st.session_state.payload_specific_context = st.session_state.specific_context_input
+    st.session_state.payload_specific_country_name = st.session_state.country_select # Store name, convert to code for API
+    st.session_state.payload_max_global = st.session_state.max_global_input
+    st.session_state.payload_max_specific = st.session_state.max_specific_input
 
-    # Validation
-    if not query_to_run: st.warning("Please enter an initial search query.")
-    elif not provider_to_run or not model_to_run: st.warning("Please select Provider/Model in sidebar.")
-    elif BACKEND_API_URL.startswith("YOUR_"): st.error("Backend API URL is not configured.")
-    else:
-        # Construct payload *before* rerun
-        specific_country_code_to_send = COUNTRY_OPTIONS.get(country_to_run, "us") # Get CODE from NAME
-        payload = {
-            "query": query_to_run,
-            "global_context": glob_context_to_run,
-            "specific_context": spec_context_to_run,
-            "specific_country": specific_country_code_to_send, # Send the code
-            "max_global": max_glob_to_run,
-            "max_specific": max_spec_to_run,
-            "llm_provider": provider_to_run,
-            "llm_model": model_to_run
-        }
-        # Store payload and set status before rerun
-        st.session_state.analysis_payload = payload
+    # Capture selected LLM provider and model
+    st.session_state.payload_llm_provider = selected_provider_key
+    st.session_state.payload_llm_model = st.session_state.get(f"{selected_provider_key}_model_input")
+
+    # --- Input Validation ---
+    validation_errors = []
+    if not st.session_state.get('payload_query') or not st.session_state.get('payload_query').strip():
+        validation_errors.append("Please enter an initial search query.")
+    if not st.session_state.get('payload_llm_provider') or not st.session_state.get('payload_llm_provider').strip() or \
+       not st.session_state.get('payload_llm_model') or not st.session_state.get('payload_llm_model').strip() or \
+       st.session_state.get('payload_llm_model') == "unknown":
+        validation_errors.append("Please select a valid LLM Provider and Model in the sidebar.")
+    if BACKEND_API_URL.startswith("YOUR_"):
+         validation_errors.append("Backend API URL needs configuration. Please set the `BACKEND_API_URL` environment variable.")
+    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or 'related to' in st.session_state.get('payload_specific_context','')):
+         # Warn if country is Global but specific context is still country-focused
+         st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still mentions 'specific company examples and regulatory actions related to...'. Consider adjusting the specific context for a global search.")
+         # Decided not to block, just warn
+
+
+    if validation_errors:
+        # Display errors and reset status
+        for err in validation_errors: st.error(err)
+        st.session_state.analysis_status = "IDLE"
+        st.session_state.analysis_payload = None # Clear payload on validation failure
+        st.session_state.error_message = "Validation failed. Check inputs."
         st.session_state.analysis_results = None # Clear previous results
-        st.session_state.error_message = None # Clear previous errors
-        st.session_state.analysis_status = "RUNNING"
-        print(f"Form submitted. Payload set. Rerunning. Payload: {payload}")
-        st.rerun()
+        print(f"Form submission failed validation: {validation_errors}")
+    else:
+        # Inputs are valid, prepare payload for API call
+        specific_country_code_to_send = COUNTRY_OPTIONS.get(st.session_state.payload_specific_country_name, "us") # Convert name to code
+
+        payload = {
+            "query": st.session_state.payload_query,
+            "global_context": st.session_state.payload_global_context,
+            "specific_context": st.session_state.payload_specific_context,
+            "specific_country": specific_country_code_to_send,
+            "max_global": st.session_state.payload_max_global,
+            "max_specific": st.session_state.payload_max_specific,
+            "llm_provider": st.session_state.payload_llm_provider,
+            "llm_model": st.session_state.payload_llm_model
+        }
+        st.session_state.analysis_payload = payload # Store payload in state
+        st.session_state.analysis_results = None # Clear previous results
+        st.session_state.error_message = None # Clear previous error
+        st.session_state.analysis_status = "RUNNING" # Set status to RUNNING
+        print(f"Form submitted successfully. Payload set in state. Triggering rerun for API call.")
+        # print(f"Captured Payload: {payload}") # Avoid logging sensitive details like full contexts
+        st.rerun() # Rerun the script to execute the API call block
+
+# --- API Call Execution Block ---
+# This block runs if the status is "RUNNING"
+elif st.session_state.analysis_status == "RUNNING":
+     st.info(f"Analysis in progress... Sending request to backend API ({ANALYZE_ENDPOINT}).")
+     payload_to_send = st.session_state.get('analysis_payload')
+
+     if not payload_to_send or not isinstance(payload_to_send, dict):
+         # Should not happen if validation worked, but safety check
+         error_msg = "Internal error: Analysis payload not found or is invalid in session state."
+         st.error(error_msg)
+         st.session_state.analysis_status = "ERROR"
+         st.session_state.error_message = error_msg
+         st.session_state.analysis_payload = None # Clear invalid payload
+         print(f"--- STREAMLIT STATE ERROR: {error_msg} ---")
+         st.rerun() # Rerun to show error state
+     else:
+         # Display LLM being used based on the payload
+         llm_display = f"{payload_to_send.get('llm_provider','?')}: {payload_to_send.get('llm_model','?')}"
+         st.write(f"Using LLM: {llm_display}")
+
+         with st.spinner("Analysis in progress... This may take several minutes."):
+            results_data = None; error_msg = None
+            try:
+                print(f"Making API call with payload...")
+                # Use a timeout that's less than the Uvicorn worker timeout if possible, but long enough for analysis
+                # Assuming backend timeout is 2000s as discussed, let's use 1800s (30 minutes)
+                # It should match or be slightly less than the backend's processing timeout.
+                api_timeout_seconds = 1800 # 30 minutes
+                response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=api_timeout_seconds)
+
+                if response.status_code == 200:
+                    results_data = response.json()
+                    print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
+                    if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
+                        # Backend reported an error, but API call was successful (status 200)
+                        error_msg = f"Backend Orchestrator reported an error: {results_data['error']}"
+                        st.session_state.analysis_status = "COMPLETE_WITH_ERROR" # Use a distinct status
+                        print(f"Backend reported error: {results_data['error']}")
+                    else:
+                        # Analysis completed successfully with no backend error reported
+                        st.session_state.analysis_status = "COMPLETE"
+                        print("Analysis completed successfully.")
+                else:
+                     # Handle non-200 status codes from the API
+                     error_msg = f"Backend API request failed! Status Code: {response.status_code}"
+                     try:
+                          # Try to get error detail from JSON response
+                          error_json = response.json()
+                          if 'detail' in error_json:
+                               error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
+                               error_msg += f"\nDetail: {error_detail}"
+                          else:
+                               error_msg += f"\nResponse: {response.text[:200]}..."
+                          print(f"Backend non-200 response: {response.text}") # Log full response for debugging
+                     except json.JSONDecodeError:
+                          # If response is not JSON, use raw text
+                          error_msg += f"\nResponse: {response.text[:200]}..."
+                          print(f"Backend non-200 response (non-JSON): {response.text}") # Log full response for debugging
+
+                     st.session_state.analysis_status = "ERROR" # General ERROR status for API request failures
 
 
-# --- Display Area (Handles RUNNING, COMPLETE, ERROR states) ---
-if st.session_state.analysis_status == "RUNNING":
-     st.info(f"Sending request to backend ({ANALYZE_ENDPOINT})...")
-     payload_to_send = st.session_state.analysis_payload
-     llm_display = f"{payload_to_send.get('llm_provider','?')} ({payload_to_send.get('llm_model','?')})"
-     st.write(f"Using LLM: {llm_display}")
-     with st.spinner("Analysis in progress... Please wait."):
-        results_data = None; error_msg = None
-        try:
-            print(f"Making API call with payload: {payload_to_send}")
-            response = requests.post(ANALYZE_ENDPOINT, json=payload_to_send, timeout=300)
-            if response.status_code == 200: results_data = response.json(); st.session_state.analysis_status = "COMPLETE"
-            else:
-                 error_msg = f"Backend API request failed! Status Code: {response.status_code}"
-                 try: error_detail = response.json(); error_msg += f"\nDetail: {json.dumps(error_detail)}"
-                 except json.JSONDecodeError: error_msg += f"\nResponse: {response.text[:500]}"
+            except requests.exceptions.Timeout:
+                error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
+                st.session_state.analysis_status = "ERROR" # Consider timeout as an error in the UI for now
+                print(f"API Request Timeout after {api_timeout_seconds}s.")
+            except requests.exceptions.ConnectionError as e:
+                 error_msg = f"Could not connect to backend API at {ANALYZE_ENDPOINT}: {e}. Is the backend running?"
                  st.session_state.analysis_status = "ERROR"
-        except requests.exceptions.Timeout: error_msg = "Request to backend API timed out."; st.session_state.analysis_status = "ERROR"
-        except requests.exceptions.RequestException as e: error_msg = f"Could not connect to backend API: {e}"; st.session_state.analysis_status = "ERROR"
-        except Exception as e: error_msg = f"Unexpected error during analysis request: {e}"; st.session_state.analysis_status = "ERROR"; traceback.print_exc()
+                 print(f"API Connection Error: {e}")
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Request Exception calling backend: {type(e).__name__}: {e}"
+                st.session_state.analysis_status = "ERROR"
+                print(f"API Request Exception: {e}")
+                traceback.print_exc() # Log traceback for unexpected request errors
+            except Exception as e:
+                error_msg = f"Unexpected error during analysis request: {type(e).__name__}: {e}"
+                st.session_state.analysis_status = "ERROR"
+                print(f"--- UNEXPECTED ERROR IN STREAMLIT RUNNING BLOCK ---")
+                traceback.print_exc()
 
-        st.session_state.analysis_results = results_data; st.session_state.error_message = error_msg
-        st.rerun() # Rerun again to display final results/error
+            # Update session state with results and error message
+            st.session_state.analysis_results = results_data
+            st.session_state.error_message = error_msg
+            # Trigger a rerun to move to the display block
+            st.rerun()
 
-elif st.session_state.analysis_status == "COMPLETE" and isinstance(st.session_state.analysis_results, dict):
-    # --- Display Success Results ---
+# --- Analysis Complete/Error Display Block ---
+# This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR
+elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
     results = st.session_state.analysis_results
-    st.success("Analysis complete!")
-    st.subheader("Analysis Summary")
-    # Display LLM Generated Summary
-    st.markdown("**Key Takeaways:**"); summary_text = results.get("analysis_summary", "Summary could not be generated."); st.info(summary_text)
-    # Display Supply Chain Summary and Link
-    exposures = results.get("supply_chain_exposures", [])
-    col_sum1, col_sum2 = st.columns([1,3]);
-    with col_sum1: st.metric("Supply Chain Exposures Found", len(exposures))
-    with col_sum2:
-        if GOOGLE_SHEET_URL:
-             exposures_gid = "1468712289" # GID for 'Supply Chain Exposures' tab
-             if exposures_gid and exposures_gid != "1468712289": sheet_link = f"{GOOGLE_SHEET_URL}#gid={exposures_gid}"; st.markdown(f"[View Exposure Details]({sheet_link})")
-             else: st.markdown(f"[View Full Results Sheet]({GOOGLE_SHEET_URL})"); st.caption("(Add GID for direct link)")
-        else: st.caption("Google Sheet link not configured.")
-    # Display other metrics
-    st.metric("LLM Used", results.get("llm_used", "N/A")); st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A")); st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
-    if results.get("error") and not results.get("error_message"): st.error(f"Backend Orchestration Error: {results['error']}")
-    # Display Steps
-    st.subheader("Run Steps & Durations");
-    if results.get("steps"):
-        try: steps_df = pd.DataFrame(results["steps"]); st.dataframe(steps_df)
-        except Exception as df_e: st.warning(f"Steps table error: {df_e}"); st.json(results["steps"])
-    else: st.write("No step details.")
-    # Display Expanders
-    with st.expander("Final Extracted Data (Combined)", expanded=False): st.json(results.get("final_extracted_data", {}))
-    with st.expander("Identified Supply Chain Exposures (Details)", expanded=False): st.json(exposures)
-    with st.expander("Wayback Machine Results", expanded=False): st.json(results.get("wayback_results", []))
-    with st.expander("Full Raw Results JSON", expanded=False): st.json(results)
+    if st.session_state.analysis_status == "COMPLETE":
+        st.success("Analysis complete!")
+    elif st.session_state.analysis_status == "COMPLETE_WITH_ERROR":
+        st.warning("Analysis completed with reported backend errors.")
 
+    st.subheader("Analysis Summary")
+    st.markdown("**Key Takeaways:**")
+    # Display the analysis summary text
+    summary_text = results.get("analysis_summary", "Summary could not be generated or analysis failed early.")
+    st.info(summary_text)
+
+    # Display key metrics in columns
+    col_metrics1, col_metrics2, col_metrics3, col_metrics4 = st.columns(4)
+    with col_metrics1: st.metric("LLM Used", results.get("llm_used", "N/A"))
+    with col_metrics2: st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A"))
+    with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
+
+    # Get exposures count from the results dictionary
+    exposures_list_from_results = results.get("high_risk_exposures", [])
+    exposures_count = len(exposures_list_from_results)
+    with col_metrics4: st.metric("High Risk Exposures Found", exposures_count)
+
+    # Add link to Google Sheet Exposures tab
+    if GOOGLE_EXPOSURES_SHEET_URL:
+         st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
+         if EXPOSURES_SHEET_GID == "YOUR_EXPOSURES_SHEET_GID":
+             st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
+    elif GOOGLE_SHEET_URL:
+         st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
+         st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` if you know the correct GID for the Exposures tab for a direct link.")
+    else:
+         st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
+
+
+    # --- Display High Risk Exposures Table ---
+    st.subheader("Identified High Risk Exposures (Current Run)")
+    if exposures_list_from_results:
+        try:
+            # Create a Pandas DataFrame from the exposures list
+            exposures_df = pd.DataFrame(exposures_list_from_results)
+            # Select and order columns for display
+            display_cols = ["Entity", "Subsidiary/Affiliate", "Parent Company", "Risk_Severity", "Risk_Type", "Explanation", "Main_Sources"]
+            # Ensure all display_cols exist in the DataFrame before selecting
+            existing_cols = [col for col in display_cols if col in exposures_df.columns]
+            st.dataframe(exposures_df[existing_cols], use_container_width=True)
+        except Exception as exp_df_e:
+            st.warning(f"Error displaying exposures table: {exp_df_e}")
+            # Fallback to displaying JSON if table creation fails
+            st.json(exposures_list_from_results)
+    else:
+        st.write("No high risk exposures identified in this run.")
+
+
+    # Display any backend errors reported (status 200 but error field present)
+    if results.get("error") and results["error"] != "None" and results["error"] != "":
+        st.error(f"Backend Orchestrator reported an error: {results['error']}")
+        # You might want to display more details here if available in the results dict
+
+    # --- Optional Expanders for Detailed Data ---
+    st.markdown("---") # Separator
+
+    with st.expander("Run Steps & Details", expanded=False):
+        st.subheader("Run Steps & Durations");
+        if results.get("steps"):
+            try:
+                steps_data = []
+                for step in results["steps"]:
+                     if isinstance(step, dict):
+                          steps_data.append({
+                              "Name": step.get("name", "N/A"),
+                              "Duration (s)": step.get("duration", "N/A"),
+                              "Status": step.get("status", "N/A"),
+                              "Search Results": step.get("search_results_count", "N/A"),
+                              "Structured Results": step.get("structured_results_count", "N/A"),
+                              "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
+                              "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
+                              "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
+                              # Display counts from extracted_data_counts if available
+                              "Entities Extracted": step.get("extracted_data_counts", {}).get("entities", "N/A"),
+                              "Risks Extracted": step.get("extracted_data_counts", {}).get("risks", "N/A"),
+                              "Relationships Extracted": step.get("extracted_data_counts", {}).get("relationships", "N/A"),
+                              "Error Message": step.get("error_message", "") # Error message from any step
+                          })
+                     else:
+                          steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
+                steps_df = pd.DataFrame(steps_data)
+                # Define column order and drop columns where all values are N/A, "", or None
+                col_order = [
+                    "Name", "Status", "Duration (s)", "Error Message",
+                    "Search Results", "Structured Results",
+                    "Entities Extracted", "Risks Extracted", "Relationships Extracted",
+                    "Exposures Found", "URLs Checked", "KG Status",
+                ]
+                # Filter for columns that exist in the DataFrame and are not all empty/N/A
+                cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
+
+                steps_df = steps_df.reindex(columns=cols_to_display)
+                st.dataframe(steps_df, use_container_width=True)
+            except Exception as df_e:
+                st.warning(f"Error displaying steps table: {df_e}")
+                st.json(results.get("steps", "No steps data."))
+        else: st.write("No step details available.")
+
+    with st.expander("Final Extracted Data (Combined Raw)", expanded=False):
+        st.subheader("Final Extracted Data (Before Filtering for Sheet/KG)")
+        final_data = results.get("final_extracted_data", {})
+        if final_data:
+             st.json(final_data)
+        else:
+             st.write("No final extracted data available.")
+
+    with st.expander("Linkup Raw Structured Data", expanded=False):
+        st.subheader("Raw Structured Data Collected from Linkup")
+        structured_data_list = results.get("linkup_structured_data", [])
+        if structured_data_list:
+             st.json(structured_data_list)
+        else:
+             st.write("No raw structured data collected from Linkup.")
+
+    with st.expander("Wayback Machine Results", expanded=False):
+        st.subheader("Wayback Machine Check Results")
+        wayback_results_list = results.get("wayback_results", [])
+        if wayback_results_list:
+            st.json(wayback_results_list)
+        else:
+             st.write("No wayback machine results available.")
+
+    with st.expander("Full Raw Results JSON", expanded=False):
+        st.subheader("Complete Raw JSON Output")
+        # Ensure the original high_risk_exposures list is included in the full raw JSON
+        # (It's already there as results["high_risk_exposures"])
+        st.json(results)
+
+# --- Error Display Block ---
+# This block runs if the status is ERROR (API request failed, timeout, etc.)
 elif st.session_state.analysis_status == "ERROR":
     st.error("Analysis Failed!")
-    if st.session_state.error_message: st.error(st.session_state.error_message)
-    else: st.error("An unknown error occurred during processing.")
+    if st.session_state.error_message:
+        st.error(st.session_state.error_message)
+    else:
+        st.error("An unknown error occurred during processing.")
 
-# else: # Initial IDLE state
-#    st.write("Enter query and click 'Run Analysis'.")
+    # Optionally display any partial results or steps if available, even in error state
+    if st.session_state.get('analysis_results') and isinstance(st.session_state.analysis_results, dict):
+         st.subheader("Partial Results (if any)")
+         partial_results = st.session_state.analysis_results
+         # Display partial metrics
+         col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
+         with col_metrics1: st.metric("LLM Used", partial_results.get("llm_used", "N/A"))
+         with col_metrics2: st.metric("Partial Duration (s)", partial_results.get("run_duration_seconds", "N/A"))
+         with col_metrics3: st.metric("KG Update Status (Partial)", partial_results.get("kg_update_status", "N/A"))
+
+         # Display partial steps
+         with st.expander("Completed Steps (Partial Run)", expanded=True):
+            st.subheader("Run Steps & Durations");
+            if partial_results.get("steps"):
+                try:
+                    steps_data = []
+                    for step in partial_results["steps"]:
+                         if isinstance(step, dict):
+                              steps_data.append({
+                                  "Name": step.get("name", "N/A"),
+                                  "Duration (s)": step.get("duration", "N/A"),
+                                  "Status": step.get("status", "N/A"),
+                                  "Error Message": step.get("error_message", "") # Show error message if step failed
+                              })
+                         else: steps_data.append({"Name": "Invalid Step Data", "Status": "Error"})
+                    steps_df = pd.DataFrame(steps_data)
+                    st.dataframe(steps_df, use_container_width=True)
+                except Exception as df_e:
+                    st.warning(f"Error displaying partial steps table: {df_e}")
+                    st.json(partial_results.get("steps", "No steps data."))
+            else: st.write("No step details available.")
+
+         with st.expander("Partial Extracted Data (if any)", expanded=False):
+              st.json(partial_results.get("final_extracted_data", "No partial extracted data."))
+         with st.expander("Partial Structured Data (if any)", expanded=False):
+              st.json(partial_results.get("linkup_structured_data", "No partial structured data."))
+
+
+# --- Initial/Idle State Display ---
+else:
+    st.info("Enter query and click 'Run Analysis' to begin.")
