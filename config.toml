@@ -1,0 +1,4 @@
+[server]
+# Increase the script timeout to 1200 seconds (20 minutes) or more
+# Adjust based on the maximum expected runtime of your analysis queries
+scriptTimeout = 1200

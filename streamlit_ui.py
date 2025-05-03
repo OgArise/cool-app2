@@ -137,8 +137,8 @@ for provider_key in LLM_PROVIDERS.values():
 #     st.session_state.analysis_task = None
 
 
-st.set_page_config(page_title="AI Analyst Agent", layout="wide")
-st.title("🕵️ AI Analyst Agent Interface")
+st.set_page_config(page_title="Analyst AI Agent", layout="wide")
+st.title("🕵️ The China Analyst AI Agent")
 st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 
 # Display backend URL status
@@ -170,7 +170,7 @@ llm_model = st.sidebar.text_input(
     help=f"e.g., {DEFAULT_MODELS.get(selected_provider_key, 'default')}"
 )
 
-st.sidebar.caption("✨ Tip: Google AI & OpenRouter often have free tiers. OpenAI requires paid credits.")
+st.sidebar.caption("✨ Tip: OpenRouter is free. OpenAI & Google requires paid credits.")
 
 st.subheader("1. Enter Your Initial Query")
 # Set initial query default to blank
