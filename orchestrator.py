@@ -113,7 +113,7 @@ def _get_gsheet_service():
             gsheet_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
             print("Google Sheets service authenticated successfully.")
         except Exception as e: print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}"); gsheet_service = None
-    return gsheet_service
+    return gheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     """Appends a list of rows (values) to the specified sheet tab. Checks for service."""
@@ -125,7 +125,6 @@ def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
         return True
     except Exception as e: print(f"ERROR appending data to Google Sheet '{sheet_name}': {e}"); return False
 
-# --- NEW HELPER FUNCTION ---
 def contains_chinese(text):
     """Simple check if a string contains Chinese characters."""
     if not isinstance(text, str):
@@ -152,7 +151,7 @@ def _save_analysis_to_gsheet(run_results: Dict,
     service = _get_gsheet_service()
     if service is None: print("Aborting save: GSheet service unavailable or config missing."); return
 
-    # Check NLP availability for translation specifically
+    # Check NLP availability for translation
     nlp_available_for_translation = nlp_processor_available and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
     if not nlp_available_for_translation:
         print("Warning: NLP processor or translate_text function not available. Chinese entity names in Exposures sheet will not be translated.")
@@ -221,7 +220,7 @@ def _save_analysis_to_gsheet(run_results: Dict,
     if exposures_to_save:
         exposure_rows_to_save_sheet = []
 
-        # --- NEW HELPER FUNCTION FOR EXPOSURE NAME FORMATTING ---
+        # Helper function to translate name and format for sheet cell
         def format_entity_name_for_sheet(name: Any, original_field_key: str) -> str:
             if not name or not isinstance(name, str):
                 return str(name) if name is not None else '' # Return as string or empty string if invalid or empty
@@ -235,6 +234,8 @@ def _save_analysis_to_gsheet(run_results: Dict,
                  if nlp_processor is not None:
                       print(f"[Step 5 Prep] Translating Chinese entity name for '{original_field_key}' column: '{name_str}'")
                       try:
+                           # Added a small sleep before translation calls to avoid hitting API limits too fast
+                           time.sleep(nlp_processor.LLM_TRANSLATION_DELAY)
                            translated_name = nlp_processor.translate_text(name_str, 'en', llm_provider_for_translation, llm_model_for_translation)
                            if translated_name and isinstance(translated_name, str) and translated_name.strip():
                                 # Combine translated English with original Chinese in brackets
@@ -852,7 +853,7 @@ def run_analysis(initial_query: str,
         print(f"\n--- Running Step 2: Translating Keywords ---")
         step2_start = time.time()
         # Check if nlp_processor and specific functions are available before calling
-        # nlp_extraction_available check includes translate_keywords_for_context
+        # The check for nlp_extraction_available covers these
         if nlp_extraction_available:
              translated_keywords = nlp_processor.translate_keywords_for_context(
                   initial_query, f"{specific_search_context} relevant for {specific_country_code}",
@@ -1148,27 +1149,6 @@ def run_analysis(initial_query: str,
 
         likely_chinese_company_org_names_set.discard('') # Remove empty strings
 
-        # Filter based on presence of Chinese characters as a proxy for "likely Chinese" if country is CN
-        # If country is not CN, this filter logic might need adjustment.
-        if specific_country_code.lower() == 'cn':
-             # Keep names that were identified AND contain Chinese characters OR are already translated English names that were linked to Chinese sources/context (more complex check)
-             # For simplicity now, let's just assume entities with Chinese characters are "Chinese" for the sheet/KG filtering in the CN run.
-             # A more robust approach would involve language detection on the entity name or source snippet.
-             # Keep triggers even if name is English translation if the trigger logic identified them based on relationships/risks involving Chinese entities
-             triggering_chinese_company_org_names_lower = {name.lower() for name in triggering_chinese_company_org_names_lower} # Ensure this set is lowercased
-             likely_chinese_company_org_names = {name for name in likely_chinese_company_org_names_set if contains_chinese(name) or name.lower() in triggering_chinese_company_org_names_lower}
-        else:
-             # If not a CN run, this filtering logic might be less relevant or need different criteria.
-             # For now, assume we save/KG entities identified if not in common non-country specific list.
-             # Revert to a simpler filter or adapt based on non-CN requirements.
-             # For this code version focused on the CN example, we'll stick to the CN-centric filter if specific_country_code is 'cn'.
-             # If not 'cn', we'll skip this Chinese-character based filtering for entity names and use all identified as potentially relevant.
-             likely_chinese_company_org_names = likely_chinese_company_org_names_set # In non-CN run, keep all initially identified as potential
-             triggering_chinese_company_org_names_lower = {name.lower() for name in triggering_chinese_company_org_names_lower} # Still need this for relationship/risk linking logic below
-
-
-        likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities.")
 
         # Identify Regulatory Agencies and Sanctions from the accumulated entities
         # These will be used to identify the 'subject_to' relationships involving Chinese entities
@@ -1203,22 +1183,45 @@ def run_analysis(initial_query: str,
             and rel.get('entity1').strip().lower() in likely_chinese_company_org_names_lower # Entity1 is a Chinese Company/Org
             and rel.get('entity2').strip().lower() in all_reg_sanc_names_lower # Entity2 is a Regulator/Sanction (might not be Chinese, but needs to be *an* extracted Reg/Sanc entity)
         ]
-        # Refined trigger logic: An exposure is a Chinese Company/Org that is related to *another* Chinese Company/Org via ownership/affiliate/JV AND is a 'trigger'.
-        # The 'trigger' event itself (SUBJECT_TO or relevant High/Severe Risk) is what makes the *Chinese Entity* noteworthy.
-        # Then we link this *triggering Chinese Entity* to *other Chinese Entities* via ownership relationships to identify the exposed pair.
+        companies_subject_to_names_lower = {rel['entity1'].strip().lower() for rel in companies_subject_to_reg_sanc_rels}
 
-        # Let's redefine "triggering_chinese_company_org_names_lower" to be the set of Chinese Companies/Orgs that are *either* SUBJECT_TO *or* have a relevant High/Severe risk.
-        triggering_chinese_company_org_names_lower = companies_subject_to_names_lower.union(companies_with_high_severe_relevant_risks)
-        # Ensure these names are actually in the set of likely_chinese_company_org_names_lower
-        triggering_chinese_company_org_names_lower = triggering_chinese_company_org_names_lower.intersection(likely_chinese_company_org_names_lower)
+        # 2. Entities with HIGH/SEVERE Compliance, Financial, Legal, Regulatory, Governance Risks (from *any* source)
+        companies_with_high_severe_relevant_risks = set()
+        high_severe_risks = [r for r in all_risks_accumulated if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"]]
+        relevant_risk_categories_lower = ['compliance', 'financial', 'legal', 'regulatory', 'governance'] # Added more categories
+        for risk in high_severe_risks:
+             risk_desc = risk.get('description', '').lower()
+             risk_category = risk.get('risk_category', '').lower() # Use extracted category
 
-        print(f"[Step 3.5 Exposures] Identified {len(triggering_chinese_company_org_names_lower)} Chinese Companies/Orgs that are potential exposure triggers (Subject To OR High/Severe Relevant Risk).")
+             # Check for relevant category
+             if risk_category in relevant_risk_categories_lower:
+                  for entity_name in risk.get('related_entities', []):
+                       # Ensure the related entity is a Chinese Company/Org
+                       if isinstance(entity_name, str) and entity_name.strip().lower() in likely_chinese_company_org_names_lower:
+                            companies_with_high_severe_relevant_risks.add(entity_name.strip().lower())
+             # Also check if the risk description itself strongly suggests a relevant risk type if category is missing or unknown
+             elif risk_category == "UNKNOWN":
+                  # Simple keyword check in description for UNKNOWN category risks
+                  if any(keyword in risk_desc for keyword in relevant_risk_categories_lower + ['sanction', 'fine', 'penalty', 'violation', 'lawsuit', 'investigation', 'fraud', 'corruption']):
+                       for entity_name in risk.get('related_entities', []):
+                            # Ensure the related entity is a Chinese Company/Org
+                            if isinstance(entity_name, str) and entity_name.strip().lower() in likely_chinese_company_org_names_lower:
+                                 companies_with_high_severe_relevant_risks.add(entity_name.strip().lower())
+
+
+        # Combine all Chinese Company/Org entities that are triggers
+        # A trigger is a Chinese Company/Org that is either SUBJECT_TO or has a HIGH/SEVERE Relevant Risk
+        # *** CORRECTED VARIABLE NAME ***
+        initial_triggering_company_names_lower = companies_subject_to_names_lower.union(companies_with_high_severe_relevant_risks)
+
+
+        print(f"[Step 3.5 Exposures] Identified {len(initial_triggering_company_names_lower)} Chinese Companies/Orgs that are potential exposure triggers (Subject To OR High/Severe Compliance/Financial Risk).")
 
 
         consolidated_exposures: Dict[Tuple, Dict] = {} # Key will be (Triggering Chinese Co/Org Name Lower, Related Chinese Co/Org Name Lower, Ownership/Affiliate/JV Relationship Type)
 
         # Iterate through the Chinese Company/Org entities that are triggers
-        for triggering_company_name_lower in triggering_chinese_company_org_names_lower:
+        for triggering_company_name_lower in initial_triggering_company_names_lower: # Iterate over the initial set of triggers
              # Find the original casing name from the accumulated entities list
              triggering_company_name = next((name for name in likely_chinese_company_org_names if name.lower() == triggering_company_name_lower), triggering_company_name_lower) # Get original casing if possible
 
@@ -1238,7 +1241,7 @@ def run_analysis(initial_query: str,
              ]
 
              # We create an exposure row for each *pair* of Chinese Companies/Orgs linked by a required ownership relationship,
-             # BUT *only* if one of them is in the 'triggering_chinese_company_org_names_lower' list.
+             # BUT *only* if one of them is in the 'initial_triggering_company_names_lower' list.
              # If a triggering company exists but has no *explicit* ownership relation to *another* Chinese company in the data,
              # it won't create an exposure row in the sheet based on the current logic (which requires a related Chinese entity).
 
@@ -1317,14 +1320,15 @@ def run_analysis(initial_query: str,
                  # Define the key for consolidating exposures.
                  # Use the triggering company name + the other involved company name + relationship type.
                  # Ensure names are lowercase and stripped for consistency in the key.
-                 entity_pair_sorted = tuple(sorted((triggering_company_name_lower, other_chinese_company_name.lower().strip())))
+                 triggering_name_for_key = triggering_company_name.strip().lower() if isinstance(triggering_company_name, str) else ''
+                 other_name_for_key = other_chinese_company_name.strip().lower() if isinstance(other_chinese_company_name, str) else ''
 
                  # Ensure the tuple key is valid (no empty strings from names)
-                 if not all(entity_pair_sorted):
-                      print(f"Warning: Skipping exposure key due to invalid entity names: {entity_pair_sorted}. Relationship: {ownership_rel}")
+                 if not all([triggering_name_for_key, other_name_for_key]):
+                      print(f"Warning: Skipping exposure key due to invalid entity names: ('{triggering_company_name}', '{other_chinese_company_name}'). Relationship: {ownership_rel}")
                       continue
 
-                 relationship_exposure_key = (entity_pair_sorted[0], entity_pair_sorted[1], r_type_upper)
+                 relationship_exposure_key = (triggering_name_for_key, other_name_for_key, r_type_upper)
 
 
                  # Consolidate data if the same relationship between the same entities has multiple risks/sanctions apply
@@ -1541,9 +1545,8 @@ def run_analysis(initial_query: str,
              # A more robust approach would involve language detection on the entity name or source snippet.
              # Keep triggers even if name is English translation if the trigger logic identified them based on relationships/risks involving Chinese entities
              # We need the set of triggering entities *before* filtering likely Chinese names
-             triggering_chinese_company_org_names_lower_initial = {name.lower() for name in triggering_chinese_company_org_names_lower} # Use the set calculated in 3.5
-
-             likely_chinese_company_org_names = {name for name in likely_chinese_company_org_names_set if contains_chinese(name) or name.lower() in triggering_chinese_company_org_names_lower_initial}
+             # *** CORRECTED VARIABLE NAME USAGE ***
+             likely_chinese_company_org_names = {name for name in likely_chinese_company_org_names_set if contains_chinese(name) or name.lower() in initial_triggering_company_names_lower} # Uses the initial triggering set
         else:
              # If not a CN run, this filtering logic might be less relevant or need different criteria.
              # For now, assume we save/KG entities identified if not in common non-country specific list.
