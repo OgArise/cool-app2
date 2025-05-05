@@ -159,6 +159,10 @@ def _save_analysis_to_gsheet(run_results: Dict,
     nlp_available_for_translation = nlp_processor is not None and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
     if not nlp_available_for_translation:
         print("Warning: NLP processor or translate_text function not available. Chinese entity names in Exposures sheet will not be translated.")
+    elif not llm_provider_for_translation or not llm_model_for_translation:
+         print("Warning: LLM config for translation is missing. Chinese entity names in Exposures sheet will not be translated.")
+         nlp_available_for_translation = False # Disable translation if LLM config is bad
+
 
     run_timestamp_iso = "Timestamp Error"
     try:
@@ -410,7 +414,7 @@ def run_analysis(initial_query: str,
                               'extract_relationships_only', 'extract_regulatory_sanction_relationships',
                               'process_linkup_structured_data', 'generate_analysis_summary']
         for func_name in required_nlp_funcs:
-             if not hasattr(nlp_processor, func_name) or not callable(getattr(nlp_processor, func_name)):
+             if not hasattr(nlp_processor, func) or not callable(getattr(nlp_processor, func)):
                   print(f"Warning: nlp_processor.{func_name} not available.")
                   nlp_processor_available = False
                   # No break here, report all missing functions
@@ -420,7 +424,8 @@ def run_analysis(initial_query: str,
          results["error"] = "NLP processor module or essential functions not available."; print(f"--- Orchestrator ERROR: {results['error']} ---")
          results["run_duration_seconds"] = round(time.time() - start_run_time, 2)
          # Pass empty lists to _save_analysis_to_gsheet since no data was extracted
-         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [])
+         # Also pass the LLM config for translation, even if translation didn't happen
+         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
          if kg_driver_available and kg_driver is not None: knowledge_graph.close_driver() # Close if it was successfully obtained
          return results
 
@@ -431,7 +436,8 @@ def run_analysis(initial_query: str,
          results["error"] = f"LLM configuration/initialization failed: {e}"; print(f"--- Orchestrator ERROR: {results['error']} ---")
          results["run_duration_seconds"] = round(time.time() - start_run_time, 2)
          # Pass empty lists to _save_analysis_to_gsheet since no data was extracted
-         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [])
+         # Also pass the LLM config for translation, even if translation didn't happen
+         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
          if kg_driver_available and kg_driver is not None: knowledge_graph.close_driver() # Close if it was successfully obtained
          return results
 
@@ -449,8 +455,6 @@ def run_analysis(initial_query: str,
     # Define the threshold for stopping subsequent search engines early
     search_threshold_results = 15
 
-    all_search_results_map: Dict[str, Dict] = {} # Use map for O(1) URL lookup
-
 
     # Initialize empty lists within try block scope for finally access
     entities_to_save_to_sheet = []
@@ -460,6 +464,9 @@ def run_analysis(initial_query: str,
 
     # Initialize raw structured data list within try block
     raw_linkup_structured_data_collected = []
+
+    # Initialize all_search_results_map within try block
+    all_search_results_map: Dict[str, Dict] = {} # Use map for O(1) URL lookup
 
 
     try:
@@ -900,8 +907,8 @@ def run_analysis(initial_query: str,
              try:
                   # Linkup search_linkup_snippets handles multiple queries and returns combined unique results
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
-                  # Pass the combined query to search_linkup_snippets.
-                  linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Removed num and country_code
+                  # Pass the combined query to search_linkup_snippets. Removed num and country_code
+                  linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Corrected call signature
                   if linkup_specific_results:
                        print(f"    Linkup Snippet Search returned {len(linkup_specific_results)} unique results after internal deduplication.")
                        # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
@@ -1789,7 +1796,8 @@ def run_analysis(initial_query: str,
                          "analysis_summary": "Analysis failed due to critical internal error."
                      }
                       # Pass empty lists as no data was filtered/prepared
-                      _save_analysis_to_gsheet(basic_error_results, [], [], [], [])
+                      # Pass the LLM config for translation, even if translation didn't happen
+                      _save_analysis_to_gsheet(basic_error_results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
              except Exception as save_e:
                   print(f"CRITICAL ERROR: Failed to save even basic error info to sheets: {save_e}")
                   traceback.print_exc()
@@ -1797,11 +1805,14 @@ def run_analysis(initial_query: str,
 
     finally:
         # Ensure KG driver is closed if it was successfully obtained and is not None
+        # Use the dedicated knowledge_graph.close_driver() function
         if kg_driver_available and kg_driver is not None:
             try:
-                 driver.close()
-                 driver = None
-                 print("Neo4j connection closed.")
+                 knowledge_graph.close_driver() # Correctly call the close function
+                 # The global driver variable is managed within knowledge_graph.py now
+                 # driver = None # No need to set driver to None here, knowledge_graph.close_driver() does it
+                 # print("Neo4j connection closed.") # knowledge_graph.close_driver() already prints this
+                 pass # Do nothing if close_driver() handles print and setting driver to None
             except Exception as e:
                  print(f"Error closing Neo4j driver: {e}")
 
@@ -1818,6 +1829,7 @@ def run_analysis(initial_query: str,
                        del step_data["extracted_data"] # Remove large list of data
 
              # Pass the filtered data (now defined in the main try block scope) to the save function
+             # Also pass the LLM config for translation
              if google_sheets_available:
                  # Ensure lists exist even if filtering failed partially by checking locals()
                  _save_analysis_to_gsheet(
@@ -1825,7 +1837,9 @@ def run_analysis(initial_query: str,
                      entities_to_save_to_sheet if 'entities_to_save_to_sheet' in locals() else [],
                      risks_to_save_to_sheet if 'risks_to_save_to_sheet' in locals() else [],
                      relationships_to_save_to_sheet if 'relationships_to_save_to_sheet' in locals() else [],
-                     exposures_to_save_to_sheet if 'exposures_to_save_to_sheet' in locals() else []
+                     exposures_to_save_to_sheet if 'exposures_to_save_to_sheet' in locals() else [],
+                     llm_provider_to_use, # Pass LLM provider for translation
+                     llm_model_to_use # Pass LLM model for translation
                  )
              else: print("Skipping save to Google Sheets: Configuration missing or invalid.")
         else:
