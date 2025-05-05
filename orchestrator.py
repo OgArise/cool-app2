@@ -114,13 +114,11 @@ def _get_gsheet_service():
             print("Google Sheets service authenticated successfully.")
         except Exception as e:
              print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}")
-             # --- CORRECTED TYPO ---
-             gsheet_service = None # Corrected gheet_service to gsheet_service
+             gsheet_service = None
         # --- ENSURE service is returned even if exception occurred ---
         # The global gsheet_service variable is updated inside the try/except block
         # The return statement needs to access the global variable.
         # The logic below relies on gsheet_service being None if the build failed.
-        # The variable is correctly set to None (after typo fix), so the return is fine.
     return gsheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
@@ -162,7 +160,7 @@ def _save_analysis_to_gsheet(run_results: Dict,
     if service is None: print("Aborting save: GSheet service unavailable or config missing."); return
 
     # Check NLP availability for translation specifically
-    nlp_available_for_translation = nlp_processor_available and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
+    nlp_available_for_translation = nlp_processor is not None and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
     if not nlp_available_for_translation:
         print("Warning: NLP processor or translate_text function not available. Chinese entity names in Exposures sheet will not be translated.")
 
@@ -458,31 +456,29 @@ def run_analysis(initial_query: str,
     all_search_results_map: Dict[str, Dict] = {} # Use map for O(1) URL lookup
 
 
-    # Initialize empty lists within try block scope for finally access.
-    # These are assigned in Step 5.
-    entities_to_save_to_sheet = []
-    risks_to_save_to_sheet = []
-    relationships_to_save_to_sheet = []
-    exposures_to_save_to_sheet = [] # This will hold the final list of exposure dictionaries
+    # Initialize variables that need to persist through the try block
+    # These are populated *within* the try block but potentially accessed in `finally` or later steps
+    all_entities_accumulated: List[Dict] = []
+    all_risks_accumulated: List[Dict] = []
+    all_collected_relationships: List[Dict] = []
+    raw_linkup_structured_data_collected: List[Dict] = []
 
-    # Initialize raw structured data list within try block. Assigned in Step 1.5.
-    raw_linkup_structured_data_collected = []
-
-    # Initialize variables calculated in Step 3.5 Exposure Generation.
-    # These are needed in Step 5 Filtering or the finally block.
+    # Variables used for filtering and exposure generation, populated *within* the try block
     likely_chinese_company_org_names_set: set[str] = set()
     likely_chinese_company_org_names: set[str] = set()
     likely_chinese_company_org_names_lower: set[str] = set()
     triggering_chinese_company_org_names_lower_initial: set[str] = set()
-    triggering_and_likely_chinese_entities_lower: set[str] = set()
     all_reg_agency_names: set[str] = set()
     all_sanction_names: set[str] = set()
     all_reg_sanc_names_lower: set[str] = set()
-    consolidated_exposures: Dict[Tuple, Dict] = {}
-    generated_exposures: List[Dict] = []
-    all_entities_accumulated: List[Dict] = [] # Needed for finding original casing
-    all_risks_accumulated: List[Dict] = [] # Needed for risk calculation
-    all_collected_relationships: List[Dict] = [] # Needed for relationship calculation
+    consolidated_exposures: Dict[Tuple, Dict] = {} # Used internally for exposure generation deduplication
+    generated_exposures: List[Dict] = [] # Holds the list of generated exposure dictionaries
+
+    # Final lists for saving to sheet/KG - populated *after* filtering in Step 5
+    entities_to_save_to_sheet: List[Dict] = []
+    risks_to_save_to_sheet: List[Dict] = []
+    relationships_to_save_to_sheet: List[Dict] = []
+    exposures_to_save_to_sheet: List[Dict] = [] # Holds exposure dictionaries filtered for saving to sheet
 
 
     try:
@@ -604,7 +600,6 @@ def run_analysis(initial_query: str,
 
                       time.sleep(0.5)
                  except Exception as e:
-                      # --- CORRECTED MISSING PARENTHESIS ---
                       print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
                       traceback.print_exc()
 
@@ -1029,7 +1024,6 @@ def run_analysis(initial_query: str,
 
                       time.sleep(0.5)
                  except Exception as e:
-                      # --- CORRECTED MISSING PARENTHESIS ---
                       print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
                       traceback.print_exc()
 
@@ -1167,10 +1161,10 @@ def run_analysis(initial_query: str,
         print(f"\n--- Running Step 3.5: Generating High Risk Exposures ---")
         step3_5_start = time.time()
 
-        # --- These variables are now initialized before the try block ---
+        # Retrieve the *final* accumulated lists from the results dict after all extraction steps
         all_entities_accumulated = results["final_extracted_data"].get("entities", [])
         all_risks_accumulated = results["final_extracted_data"].get("risks", [])
-        all_collected_relationships = list(results["final_extracted_data"].get("relationships", []))
+        all_collected_relationships = results["final_extracted_data"].get("relationships", []) # Use .get() just in case
 
 
         # Recalculate likely Chinese company/org names based on ALL accumulated entities
@@ -1185,13 +1179,8 @@ def run_analysis(initial_query: str,
 
         likely_chinese_company_org_names_set.discard('') # Remove empty strings
 
-        # Filter based on presence of Chinese characters as a proxy for "likely Chinese" if country is CN
-        # If country is not CN, this filter logic might need adjustment.
-        # --- Fix for UnboundLocalError ---
-        # triggering_chinese_company_org_names_lower_initial is initialized before try
 
-
-        # Recalculate the set of triggering entities based on all accumulated data before filtering 'likely Chinese' names
+        # Recalculate the set of triggering entities based on all accumulated data
         # Find ALL relevant risks (High/Severe) and SUBJECT_TO relationships involving the triggering entity (any entity type for now)
         high_severe_risks = [r for r in all_risks_accumulated if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"]]
         relevant_risk_categories_lower = ['compliance', 'financial', 'legal', 'regulatory', 'governance'] # Added more categories
@@ -1233,7 +1222,6 @@ def run_analysis(initial_query: str,
              # For this code version focused on the CN example, we'll stick to the CN-centric filter if specific_country_code is 'cn'.
              # If not 'cn', we'll skip this Chinese-character based filtering for entity names and use all identified as potentially relevant.
              likely_chinese_company_org_names = likely_chinese_company_org_names_set # In non-CN run, keep all initially identified as potential
-             # triggering_chinese_company_org_names_lower_initial is already calculated above and needed for the exposure loop below.
 
 
         # Make sure triggering_chinese_company_org_names_lower_initial is a set of lowercase strings
@@ -1242,18 +1230,13 @@ def run_analysis(initial_query: str,
 
 
         likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 5 Prep] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for Sheet/KG filtering.")
 
-
-        print(f"[Step 5 Prep] Analyzing {len(all_risks_from_run)} raw risks and {len(all_entities_from_run)} raw entities for Sheet/KG filtering.")
-
-        # Identify Regulatory Agencies and Sanctions to save based on filtering rules for sheet/KG
-        # Include those identified in NLP snippet extraction or structured data
-        all_reg_agency_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
-        all_sanction_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+        # Identify Regulatory Agencies and Sanctions based on ALL accumulated entities
+        all_reg_agency_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
+        all_sanction_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
 
         # Also include Regulatory Agencies and Sanctions potentially identified from structured data
-        structured_derived_reg_sanc_entities = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
+        structured_derived_reg_sanc_entities = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
         all_reg_agency_names.update(structured_derived_reg_sanc_entities) # Just lump them here for now, refinement might need specific type check
 
         all_reg_agency_names.discard('')
@@ -1264,9 +1247,162 @@ def run_analysis(initial_query: str,
         all_reg_sanc_names_lower = all_reg_agency_names_lower.union(all_sanction_names_lower)
 
 
+        # --- Placeholder Exposure Generation Logic ---
+        # This section takes the accumulated data and identifies specific "exposures"
+        # that are high risk and relevant (e.g., involving triggered entities).
+        # A real implementation would involve more complex analysis combining risks, relationships, and entity types.
+        # The output populates the `generated_exposures` list.
+
+        consolidated_exposures = {} # Reset or ensure this is clear before starting
+
+        # Define the set of entity names that should trigger exposure generation if involved in risks/relationships
+        triggering_and_likely_chinese_entities_lower = likely_chinese_company_org_names_lower.union(triggering_chinese_company_org_names_lower_initial)
+
+        print(f"[Step 3.5 GenExp] Triggering/Likely Entities ({len(triggering_and_likely_chinese_entities_lower)}): {list(triggering_and_likely_chinese_entities_lower)[:10]}...")
+
+        # Generate exposures from Risks
+        high_severe_risks_for_exposure = [
+            r for r in all_risks_accumulated
+            if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"]
+        ]
+        print(f"[Step 3.5 GenExp] Found {len(high_severe_risks_for_exposure)} high/severe risks.")
+
+        for risk in high_severe_risks_for_exposure:
+            risk_desc = risk.get('description', '')
+            risk_severity = risk.get('severity', 'N/A')
+            risk_category = risk.get('risk_category', 'UNKNOWN')
+            sources = risk.get('source_urls', [])
+            related_entities = risk.get('related_entities', [])
+
+            for entity_name in related_entities:
+                if isinstance(entity_name, str) and entity_name.strip().lower() in triggering_and_likely_chinese_entities_lower:
+                     # This entity is a trigger/likely Chinese company with a high risk
+                     # Create a basic exposure for this entity
+                     exposure_key = (entity_name.strip().lower(), risk_desc.strip().lower(), 'Risk') # Use risk description as part of key
+
+                     if exposure_key not in consolidated_exposures:
+                         # Find if this entity is a subsidiary/affiliate or parent from relationships
+                         parent_name = "N/A"
+                         sub_aff_name = "N/A"
+                         # Iterate through ALL relationships to find relevant ownership connections for this entity
+                         for rel in all_collected_relationships:
+                              if isinstance(rel, dict):
+                                   e1 = rel.get('entity1')
+                                   e2 = rel.get('entity2')
+                                   rel_type = rel.get('relationship_type')
+
+                                   if isinstance(e1, str) and isinstance(e2, str) and isinstance(rel_type, str):
+                                         if rel_type.upper() == "SUBSIDIARY_OF" and e1.strip().lower() == entity_name.strip().lower():
+                                             parent_name = e2.strip() # e2 is the parent of e1
+                                             break # Found parent, move on (simplification: assumes one primary parent)
+                                         # Add check if the trigger entity is e2 in a PARENT_COMPANY_OF relationship
+                                         if rel_type.upper() == "PARENT_COMPANY_OF" and e2.strip().lower() == entity_name.strip().lower():
+                                             # If the trigger entity is e2, then e1 is its parent
+                                             parent_name = e1.strip()
+                                             break # Found parent
+
+
+                         # Create the exposure dictionary
+                         exposure_dict = {
+                             'Entity': entity_name.strip(),
+                             'Subsidiary/Affiliate': sub_aff_name, # Need logic to populate this correctly
+                             'Parent Company': parent_name,
+                             'Risk_Severity': risk_severity,
+                             'Risk_Type': f"Risk ({risk_category})", # Indicate it's a risk-based exposure
+                             'Explanation': risk_desc.strip(),
+                             'Main_Sources': list(set(sources)), # Ensure unique sources
+                             '_source_type': 'derived_from_risk'
+                         }
+                         consolidated_exposures[exposure_key] = exposure_dict
+                         # print(f"  [Step 3.5 GenExp] Created risk exposure for '{entity_name}'")
+
+
+        # Generate exposures from Relationships (e.g., Regulatory/Sanction relationships)
+        reg_sanc_relationships_for_exposure = [
+            rel for rel in all_collected_relationships
+            if isinstance(rel, dict)
+            and isinstance(rel.get('entity1'), str)
+            and rel.get('entity1').strip().lower() in triggering_and_likely_chinese_entities_lower # Entity1 is the triggering/likely Chinese subject
+            and isinstance(rel.get('relationship_type'), str)
+            and rel.get('relationship_type').upper() in ["SUBJECT_TO", "ISSUED_BY"] # Relevant relationship types
+            and isinstance(rel.get('entity2'), str)
+            and rel.get('entity2').strip().lower() in all_reg_sanc_names_lower # Entity2 is a regulator or sanction
+        ]
+        print(f"[Step 3.5 GenExp] Found {len(reg_sanc_relationships_for_exposure)} relevant regulatory/sanction relationships.")
+
+        for rel in reg_sanc_relationships_for_exposure:
+            entity1 = rel.get('entity1', '').strip()
+            entity2 = rel.get('entity2', '').strip()
+            rel_type = rel.get('relationship_type', '').strip()
+            context_urls = rel.get('context_urls', [])
+
+            # Create a basic exposure for this relationship
+            exposure_key = (entity1.lower(), f"{rel_type.lower()}_{entity2.lower()}", 'Relationship') # Use relationship details in key
+
+            if exposure_key not in consolidated_exposures:
+                 # Find parent/subsidiary info for entity1 (the subject)
+                 parent_name = "N/A"
+                 sub_aff_name = "N/A"
+                 for own_rel in all_collected_relationships:
+                      if isinstance(own_rel, dict):
+                           e1_own = own_rel.get('entity1')
+                           e2_own = own_rel.get('entity2')
+                           rel_type_own = own_rel.get('relationship_type')
+
+                           if isinstance(e1_own, str) and isinstance(e2_own, str) and isinstance(rel_type_own, str):
+                                if rel_type_own.upper() == "SUBSIDIARY_OF" and e1_own.strip().lower() == entity1.lower():
+                                     parent_name = e2_own.strip()
+                                     break
+                                if rel_type_own.upper() == "PARENT_COMPANY_OF" and e2_own.strip().lower() == entity1.lower():
+                                     parent_name = e1_own.strip()
+                                     break
+
+                 # Create the exposure dictionary
+                 exposure_dict = {
+                     'Entity': entity1,
+                     'Subsidiary/Affiliate': sub_aff_name, # Need logic to populate this correctly
+                     'Parent Company': parent_name,
+                     'Risk_Severity': 'HIGH', # Assume regulatory/sanction relationship implies high risk
+                     'Risk_Type': f"Regulatory/Sanction ({rel_type.replace('_', ' ').title()} {entity2})", # Describe the relationship
+                     'Explanation': f"{entity1} is {rel_type.lower().replace('_', ' ')} {entity2}", # Basic explanation
+                     'Main_Sources': list(set(context_urls)), # Ensure unique sources
+                     '_source_type': 'derived_from_relationship'
+                 }
+                 consolidated_exposures[exposure_key] = exposure_dict
+                 # print(f"  [Step 3.5 GenExp] Created relationship exposure for '{entity1}'")
+
+
+        # The list for the sheet needs to be derived from the consolidated dictionary's values
+        # This implicitly handles deduplication by key used in consolidated_exposures
+        generated_exposures = list(consolidated_exposures.values())
+        results["high_risk_exposures"] = generated_exposures # Store generated exposures in results dict
+        print(f"[Step 3.5 GenExp] Generated {len(generated_exposures)} unique exposure candidates.")
+
+        # --- End Placeholder Exposure Generation ---
+
+
+        results["steps"].append({"name": "Generate High Risk Exposures", "duration": round(time.time() - step3_5_start, 2), "generated_exposures_count": len(generated_exposures), "status": "OK" if generated_exposures else "No Exposures Generated" })
+
+
+        print(f"\n--- Running Step 5: Prepare Data for Sheet & KG ---") # Renamed step to align with process
+        step5_prep_start = time.time() # Renamed variable
+
+        # The filtering logic for entities, risks, relationships for sheet/KG now follows,
+        # using the sets calculated above (triggering_..., likely_...).
+
+        # Recalculate likely Chinese company/org names based on ALL accumulated entities
+        # This logic was already done in Step 3.5 - the sets are available here.
+        # Identify Regulatory Agencies and Sanctions to save based on filtering rules for sheet/KG
+        # This logic was also done in Step 3.5 - the sets are available here.
+
+
+        # --- Corrected the variable names causing the NameError ---
+        print(f"[Step 5 Prep] Analyzing {len(all_risks_accumulated)} raw risks and {len(all_entities_accumulated)} raw entities for Sheet/KG filtering.")
+
+
         # Filter entities for the sheet/KG: ONLY Entities identified as likely Chinese Companies/Organizations,
         # AND ONLY Regulatory Agencies and Sanctions identified as likely Chinese (simplified check).
-        entities_to_save_to_sheet = [] # Use a different variable name
+        entities_to_save_to_sheet = []
         # List of common known non-Chinese regulators/sanctions/orgs/countries for filtering
         common_non_chinese_entities_lower = {
             "sec", "securities and exchange commission", "ofac", "office of foreign assets control",
@@ -1277,9 +1413,9 @@ def run_analysis(initial_query: str,
             "google", "apple", "microsoft", "amazon", "facebook", "meta", "twitter", "x", "alibaba", "tencent", "baidu", "huawei", # Add common tech/large company names if they get misclassified
             "shanghai", "beijing", "shenzhen", "guangzhou", "hong kong", "taiwan", # Add cities/regions if misclassified
             "people's republic of china", "prc" # Sometimes PRC itself gets extracted as an entity
-        } # Added more country/org names that might be misidentified
+        }
 
-        for e in all_entities_from_run:
+        for e in all_entities_accumulated: # Filter from ALL accumulated entities
             if isinstance(e, dict) and e.get('name'):
                  entity_name = e.get('name')
                  entity_name_lower = entity_name.lower().strip()
@@ -1310,7 +1446,7 @@ def run_analysis(initial_query: str,
         entity_names_saved_lower = {e.get('name','').lower() for e in entities_to_save_to_sheet if isinstance(e, dict) and e.get('name')}
 
         risks_to_save_to_sheet = [
-            r for r in all_risks_from_run
+            r for r in all_risks_accumulated # Filter from ALL accumulated risks
             if isinstance(r, dict) and r.get('description')
             # Check if *any* related entity for this risk is in the list of entities that will be saved
             and any(isinstance(entity_name, str) and entity_name.strip().lower() in entity_names_saved_lower for entity_name in r.get('related_entities', []))
@@ -1322,7 +1458,7 @@ def run_analysis(initial_query: str,
         # Updated allowed relationship types for the Relationships sheet
         allowed_sheet_rel_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER", "REGULATED_BY", "ISSUED_BY", "SUBJECT_TO", "MENTIONED_WITH", "ACQUIRED", "RELATED_COMPANY"]
 
-        for rel in all_relationships_from_run:
+        for rel in all_collected_relationships: # Filter from ALL collected relationships
             if isinstance(rel, dict) and rel.get('entity1') and rel.get('relationship_type') and rel.get('entity2'):
                  e1_name = rel.get('entity1'); e2_name = rel.get('entity2'); r_type_raw = rel.get('relationship_type')
                  if isinstance(r_type_raw, str) and isinstance(e1_name, str) and isinstance(e2_name, str):
@@ -1339,9 +1475,8 @@ def run_analysis(initial_query: str,
                           # else: print(f"[Step 5 Prep] Filtering out relationship type '{r_type_raw}' not explicitly allowed for sheet/KG save between saved entities.")
                      # else: print(f"[Step 5 Prep] Filtering out relationship {rel} because one or both entities ('{e1_name}', '{e2_name}') were not saved to the entity list.") # Optional logging
 
-
-        # exposures_to_save_to_sheet already contains the filtered list from Step 3.5
-
+        # Filter exposures for the sheet (currently just using all generated exposures, could add more filtering here)
+        exposures_to_save_to_sheet = list(generated_exposures) # Save all generated exposures from Step 3.5
 
         print(f"[Step 5 Prep] Finished filtering data: Entities:{len(entities_to_save_to_sheet)}, Risks:{len(risks_to_save_to_sheet)}, Relationships:{len(relationships_to_save_to_sheet)}, Exposures:{len(exposures_to_save_to_sheet)}.")
 
@@ -1565,7 +1700,8 @@ def run_analysis(initial_query: str,
                      }
                       # Pass empty lists as no data was filtered/prepared
                       # Pass LLM config used in the run for potential error logging in sheet save
-                      _save_analysis_to_gsheet(basic_error_results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
+                      # These lists are initialized before the try, so they are available, even if empty
+                      _save_analysis_to_gsheet(basic_error_results, entities_to_save_to_sheet, risks_to_save_to_sheet, relationships_to_save_to_sheet, exposures_to_save_to_sheet, llm_provider_to_use, llm_model_to_use)
              except Exception as save_e:
                   print(f"CRITICAL ERROR: Failed to save even basic error info to sheets: {save_e}")
                   traceback.print_exc()
@@ -1595,16 +1731,16 @@ def run_analysis(initial_query: str,
                             else: step_data["extracted_data_counts"] = {}
                        del step_data["extracted_data"] # Remove large list of data
 
-             # Pass the filtered data (now defined in the main try block scope) to the save function
+             # Pass the filtered data (now defined before the try block and populated within) to the save function
              # Pass LLM config used in the run for potential error logging in sheet save
              if google_sheets_available:
-                 # Ensure lists exist even if filtering failed partially by checking locals()
+                 # These lists are initialized before the try block, so they are always available
                  _save_analysis_to_gsheet(
                      results,
-                     entities_to_save_to_sheet if 'entities_to_save_to_sheet' in locals() else [],
-                     risks_to_save_to_sheet if 'risks_to_save_to_sheet' in locals() else [],
-                     relationships_to_save_to_sheet if 'relationships_to_save_to_sheet' in locals() else [],
-                     exposures_to_save_to_sheet if 'exposures_to_save_to_sheet' in locals() else [],
+                     entities_to_save_to_sheet,
+                     risks_to_save_to_sheet,
+                     relationships_to_save_to_sheet,
+                     exposures_to_save_to_sheet, # This list is populated in Step 3.5/5
                      llm_provider_to_use, # Pass LLM config
                      llm_model_to_use # Pass LLM config
                  )
@@ -1621,16 +1757,8 @@ def run_analysis(initial_query: str,
     return results
 
 # Check nlp_processor availability at module level for helper functions
-nlp_processor_available = True
-if nlp_processor is None:
-    nlp_processor_available = False
-    print("Warning: nlp_processor module is not available in orchestrator. NLP-dependent features will be disabled.")
-# Check specific functions needed for translation in the save function
-if nlp_processor_available and (not hasattr(nlp_processor, 'translate_text') or not callable(nlp_processor.translate_text)):
-     nlp_processor_available_for_translation = False
-     print("Warning: nlp_processor.translate_text is not available. Translation for sheet saving will be skipped.")
-else:
-     nlp_processor_available_for_translation = nlp_processor_available # If nlp_processor is available and translate_text exists, translation is possible
+# This block seems redundant as it's done near the top, but keeping it for now.
+# Let's remove the redundancy and rely on the check at the top.
 
 
 if __name__ == "__main__":
