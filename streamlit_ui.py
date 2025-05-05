@@ -488,7 +488,7 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
                     steps_data = []
                     for step in results["steps"]:
                          if isinstance(step, dict):
-                              # Use extracted_data_counts if available, otherwise fallback to original keys if they exist
+                               # Use extracted_data_counts if available, otherwise fallback to original keys if they exist
                               entity_count_step = step.get("extracted_data_counts", {}).get("entities", step.get("extracted_data",{}).get("entities","N/A")) # Fallback check includes original structure
                               risk_count_step = step.get("extracted_data_counts", {}).get("risks", step.get("extracted_data",{}).get("risks","N/A"))
                               rel_count_step = step.get("extracted_data_counts", {}).get("relationships", step.get("extracted_data",{}).get("relationships","N/A"))
@@ -516,23 +516,23 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
                               })
                          else:
                               steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
-                steps_df = pd.DataFrame(steps_data)
-                # Define column order and drop columns where all values are N/A, "", or None
-                col_order = [
-                    "Name", "Status", "Duration (s)", "Error Message",
-                    "Search Results", "Structured Results",
-                    "Entities Extracted (Step)", "Risks Extracted (Step)", "Relationships Extracted (Step)",
-                    "Exposures Found", "URLs Checked", "KG Status",
-                ]
-                # Filter for columns that exist in the DataFrame and are not all empty/N/A
-                cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
+                    steps_df = pd.DataFrame(steps_data)
+                    # Define column order and drop columns where all values are N/A, "", or None
+                    col_order = [
+                        "Name", "Status", "Duration (s)", "Error Message",
+                        "Search Results", "Structured Results",
+                        "Entities Extracted (Step)", "Risks Extracted (Step)", "Relationships Extracted (Step)",
+                        "Exposures Found", "URLs Checked", "KG Status",
+                    ]
+                    # Filter for columns that exist in the DataFrame and are not all empty/N/A
+                    cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
 
-                steps_df = steps_df.reindex(columns=cols_to_display)
-                st.dataframe(steps_df, use_container_width=True)
-            except Exception as df_e:
-                st.warning(f"Error displaying steps table: {df_e}")
-                st.json(results.get("steps", "No steps data."))
-        else: st.write("No step details available.")
+                    steps_df = steps_df.reindex(columns=cols_to_display)
+                    st.dataframe(steps_df, use_container_width=True)
+                except Exception as df_e: # FIX: This except block must directly follow the try block with correct indentation
+                    st.warning(f"Error displaying steps table: {df_e}")
+                    st.json(results.get("steps", "No steps data."))
+            else: st.write("No step details available.")
 
     # Remove expanders for full raw data lists to reduce Streamlit state size
     # The data is saved to Google Sheets, so the link above serves as access point
@@ -600,7 +600,7 @@ elif st.session_state.analysis_status == "ERROR":
          with st.expander("Completed Steps (Partial Run)", expanded=True):
             st.subheader("Run Steps & Durations");
             if partial_results.get("steps"):
-                try:
+                try: # FIX: Ensure this try block is correctly structured
                     steps_data = []
                     for step in partial_results["steps"]:
                          if isinstance(step, dict):
@@ -644,7 +644,7 @@ elif st.session_state.analysis_status == "ERROR":
 
                     steps_df = steps_df.reindex(columns=cols_to_display)
                     st.dataframe(steps_df, use_container_width=True)
-                except Exception as df_e:
+                except Exception as df_e: # FIX: This except block must directly follow the try block with correct indentation
                     st.warning(f"Error displaying partial steps table: {df_e}")
                     st.json(partial_results.get("steps", "No steps data."))
             else: st.write("No step details available.")
