@@ -458,14 +458,31 @@ def run_analysis(initial_query: str,
     all_search_results_map: Dict[str, Dict] = {} # Use map for O(1) URL lookup
 
 
-    # Initialize empty lists within try block scope for finally access
+    # Initialize empty lists within try block scope for finally access.
+    # These are assigned in Step 5.
     entities_to_save_to_sheet = []
     risks_to_save_to_sheet = []
     relationships_to_save_to_sheet = []
     exposures_to_save_to_sheet = [] # This will hold the final list of exposure dictionaries
 
-    # Initialize raw structured data list within try block
+    # Initialize raw structured data list within try block. Assigned in Step 1.5.
     raw_linkup_structured_data_collected = []
+
+    # Initialize variables calculated in Step 3.5 Exposure Generation.
+    # These are needed in Step 5 Filtering or the finally block.
+    likely_chinese_company_org_names_set: set[str] = set()
+    likely_chinese_company_org_names: set[str] = set()
+    likely_chinese_company_org_names_lower: set[str] = set()
+    triggering_chinese_company_org_names_lower_initial: set[str] = set()
+    triggering_and_likely_chinese_entities_lower: set[str] = set()
+    all_reg_agency_names: set[str] = set()
+    all_sanction_names: set[str] = set()
+    all_reg_sanc_names_lower: set[str] = set()
+    consolidated_exposures: Dict[Tuple, Dict] = {}
+    generated_exposures: List[Dict] = []
+    all_entities_accumulated: List[Dict] = [] # Needed for finding original casing
+    all_risks_accumulated: List[Dict] = [] # Needed for risk calculation
+    all_collected_relationships: List[Dict] = [] # Needed for relationship calculation
 
 
     try:
@@ -723,7 +740,8 @@ def run_analysis(initial_query: str,
         step1_5_start = time.time()
         step1_5_status = "Skipped (Linkup not available)"
         structured_data_status = "not_run"
-        # raw_linkup_structured_data_collected = [] # Moved initialization to before try block
+        # raw_linkup_structured_data_collected is initialized before try
+
 
         # Check if Linkup structured search and processing functions are available
         linkup_structured_available_orchestrator = linkup_structured_search_available and nlp_extraction_available # nlp_processor.process_linkup_structured_data is included in nlp_extraction_available
@@ -1149,9 +1167,11 @@ def run_analysis(initial_query: str,
         print(f"\n--- Running Step 3.5: Generating High Risk Exposures ---")
         step3_5_start = time.time()
 
+        # --- These variables are now initialized before the try block ---
         all_entities_accumulated = results["final_extracted_data"].get("entities", [])
         all_risks_accumulated = results["final_extracted_data"].get("risks", [])
         all_collected_relationships = list(results["final_extracted_data"].get("relationships", []))
+
 
         # Recalculate likely Chinese company/org names based on ALL accumulated entities
         # This is crucial for filtering consistently across sheets and KG
@@ -1168,8 +1188,7 @@ def run_analysis(initial_query: str,
         # Filter based on presence of Chinese characters as a proxy for "likely Chinese" if country is CN
         # If country is not CN, this filter logic might need adjustment.
         # --- Fix for UnboundLocalError ---
-        # Initialize triggering_chinese_company_org_names_lower_initial before the if/else block that might use it.
-        triggering_chinese_company_org_names_lower_initial: set[str] = set() # Initialize as empty set
+        # triggering_chinese_company_org_names_lower_initial is initialized before try
 
 
         # Recalculate the set of triggering entities based on all accumulated data before filtering 'likely Chinese' names
@@ -1223,13 +1242,13 @@ def run_analysis(initial_query: str,
 
 
         likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for Sheet/KG filtering.")
+        print(f"[Step 5 Prep] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for Sheet/KG filtering.")
 
 
-        print(f"[Step 3.5 Exposures] Analyzing {len(all_risks_from_run)} raw risks and {len(all_entities_from_run)} raw entities for Sheet/KG filtering.")
+        print(f"[Step 5 Prep] Analyzing {len(all_risks_from_run)} raw risks and {len(all_entities_from_run)} raw entities for Sheet/KG filtering.")
 
-        # Identify Regulatory Agencies and Sanctions from the accumulated entities
-        # These will be used to identify the 'subject_to' relationships involving Chinese entities
+        # Identify Regulatory Agencies and Sanctions to save based on filtering rules for sheet/KG
+        # Include those identified in NLP snippet extraction or structured data
         all_reg_agency_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
         all_sanction_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
 
