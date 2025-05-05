@@ -115,7 +115,7 @@ def _get_gsheet_service():
         except Exception as e:
              print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}")
              gsheet_service = None
-    return gsheet_service
+    return gheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     """Appends a list of rows (values) to the specified sheet tab. Checks for service."""
@@ -414,7 +414,8 @@ def run_analysis(initial_query: str,
                               'extract_relationships_only', 'extract_regulatory_sanction_relationships',
                               'process_linkup_structured_data', 'generate_analysis_summary']
         for func_name in required_nlp_funcs:
-             if not hasattr(nlp_processor, func) or not callable(getattr(nlp_processor, func)):
+             # FIX: Use func_name instead of func
+             if not hasattr(nlp_processor, func_name) or not callable(getattr(nlp_processor, func_name)):
                   print(f"Warning: nlp_processor.{func_name} not available.")
                   nlp_processor_available = False
                   # No break here, report all missing functions
@@ -1121,7 +1122,7 @@ def run_analysis(initial_query: str,
 
         # Recalculate likely Chinese company/org names based on ALL accumulated entities
         # This is crucial for filtering consistently across sheets and KG
-        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION"]}
+        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]} # Added potential other types for completeness in Chinese list
         likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
         print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities.")
 
