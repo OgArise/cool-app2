@@ -115,7 +115,8 @@ def _get_gsheet_service():
         except Exception as e:
              print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}")
              gsheet_service = None
-    return gheet_service
+    # FIX: Corrected typo from gheet_service to gsheet_service
+    return gsheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     """Appends a list of rows (values) to the specified sheet tab. Checks for service."""
