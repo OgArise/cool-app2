@@ -10,6 +10,7 @@ import httpx # Import httpx
 import asyncio # Import asyncio
 import pandas as pd
 import traceback
+from typing import Optional, Dict, Any, List # Import List for type hinting
 
 # Import config
 try:
@@ -48,7 +49,7 @@ LLM_PROVIDERS = { "Google AI": "google_ai", "OpenAI": "openai", "OpenRouter": "o
 DEFAULT_MODELS = {
     "google_ai": getattr(config, 'DEFAULT_GOOGLE_AI_MODEL', "models/gemini-1.5-flash-latest") if config else "models/gemini-1.5-flash-latest",
     "openai": getattr(config, 'DEFAULT_OPENAI_MODEL', "gpt-4o-mini") if config else "gpt-4o-mini",
-    "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "google/gemini-flash-1.5") if config else "google/gemini-flash-1.5"
+    "openrouter": getattr(config, 'DEFAULT_OPENROUTER_MODEL', "qwen/qwen3-235b-a22b:free") if config else "qwen/qwen3-235b-a22b:free"
 }
 
 # Determine the default provider key based on the name 'OpenAI'
@@ -137,8 +138,11 @@ for provider_key in LLM_PROVIDERS.values():
 #     st.session_state.analysis_task = None
 
 
-st.set_page_config(page_title="Analyst AI Agent", layout="wide")
+# Set the page title for the browser tab and the main title on the page
+st.set_page_config(page_title="The China Analyst AI Agent", layout="wide") # FIX: Updated page_title
 st.title("🕵️ The China Analyst AI Agent")
+
+
 st.markdown("Enter query, select LLM/Country. API Keys configured on backend.")
 
 # Display backend URL status
@@ -229,19 +233,45 @@ async def run_analysis_async(payload):
             print(f"Streamlit making async API call to {ANALYZE_ENDPOINT}")
             response = await client.post(ANALYZE_ENDPOINT, json=payload)
 
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-
-        results_data = response.json()
-        print(f"Streamlit received backend analysis response. Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
-
-        # Check if the backend reported an error in the response body
-        if results_data.get("error") and results_data["error"] != "None" and results_data["error"] != "":
-             return {"status": "COMPLETE_WITH_ERROR", "results": results_data, "error_message": f"Backend Orchestrator reported an error: {results_data['error']}"}
+        # Check for specific HTTP status codes returned by the backend
+        if response.status_code == 500:
+             # If backend returns 500, it might contain error details in the body
+             try:
+                 error_details = response.json()
+                 error_msg = error_details.get("detail", "Backend returned 500 Internal Server Error")
+                 # Check if the backend included partial/summary results in the error body
+                 results_summary_data = error_details.get("results_summary")
+                 if results_summary_data:
+                      # Return status COMPLETE_WITH_ERROR and include the summary results
+                      return {"status": "COMPLETE_WITH_ERROR", "results": results_summary_data, "error_message": error_msg}
+                 else:
+                      # No summary results included, just return the error status
+                      return {"status": "ERROR", "results": None, "error_message": error_msg}
+             except json.JSONDecodeError:
+                 # If the 500 response body is not JSON
+                 error_msg = f"Backend returned 500 Internal Server Error. Response body not JSON: {response.text[:200]}..."
+                 print(error_msg)
+                 return {"status": "ERROR", "results": None, "error_message": error_msg}
         else:
-             return {"status": "COMPLETE", "results": results_data, "error_message": None}
+             # For any other non-200 status codes, raise the exception
+             response.raise_for_status() # Raise an exception for bad status codes (4xx or other 5xx)
+
+        # If status is 200 OK, parse the JSON response (which is now the smaller subset)
+        results_data = response.json()
+        print(f"Streamlit received backend analysis response (subset). Duration: {results_data.get('run_duration_seconds', 'N/A')}s")
+
+        # The backend now returns a boolean/string error field, not raising HTTPException for backend logic errors.
+        # The status is 'COMPLETE' if we reach here without an HTTPStatusError.
+        # Check the `backend_error` field in the returned data.
+        if results_data.get("backend_error") and results_data["backend_error"] != "None" and results_data["backend_error"] != "":
+            print(f"Streamlit received results with backend_error field: {results_data['backend_error']}")
+            return {"status": "COMPLETE_WITH_ERROR", "results": results_data, "error_message": f"Analysis completed with backend error: {results_data['backend_error']}"}
+        else:
+            return {"status": "COMPLETE", "results": results_data, "error_message": None}
+
 
     except httpx.TimeoutException:
-        error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend."
+        error_msg = f"Request to backend API timed out after {api_timeout_seconds} seconds. The analysis might still be running on the backend. Check Google Sheet for results."
         print(error_msg)
         return {"status": "ERROR", "results": None, "error_message": error_msg}
     except httpx.RequestError as e:
@@ -249,24 +279,6 @@ async def run_analysis_async(payload):
         print(error_msg)
         traceback.print_exc()
         return {"status": "ERROR", "results": None, "error_message": error_msg}
-    except httpx.HTTPStatusError as e:
-         error_msg = f"Backend API returned HTTP error {e.response.status_code} for {e.request.url}"
-         try:
-              # Safely attempt to get JSON detail, fallback to text
-              error_json = e.response.json()
-              if 'detail' in error_json:
-                   # Use json.dumps to handle potential list/dict details nicely
-                   error_detail = json.dumps(error_json['detail'])[:200] + '...' if len(json.dumps(error_json['detail'])) > 200 else json.dumps(error_json['detail'])
-                   error_msg += f"\nDetail: {error_detail}"
-              else:
-                   # If no 'detail' key, just take the start of the response text
-                   error_msg += f"\nResponse: {e.response.text[:200]}..."
-         except json.JSONDecodeError:
-              # If response is not JSON, use raw text
-              error_msg += f"\nResponse: {e.response.text[:200]}..."
-         print(error_msg)
-         traceback.print_exc()
-         return {"status": "ERROR", "results": None, "error_message": error_msg}
     except Exception as e:
         error_msg = f"An unexpected error occurred during the API request: {type(e).__name__}: {e}"
         print(f"--- UNEXPECTED ERROR IN STREAMLIT ASYNC CALL ---")
@@ -313,7 +325,7 @@ if submitted and st.session_state.analysis_status != "RUNNING":
         validation_errors.append("Please select a valid LLM Provider and Model in the sidebar.")
     if BACKEND_API_URL.startswith("YOUR_"):
          validation_errors.append("Backend API URL needs configuration. Please set the `BACKEND_API_URL` environment variable.")
-    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('payload_specific_context','').lower() and st.session_state.get('_last_updated_query','').lower() not in st.session_state.get('specific_context_input','').lower())):
+    if st.session_state.get('payload_specific_country_name') == "Global" and (st.session_state.get('payload_specific_context') == "Search for specific company examples and regulatory actions" or ('related to' in st.session_state.get('specific_context_input','').lower() and st.session_state.get('_last_updated_query','').lower() not in st.session_state.get('specific_context_input','').lower())):
          # Warn if country is Global but specific context is still country-focused based on default text
          st.warning("You selected 'Global' for the country target, but the 'Specific Search Context' still seems focused on specific companies/actions related to a country. Consider adjusting the specific context for a global search.")
          # Decided not to block, just warn
@@ -387,97 +399,129 @@ elif st.session_state.analysis_status == "RUNNING":
 # This block runs if the status is COMPLETE, COMPLETE_WITH_ERROR, or ERROR
 elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
     results = st.session_state.analysis_results
-    if st.session_state.analysis_status == "COMPLETE":
-        st.success("Analysis complete!")
-    elif st.session_state.analysis_status == "COMPLETE_WITH_ERROR":
-        st.warning("Analysis completed with reported backend errors.")
-
-    st.subheader("Analysis Summary")
-    st.markdown("**Key Takeaways:**")
-    # Display the analysis summary text
-    summary_text = results.get("analysis_summary", "Summary could not be generated or analysis failed early.")
-    st.info(summary_text)
-
-    # Display key metrics in columns
-    col_metrics1, col_metrics2, col_metrics3, col_metrics4 = st.columns(4)
-    with col_metrics1: st.metric("LLM Used", results.get("llm_used", "N/A"))
-    with col_metrics2: st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A"))
-    with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
-
-    # Get exposures count from the results dictionary
-    exposures_list_from_results = results.get("high_risk_exposures", [])
-    exposures_count = len(exposures_list_from_results)
-    with col_metrics4: st.metric("High Risk Exposures Found", exposures_count)
-
-    # Add link to Google Sheet Exposures tab
-    if GOOGLE_EXPOSURES_SHEET_URL:
-         st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
-         if EXPOSURES_SHEET_GID == "YOUR_EXPOSURES_SHEET_GID":
-             st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
-    elif GOOGLE_SHEET_URL:
-         st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
-         st.caption("Note: Google Sheet Exposures tab link not configured.")
+    # Ensure results is a dictionary before trying to access keys
+    if not isinstance(results, dict):
+        st.error("Analysis completed, but received invalid results data from backend.")
+        st.session_state.analysis_status = "ERROR" # Set status to error for safety
+        if st.session_state.error_message:
+            st.error(st.session_state.error_message)
+        else:
+             st.error("Backend returned data in an unexpected format.")
+        st.json(results) # Display whatever was received for debugging
     else:
-         st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
+        # Proceed with displaying results if they are valid
+        if st.session_state.analysis_status == "COMPLETE":
+            st.success("Analysis complete!")
+        elif st.session_state.analysis_status == "COMPLETE_WITH_ERROR":
+            # Display the error message received from the backend
+            st.warning(st.session_state.error_message)
 
 
-    # --- Display High Risk Exposures Table ---
-    st.subheader("Identified High Risk Exposures (Current Run)")
-    if exposures_list_from_results:
-        try:
-            # Create a Pandas DataFrame from the exposures list
-            exposures_df = pd.DataFrame(exposures_list_from_results)
-            # Select and order columns for display
-            display_cols = ["Entity", "Subsidiary/Affiliate", "Parent Company", "Risk_Severity", "Risk_Type", "Explanation", "Main_Sources"]
-            # Ensure all display_cols exist in the DataFrame before selecting
-            existing_cols = [col for col in display_cols if col in exposures_df.columns]
-            st.dataframe(exposures_df[existing_cols], use_container_width=True)
-        except Exception as exp_df_e:
-            st.warning(f"Error displaying exposures table: {exp_df_e}")
-            # Fallback to displaying JSON if table creation fails
-            st.json(exposures_list_from_results)
-    else:
-        st.write("No high risk exposures identified in this run.")
+        st.subheader("Analysis Summary")
+        st.markdown("**Key Takeaways:**")
+        # Display the analysis summary text
+        summary_text = results.get("analysis_summary", "Summary could not be generated or analysis failed early.")
+        st.info(summary_text)
+
+        # Display key metrics in columns
+        col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
+        with col_metrics1: st.metric("LLM Used", results.get("llm_used", "N/A"))
+        with col_metrics2: st.metric("Total Duration (s)", results.get("run_duration_seconds", "N/A"))
+        with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
 
 
-    # Display any backend errors reported (status 200 but error field present)
-    if results.get("error") and results["error"] != "None" and results["error"] != "":
-        st.error(f"Backend Orchestrator reported an error: {results['error']}")
-        # You might want to display more details here if available in the results dict
+        # Display counts of extracted data types
+        st.markdown("**Extracted Data Counts (before filtering for sheet/KG):**")
+        col_counts1, col_counts2, col_counts3, col_counts4, col_counts5 = st.columns(5)
+        extracted_counts = results.get("extracted_data_counts", {})
+        with col_counts1: st.metric("Entities", extracted_counts.get("entities", "N/A"))
+        with col_counts2: st.metric("Risks", extracted_counts.get("risks", "N/A"))
+        with col_counts3: st.metric("Relationships", extracted_counts.get("relationships", "N/A"))
+        with col_counts4: st.metric("Linkup Structured Results", results.get("linkup_structured_data_count", "N/A"))
+        with col_counts5: st.metric("URLs Checked (Wayback)", results.get("wayback_results_count", "N/A"))
 
-    # --- Optional Expanders for Detailed Data ---
-    st.markdown("---") # Separator
 
-    with st.expander("Run Steps & Details", expanded=False):
-        st.subheader("Run Steps & Durations");
-        if results.get("steps"):
+        # Get exposures count from the results dictionary
+        exposures_list_from_results = results.get("high_risk_exposures", [])
+        exposures_count = len(exposures_list_from_results)
+        st.metric("High Risk Exposures Found (Saved to Sheet)", exposures_count)
+
+
+        # Add link to Google Sheet Exposures tab - This block is already here
+        if GOOGLE_EXPOSURES_SHEET_URL:
+             st.markdown(f"[View All Results & High Risk Exposures in Google Sheet]({GOOGLE_EXPOSURES_SHEET_URL})")
+             if EXPOSURES_SHEET_GID == "YOUR_EXPOSURES_SHEET_GID":
+                 st.caption("Note: Update `EXPOSURES_SHEET_GID` in `streamlit_ui.py` with your actual GID for a direct link.")
+        elif GOOGLE_SHEET_URL:
+             st.markdown(f"[View All Results in Google Sheet]({GOOGLE_SHEET_URL})")
+             st.caption("Note: Google Sheet Exposures tab link not configured.")
+        else:
+             st.caption("Google Sheet link not configured (GOOGLE_SHEET_ID missing or invalid).")
+
+
+        # --- Display High Risk Exposures Table ---
+        st.subheader("Identified High Risk Exposures (Current Run)")
+        if exposures_list_from_results:
             try:
-                steps_data = []
-                for step in results["steps"]:
-                     if isinstance(step, dict):
-                          steps_data.append({
-                              "Name": step.get("name", "N/A"),
-                              "Duration (s)": step.get("duration", "N/A"),
-                              "Status": step.get("status", "N/A"),
-                              "Search Results": step.get("search_results_count", "N/A"),
-                              "Structured Results": step.get("structured_results_count", "N/A"),
-                              "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
-                              "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
-                              "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
-                              # Display counts from extracted_data_counts if available
-                              "Entities Extracted": step.get("extracted_data_counts", {}).get("entities", "N/A"),
-                              "Risks Extracted": step.get("extracted_data_counts", {}).get("risks", "N/A"),
-                              "Relationships Extracted": step.get("extracted_data_counts", {}).get("relationships", "N/A"),
-                              "Error Message": step.get("error_message", "") # Error message from any step
-                          })
-                     else:
-                          steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
+                # Create a Pandas DataFrame from the exposures list
+                exposures_df = pd.DataFrame(exposures_list_from_results)
+                # Select and order columns for display
+                display_cols = ["Entity", "Subsidiary/Affiliate", "Parent Company", "Risk_Severity", "Risk_Type", "Explanation", "Main_Sources"]
+                # Ensure all display_cols exist in the DataFrame before selecting
+                existing_cols = [col for col in display_cols if col in exposures_df.columns]
+                st.dataframe(exposures_df[existing_cols], use_container_width=True)
+            except Exception as exp_df_e:
+                st.warning(f"Error displaying exposures table: {exp_df_e}")
+                # Fallback to displaying JSON if table creation fails
+                st.json(exposures_list_from_results)
+        else:
+            st.write("No high risk exposures identified in this run.")
+
+
+        # --- Optional Expander for Step Details ---
+        st.markdown("---") # Separator
+
+        with st.expander("Run Steps & Details", expanded=False):
+            st.subheader("Run Steps & Durations");
+            if results.get("steps"):
+                try:
+                    steps_data = []
+                    for step in results["steps"]:
+                         if isinstance(step, dict):
+                              # Use extracted_data_counts if available, otherwise fallback to original keys if they exist
+                              entity_count_step = step.get("extracted_data_counts", {}).get("entities", step.get("extracted_data",{}).get("entities","N/A")) # Fallback check includes original structure
+                              risk_count_step = step.get("extracted_data_counts", {}).get("risks", step.get("extracted_data",{}).get("risks","N/A"))
+                              rel_count_step = step.get("extracted_data_counts", {}).get("relationships", step.get("extracted_data",{}).get("relationships","N/A"))
+
+                              # If fallback returned a list, get its length
+                              if isinstance(entity_count_step, list): entity_count_step = len(entity_count_step)
+                              if isinstance(risk_count_step, list): risk_count_step = len(risk_count_step)
+                              if isinstance(rel_count_step, list): rel_count_step = len(rel_count_step)
+
+
+                              steps_data.append({
+                                  "Name": step.get("name", "N/A"),
+                                  "Duration (s)": step.get("duration", "N/A"),
+                                  "Status": step.get("status", "N/A"),
+                                  "Search Results": step.get("search_results_count", "N/A"),
+                                  "Structured Results": step.get("structured_results_count", "N/A"), # Count from Step 1.5
+                                  "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
+                                  "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
+                                  "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
+                                  # Display counts from extracted_data_counts if available
+                                  "Entities Extracted (Step)": entity_count_step,
+                                  "Risks Extracted (Step)": risk_count_step,
+                                  "Relationships Extracted (Step)": rel_count_step,
+                                  "Error Message": step.get("error_message", "") # Error message from any step
+                              })
+                         else:
+                              steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
                 steps_df = pd.DataFrame(steps_data)
                 # Define column order and drop columns where all values are N/A, "", or None
                 col_order = [
                     "Name", "Status", "Duration (s)", "Error Message",
                     "Search Results", "Structured Results",
-                    "Entities Extracted", "Risks Extracted", "Relationships Extracted",
+                    "Entities Extracted (Step)", "Risks Extracted (Step)", "Relationships Extracted (Step)",
                     "Exposures Found", "URLs Checked", "KG Status",
                 ]
                 # Filter for columns that exist in the DataFrame and are not all empty/N/A
@@ -490,34 +534,35 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
                 st.json(results.get("steps", "No steps data."))
         else: st.write("No step details available.")
 
-    with st.expander("Final Extracted Data (Combined Raw)", expanded=False):
-        st.subheader("Final Extracted Data (Before Filtering for Sheet/KG)")
-        final_data = results.get("final_extracted_data", {})
-        if final_data:
-             st.json(final_data)
-        else:
-             st.write("No final extracted data available.")
+    # Remove expanders for full raw data lists to reduce Streamlit state size
+    # The data is saved to Google Sheets, so the link above serves as access point
+    # with st.expander("Final Extracted Data (Combined Raw)", expanded=False):
+    #     st.subheader("Final Extracted Data (Before Filtering for Sheet/KG)")
+    #     final_data = results.get("final_extracted_data", {})
+    #     if final_data:
+    #          st.json(final_data)
+    #     else:
+    #          st.write("No final extracted data available.")
 
-    with st.expander("Linkup Raw Structured Data", expanded=False):
-        st.subheader("Raw Structured Data Collected from Linkup")
-        structured_data_list = results.get("linkup_structured_data", [])
-        if structured_data_list:
-             st.json(structured_data_list)
-        else:
-             st.write("No raw structured data collected from Linkup.")
+    # with st.expander("Linkup Raw Structured Data", expanded=False):
+    #     st.subheader("Raw Structured Data Collected from Linkup")
+    #     structured_data_list = results.get("linkup_structured_data", [])
+    #     if structured_data_list:
+    #          st.json(structured_data_list)
+    #     else:
+    #          st.write("No raw structured data collected from Linkup.")
 
-    with st.expander("Wayback Machine Results", expanded=False):
-        st.subheader("Wayback Machine Check Results")
-        wayback_results_list = results.get("wayback_results", [])
-        if wayback_results_list:
-            st.json(wayback_results_list)
-        else:
-             st.write("No wayback machine results available.")
+    # with st.expander("Wayback Machine Results", expanded=False):
+    #     st.subheader("Wayback Machine Check Results")
+    #     wayback_results_list = results.get("wayback_results", [])
+    #     if wayback_results_list:
+    #         st.json(wayback_results_list)
+    #     else:
+    #          st.write("No wayback machine results available.")
 
-    with st.expander("Full Raw Results JSON", expanded=False):
-        st.subheader("Complete Raw JSON Output")
-        # Ensure the original high_risk_exposures list is included in the full raw JSON
-        # (It's already there as results["high_risk_exposures"])
+    with st.expander("Full Raw API Response JSON (Limited Data)", expanded=False):
+        st.subheader("Complete Raw JSON Output (Subset for UI)")
+        # Display the exact data structure received by the UI
         st.json(results)
 
 # --- Error Display Block ---
@@ -530,14 +575,26 @@ elif st.session_state.analysis_status == "ERROR":
         st.error("An unknown error occurred during processing.")
 
     # Optionally display any partial results or steps if available, even in error state
-    if st.session_state.get('analysis_results') and isinstance(st.session_state.analysis_results, dict):
+    # The error message might contain partial results if the backend returned a 500 with body
+    # Or st.session_state.analysis_results might hold partial results if the API call itself failed after some steps ran
+    partial_results = st.session_state.get('analysis_results')
+    if partial_results and isinstance(partial_results, dict):
          st.subheader("Partial Results (if any)")
-         partial_results = st.session_state.analysis_results
          # Display partial metrics
          col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
          with col_metrics1: st.metric("LLM Used", partial_results.get("llm_used", "N/A"))
          with col_metrics2: st.metric("Partial Duration (s)", partial_results.get("run_duration_seconds", "N/A"))
          with col_metrics3: st.metric("KG Update Status (Partial)", partial_results.get("kg_update_status", "N/A"))
+
+         # Display counts of extracted data types if available in partial results
+         st.markdown("**Partial Extracted Data Counts:**")
+         col_counts1, col_counts2, col_counts3, col_counts4, col_counts5 = st.columns(5)
+         extracted_counts = partial_results.get("extracted_data_counts", {})
+         with col_counts1: st.metric("Entities", extracted_counts.get("entities", "N/A"))
+         with col_counts2: st.metric("Risks", extracted_counts.get("risks", "N/A"))
+         with col_counts3: st.metric("Relationships", extracted_counts.get("relationships", "N/A"))
+         with col_counts4: st.metric("Linkup Structured Results", partial_results.get("linkup_structured_data_count", "N/A"))
+         with col_counts5: st.metric("URLs Checked (Wayback)", partial_results.get("wayback_results_count", "N/A"))
 
          # Display partial steps
          with st.expander("Completed Steps (Partial Run)", expanded=True):
@@ -547,24 +604,53 @@ elif st.session_state.analysis_status == "ERROR":
                     steps_data = []
                     for step in partial_results["steps"]:
                          if isinstance(step, dict):
+                               # Use extracted_data_counts if available, otherwise fallback to original keys if they exist
+                              entity_count_step = step.get("extracted_data_counts", {}).get("entities", step.get("extracted_data",{}).get("entities","N/A")) # Fallback check includes original structure
+                              risk_count_step = step.get("extracted_data_counts", {}).get("risks", step.get("extracted_data",{}).get("risks","N/A"))
+                              rel_count_step = step.get("extracted_data_counts", {}).get("relationships", step.get("extracted_data",{}).get("relationships","N/A"))
+
+                              # If fallback returned a list, get its length
+                              if isinstance(entity_count_step, list): entity_count_step = len(entity_count_step)
+                              if isinstance(risk_count_step, list): risk_count_step = len(risk_count_step)
+                              if isinstance(rel_count_step, list): rel_count_step = len(rel_count_step)
+
+
                               steps_data.append({
                                   "Name": step.get("name", "N/A"),
                                   "Duration (s)": step.get("duration", "N/A"),
                                   "Status": step.get("status", "N/A"),
-                                  "Error Message": step.get("error_message", "") # Show error message if step failed
+                                  "Search Results": step.get("search_results_count", "N/A"),
+                                  "Structured Results": step.get("structured_results_count", "N/A"), # Count from Step 1.5
+                                  "Exposures Found": step.get("exposures_found", "N/A"), # Count from Step 3.5
+                                  "URLs Checked": step.get("urls_checked", "N/A"), # Count from Step 4
+                                  "KG Status": step.get("kg_update_status", "N/A"), # Status from Step 5.1
+                                  # Display counts from extracted_data_counts if available
+                                  "Entities Extracted (Step)": entity_count_step,
+                                  "Risks Extracted (Step)": risk_count_step,
+                                  "Relationships Extracted (Step)": rel_count_step,
+                                  "Error Message": step.get("error_message", "") # Error message from any step
                               })
                          else: steps_data.append({"Name": "Invalid Step Data", "Status": "Error"})
                     steps_df = pd.DataFrame(steps_data)
+                    # Define column order and drop columns where all values are N/A, "", or None
+                    col_order = [
+                        "Name", "Status", "Duration (s)", "Error Message",
+                        "Search Results", "Structured Results",
+                        "Entities Extracted (Step)", "Risks Extracted (Step)", "Relationships Extracted (Step)",
+                        "Exposures Found", "URLs Checked", "KG Status",
+                    ]
+                    # Filter for columns that exist in the DataFrame and are not all empty/N/A
+                    cols_to_display = [col for col in col_order if col in steps_df.columns and not steps_df[col].isnull().all() and not (steps_df[col] == '').all()]
+
+                    steps_df = steps_df.reindex(columns=cols_to_display)
                     st.dataframe(steps_df, use_container_width=True)
                 except Exception as df_e:
                     st.warning(f"Error displaying partial steps table: {df_e}")
                     st.json(partial_results.get("steps", "No steps data."))
             else: st.write("No step details available.")
 
-         with st.expander("Partial Extracted Data (if any)", expanded=False):
-              st.json(partial_results.get("final_extracted_data", "No partial extracted data."))
-         with st.expander("Partial Structured Data (if any)", expanded=False):
-              st.json(partial_results.get("linkup_structured_data", "No partial structured data."))
+         with st.expander("Partial Raw API Response JSON (if any)", expanded=False):
+              st.json(partial_results)
 
 
 # --- Initial/Idle State Display ---
