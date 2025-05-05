@@ -5,6 +5,7 @@ import traceback
 import json
 from datetime import datetime, timezone
 import sys
+import re # Import re for the Chinese character check
 
 # Import standard libraries
 try:
@@ -111,12 +112,19 @@ def _get_gsheet_service():
             creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
             gsheet_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
             print("Google Sheets service authenticated successfully.")
-        except Exception as e: print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}"); gsheet_service = None
+        except Exception as e:
+             print(f"ERROR: Failed to authenticate/build Google Sheets service: {e}")
+             gsheet_service = None
+        # --- ENSURE service is returned even if exception occurred ---
+        # The global gsheet_service variable is updated inside the try/except block
+        # The return statement needs to access the global variable.
+        # The logic below relies on gsheet_service being None if the build failed.
     return gsheet_service
 
 def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
     """Appends a list of rows (values) to the specified sheet tab. Checks for service."""
-    if service is None or SHEET_ID is None: print("GSheet service or ID missing for append."); return False
+    if service is None: # Only check service here, SHEET_ID checked higher up in save function
+        print("GSheet service unavailable for append."); return False
     if not values: return True
     try:
         body = {'values': values}
@@ -124,19 +132,37 @@ def _append_to_gsheet(service, sheet_name: str, values: List[List[Any]]):
         return True
     except Exception as e: print(f"ERROR appending data to Google Sheet '{sheet_name}': {e}"); return False
 
+# --- NEW HELPER FUNCTION ---
+def contains_chinese(text):
+    """Simple check if a string contains Chinese characters."""
+    if not isinstance(text, str):
+        return False
+    # Check for common CJK Unified Ideographs ranges
+    # This is a basic check, not comprehensive language detection
+    return any('\u4e00' <= char <= '\u9fff' for char in text)
+
+
 def _save_analysis_to_gsheet(run_results: Dict,
                              entities_to_save: List[Dict],
                              risks_to_save: List[Dict],
                              relationships_to_save: List[Dict],
-                             exposures_to_save: List[Dict]):
+                             exposures_to_save: List[Dict],
+                             llm_provider_for_translation: str, # Pass LLM config for translation
+                             llm_model_for_translation: str): # Pass LLM config for translation
     """
     Saves filtered analysis results to Google Sheets.
     Accepts pre-filtered lists of entities, risks, relationships, and exposures.
     Checks for sheet availability.
+    Translates Chinese entity names in Exposure sheet rows if NLP is available.
     """
     print("Attempting to save analysis results to Google Sheets...")
     service = _get_gsheet_service()
     if service is None: print("Aborting save: GSheet service unavailable or config missing."); return
+
+    # Check NLP availability for translation specifically
+    nlp_available_for_translation = nlp_processor is not None and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
+    if not nlp_available_for_translation:
+        print("Warning: NLP processor or translate_text function not available. Chinese entity names in Exposures sheet will not be translated.")
 
     run_timestamp_iso = "Timestamp Error"
     try:
@@ -179,7 +205,7 @@ def _save_analysis_to_gsheet(run_results: Dict,
                    risk_copy.pop('_source_type', None)
                    related_entities_str = json.dumps(list(set(risk_copy.get('related_entities', []))))
                    source_urls_str = json.dumps(list(set(risk_copy.get('source_urls', []))))
-                   risk_rows.append([run_timestamp_iso, risk_copy.get('description'), risk_copy.get('severity', 'UNKNOWN'), related_entities_str, source_urls_str])
+                   risk_rows.append([run_timestamp_iso, risk_copy.get('description'), risk_copy.get('severity', 'UNKNOWN'), risk_copy.get('risk_category', 'UNKNOWN'), related_entities_str, source_urls_str]) # Added risk_category
               else: print(f"Skipping invalid risk format for sheet save: {r}") # Should not happen with pre-filtered list
          _append_to_gsheet(service, SHEET_NAME_RISKS, risk_rows)
     else: print(f"No valid risks to save to sheet '{SHEET_NAME_RISKS}'.")
@@ -201,15 +227,57 @@ def _save_analysis_to_gsheet(run_results: Dict,
     print(f"Saving {len(exposures_to_save)} exposure rows to sheet '{SHEET_NAME_EXPOSURES}'.")
     if exposures_to_save:
         exposure_rows_to_save_sheet = []
+
+        # --- NEW HELPER FUNCTION FOR EXPOSURE NAME FORMATTING ---
+        def format_entity_name_for_sheet(name: Any, original_field_key: str) -> str:
+            if not name or not isinstance(name, str):
+                return str(name) if name is not None else '' # Return as string or empty string if invalid or empty
+
+            name_str = name.strip()
+
+            # Check if it contains Chinese characters AND NLP translation is available
+            if contains_chinese(name_str) and nlp_available_for_translation:
+                 # Use the LLM config from the main run_analysis function scope
+                 # Need to ensure nlp_processor is not None before calling its methods
+                 if nlp_processor is not None:
+                      print(f"[Sheet Save] Translating Chinese entity name for '{original_field_key}' column: '{name_str}'")
+                      try:
+                           translated_name = nlp_processor.translate_text(name_str, 'en', llm_provider_for_translation, llm_model_for_translation)
+                           if translated_name and isinstance(translated_name, str) and translated_name.strip():
+                                # Combine translated English with original Chinese in brackets
+                                return f"{translated_name.strip()} ({name_str})"
+                           else:
+                                print(f"[Sheet Save] Translation failed for '{name_str}'. Using original.")
+                                return name_str # Use original if translation fails
+
+                      except Exception as e:
+                           print(f"[Sheet Save] Error during translation for '{name_str}' ({original_field_key}): {type(e).__name__}: {e}. Using original.")
+                           traceback.print_exc() # Log the traceback for the translation error
+                           return name_str # Use original if error occurs
+                 else:
+                      print(f"[Sheet Save] Skipping translation for '{name_str}' (NLP processor not available). Using original.")
+                      return name_str
+
+            else:
+                # Not Chinese, or NLP not available, just use the original name
+                return name_str
+
+
         for exp in exposures_to_save:
              if isinstance(exp, dict):
+                 # Process each name field in the exposure dictionary
+                 entity_col_value = format_entity_name_for_sheet(exp.get('Entity'), 'Entity')
+                 sub_aff_col_value = format_entity_name_for_sheet(exp.get('Subsidiary/Affiliate'), 'Subsidiary/Affiliate')
+                 parent_col_value = format_entity_name_for_sheet(exp.get('Parent Company'), 'Parent Company')
+
+
                  # Columns: Timestamp, Entity, Subsidiary/Affiliate, Parent Company, Risk_Severity, Risk_Type, Explanation, Main_Source(s)
                  # Ensure required keys are present, default to empty string or N/A if not
                  row_8_cols = [
                      run_timestamp_iso,
-                     exp.get('Entity', 'N/A'),
-                     exp.get('Subsidiary/Affiliate', ''),
-                     exp.get('Parent Company', ''),
+                     entity_col_value, # Use formatted value
+                     sub_aff_col_value, # Use formatted value
+                     parent_col_value, # Use formatted value
                      exp.get('Risk_Severity', 'N/A'),
                      exp.get('Risk_Type', 'N/A'), # This is the derived label, e.g., "Subsidiary Risk"
                      exp.get('Explanation', 'N/A'),
@@ -273,6 +341,13 @@ LINKUP_SCHEMA_KEY_RISKS = json.dumps({
      "required": ["company_name", "key_risks_identified"]
 })
 
+# Ensure nlp_processor is checked for availability at module level
+nlp_processor_available = True
+if nlp_processor is None or not hasattr(nlp_processor, '_get_llm_client_and_model') or not callable(nlp_processor._get_llm_client_and_model):
+     print("Warning: NLP processor module or essential functions not available.")
+     nlp_processor_available = False
+
+
 def run_analysis(initial_query: str,
                  llm_provider: str,
                  llm_model: str,
@@ -327,40 +402,40 @@ def run_analysis(initial_query: str,
          results["kg_update_status"] = "skipped_module_unavailable"
 
 
-    nlp_processor_available = True
-    if not hasattr(nlp_processor, '_get_llm_client_and_model') or not callable(nlp_processor._get_llm_client_and_model):
-         print("Warning: NLP processor module or essential functions (_get_llm_client_and_model) not available.")
-         nlp_processor_available = False
-
-    if nlp_processor_available:
-        # Check for all required NLP functions
-        required_nlp_funcs = ['translate_text', 'translate_snippets', 'translate_keywords_for_context',
-                              'extract_entities_only', 'extract_risks_only', 'link_entities_to_risk',
-                              'extract_relationships_only', 'extract_regulatory_sanction_relationships',
-                              'process_linkup_structured_data', 'generate_analysis_summary']
-        for func_name in required_nlp_funcs:
-             if not hasattr(nlp_processor, func_name) or not callable(getattr(nlp_processor, func_name)):
-                  print(f"Warning: nlp_processor.{func_name} not available.")
-                  nlp_processor_available = False
-                  # No break here, report all missing functions
+    # Re-evaluate nlp_extraction_available with all required functions
+    nlp_extraction_available = nlp_processor_available and \
+        hasattr(nlp_processor, 'translate_keywords_for_context') and callable(nlp_processor.translate_keywords_for_context) and \
+        hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text) and \
+        hasattr(nlp_processor, 'translate_snippets') and callable(nlp_processor.translate_snippets) and \
+        hasattr(nlp_processor, 'extract_entities_only') and callable(nlp_processor.extract_entities_only) and \
+        hasattr(nlp_processor, 'extract_risks_only') and callable(nlp_processor.extract_risks_only) and \
+        hasattr(nlp_processor, 'link_entities_to_risk') and callable(nlp_processor.link_entities_to_risk) and \
+        hasattr(nlp_processor, 'extract_relationships_only') and callable(nlp_processor.extract_relationships_only) and \
+        hasattr(nlp_processor, 'extract_regulatory_sanction_relationships') and callable(nlp_processor.extract_regulatory_sanction_relationships) and \
+        hasattr(nlp_processor, 'process_linkup_structured_data') and callable(nlp_processor.process_linkup_structured_data) and \
+        hasattr(nlp_processor, 'generate_analysis_summary') and callable(nlp_processor.generate_analysis_summary)
 
 
-    if not nlp_processor_available:
+    if not nlp_extraction_available:
          results["error"] = "NLP processor module or essential functions not available."; print(f"--- Orchestrator ERROR: {results['error']} ---")
          results["run_duration_seconds"] = round(time.time() - start_run_time, 2)
          # Pass empty lists to _save_analysis_to_gsheet since no data was extracted
-         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [])
+         # Pass LLM config used in the run for potential error logging in sheet save
+         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
          if kg_driver_available and kg_driver is not None: knowledge_graph.close_driver() # Close if it was successfully obtained
          return results
 
     try:
+         # Attempt to initialize the LLM client early to catch config errors
+         # Pass provider and model from the run request
          nlp_processor._get_llm_client_and_model(llm_provider_to_use, llm_model_to_use)
          print("LLM client initialized successfully for NLP processing.")
     except Exception as e:
-         results["error"] = f"LLM configuration/initialization failed: {e}"; print(f"--- Orchestrator ERROR: {results['error']} ---")
+         results["error"] = f"LLM configuration/initialization failed: {type(e).__name__}: {e}"; print(f"--- Orchestrator ERROR: {results['error']} ---")
          results["run_duration_seconds"] = round(time.time() - start_run_time, 2)
          # Pass empty lists to _save_analysis_to_gsheet since no data was extracted
-         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [])
+         # Pass LLM config used in the run for potential error logging in sheet save
+         if google_sheets_available: _save_analysis_to_gsheet(results, [], [], [], [], llm_provider_to_use, llm_model_to_use)
          if kg_driver_available and kg_driver is not None: knowledge_graph.close_driver() # Close if it was successfully obtained
          return results
 
@@ -381,14 +456,31 @@ def run_analysis(initial_query: str,
     all_search_results_map: Dict[str, Dict] = {} # Use map for O(1) URL lookup
 
 
-    # Initialize empty lists within try block scope for finally access
-    entities_to_save_to_sheet = []
-    risks_to_save_to_sheet = []
-    relationships_to_save_to_sheet = []
-    exposures_to_save_to_sheet = [] # This will hold the final list of exposure dictionaries
+    # Initialize variables that need to persist through the try block
+    # These are populated *within* the try block but potentially accessed in `finally` or later steps
+    all_entities_accumulated: List[Dict] = []
+    all_risks_accumulated: List[Dict] = []
+    all_collected_relationships: List[Dict] = []
+    raw_linkup_structured_data_collected: List[Dict] = []
 
-    # Initialize raw structured data list within try block
-    raw_linkup_structured_data_collected = []
+    # Variables used for filtering and exposure generation, populated *within* the try block
+    likely_chinese_company_org_names_set: set[str] = set()
+    likely_chinese_company_org_names: set[str] = set()
+    likely_chinese_company_org_names_lower: set[str] = set()
+    # Initialize triggering_chinese_company_org_names_lower_initial before the try block
+    triggering_chinese_company_org_names_lower_initial: set[str] = set()
+    all_reg_agency_names: set[str] = set()
+    all_sanction_names: set[str] = set()
+    all_reg_sanc_names_lower: set[str] = set()
+    consolidated_exposures: Dict[Tuple, Dict] = {} # Used internally for exposure generation deduplication
+    generated_exposures: List[Dict] = [] # Holds the list of generated exposure dictionaries
+
+    # Final lists for saving to sheet/KG - populated *after* filtering in Step 5
+    # Initialize these lists before the try block so they are always defined
+    entities_to_save_to_sheet: List[Dict] = []
+    risks_to_save_to_sheet: List[Dict] = []
+    relationships_to_save_to_sheet: List[Dict] = []
+    exposures_to_save_to_sheet: List[Dict] = [] # Holds exposure dictionaries filtered for saving to sheet
 
 
     try:
@@ -399,7 +491,8 @@ def run_analysis(initial_query: str,
 
         step1_english_queries = []
         # Check if nlp_processor and specific functions are available before calling
-        if nlp_processor_available and hasattr(nlp_processor, 'translate_keywords_for_context') and callable(nlp_processor.translate_keywords_for_context):
+        # The check for nlp_extraction_available covers these
+        if nlp_extraction_available:
              step1_english_queries = nlp_processor.translate_keywords_for_context(
                   initial_query, global_search_context,
                   llm_provider_to_use, llm_model_to_use
@@ -408,10 +501,10 @@ def run_analysis(initial_query: str,
 
 
         step1_chinese_queries = []
-        if specific_country_code.lower() == 'cn' and nlp_processor_available and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text):
+        if specific_country_code.lower() == 'cn' and nlp_extraction_available:
             print("[Step 1 Search] Translating queries to Chinese for Baidu search...")
             for query_en in step1_english_queries:
-                # Use a potentially different LLM for translation if configured, though using the main one is fine
+                # Use the LLM config from the run request for translation
                 translated_query_zh = nlp_processor.translate_text(query_en, 'zh', llm_provider_to_use, llm_model_to_use)
                 if translated_query_zh and isinstance(translated_query_zh, str) and translated_query_zh.strip():
                     step1_chinese_queries.append(translated_query_zh.strip())
@@ -431,18 +524,18 @@ def run_analysis(initial_query: str,
                   # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
                   # Pass the combined query to search_linkup_snippets.
-                  linkup_global_results = search_engines.search_linkup_snippets(query=step1_all_queries) # Removed num and country_code params from the call
+                  # Removed num and country_code params from the call based on previous TypeErrors.
+                  # The number of results per query is handled by Linkup's defaults or internal logic.
+                  linkup_global_results = search_engines.search_linkup_snippets(query=step1_all_queries)
                   if linkup_global_results:
-                      print(f"    Linkup Snippet Search returned {len(linkup_global_results)} unique results after internal deduplication.")
-                      # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
-                      # linkup_global_results_limited = linkup_global_results[:max_global_results]
-                      # if len(linkup_global_results) > len(linkup_global_results_limited):
-                      #     print(f"    Truncating Linkup results to max_global_results: {len(linkup_global_results_limited)} results kept.")
+                       # Ensure Linkup results are standardized before adding to the map/list
+                       standardized_linkup_results = [search_engines.standardize_result(r, source='linkup_snippet_step1') for r in linkup_global_results]
+                       standardized_linkup_results = [r for r in standardized_linkup_results if r is not None] # Filter out invalid ones
 
-                      for r in linkup_global_results: # Iterate through the *full* list returned by search_linkup_snippets
+                       print(f"    Linkup Snippet Search returned {len(standardized_linkup_results)} unique *standardized* results after internal deduplication.")
+
+                       for r in standardized_linkup_results:
                            if isinstance(r, dict) and r.get('url') and isinstance(r.get('url'), str) and r['url'] not in all_search_results_map:
-                               # Preserve source if already set by search_engines, default to 'linkup_snippet_step1'
-                               r['source'] = r.get('source', 'linkup_snippet_step1')
                                step1_search_results.append(r) # Add directly to final list for step 1
                                all_search_results_map[r['url']] = r
                   else: print("    Linkup Snippet Search returned no results.")
@@ -457,24 +550,24 @@ def run_analysis(initial_query: str,
             print("[Step 1 Search] Running Google CSE queries...")
             queries_for_google = step1_english_queries
             for q_idx, query_text in enumerate(queries_for_google):
-                if len(step1_search_results) >= max_global_results:
-                     print("Stopping Google CSE search early due to sufficient total results.")
-                     break
-                lang_to_use = None # Let Google detect or use default
-                print(f"  Google Query {q_idx+1}/{len(queries_for_google)}: '{query_text}'")
-                try:
-                    # search_google_official respects num=10 limit internally
-                    raw_results = search_engines.search_google_official(query=query_text, lang=lang_to_use, num=max_global_results);
-                    if raw_results:
-                        print(f"    Google CSE found {len(raw_results)} raw results.")
-                        for r in raw_results:
-                            standardized = search_engines.standardize_result(r, f"google_cse_q{q_idx+1}")
-                            if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
+                 if len(step1_search_results) >= max_global_results:
+                      print("Stopping Google CSE search early due to sufficient total results.")
+                      break
+                 lang_to_use = None # Let Google detect or use default
+                 print(f"  Google Query {q_idx+1}/{len(queries_for_google)}: '{query_text}'")
+                 try:
+                     # search_google_official respects num=10 limit internally
+                     raw_results = search_engines.search_google_official(query=query_text, lang=lang_to_use, num=max_global_results);
+                     if raw_results:
+                         print(f"    Google CSE found {len(raw_results)} raw results.")
+                         for r in raw_results:
+                             standardized = search_engines.standardize_result(r, f"google_cse_q{q_idx+1}")
+                             if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
                                  step1_search_results.append(standardized)
                                  all_search_results_map[standardized['url']] = standardized
-                    else: print("    Google CSE returned no results.")
-                    time.sleep(0.5)
-                except Exception as e: print(f"    Google CSE call failed for query '{query_text}': {type(e).__name__}: {e}"); traceback.print_exc()
+                     else: print("    Google CSE returned no results.")
+                     time.sleep(0.5)
+                 except Exception as e: print(f"    Google CSE call failed for query '{query_text}': {type(e).__name__}: {e}"); traceback.print_exc()
         elif not google_cse_available:
             print("[Step 1 Search] Skipping Google CSE queries - not configured.")
         elif len(step1_search_results) >= search_threshold_results:
@@ -483,7 +576,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step1_search_results) < max_global_results and len(step1_search_results) < search_threshold_results:
-            print("[Step 1 Search] Running SerpApi queries...")
+            print("[Step 1 Search] Running Serpapi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step1_all_queries
             for q_idx, query_text in enumerate(queries_for_serpapi):
@@ -508,7 +601,10 @@ def run_analysis(initial_query: str,
                            else: print(f"    SerpApi {serpapi_engine} returned no results for this query.")
 
                       time.sleep(0.5)
-                 except Exception as e: print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}"); traceback.print_exc()
+                 except Exception as e:
+                      print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
+                      traceback.print_exc()
+
         elif serpapi_available and not config.SERPAPI_KEY:
              print("[Step 1 Search] Skipping Serpapi search - not configured.")
         elif len(step1_search_results) >= search_threshold_results:
@@ -520,7 +616,8 @@ def run_analysis(initial_query: str,
         print(f"[Step 1 Search] Total standardized results from Linkup/Google/SerpApi after combining & deduplication: {len(step1_search_results)}")
 
         snippets_to_translate = []
-        if nlp_processor_available and hasattr(nlp_processor, 'translate_snippets') and callable(nlp_processor.translate_snippets):
+        # nlp_extraction_available check includes translate_snippets
+        if nlp_extraction_available:
              # Only translate if original language is known and not English, and snippet is available
              snippets_to_translate = [s for s in step1_search_results if isinstance(s, dict) and s.get('snippet') and isinstance(s.get('snippet'), str) and s.get('original_language') and s['original_language'].lower() not in ['en', 'english']]
 
@@ -530,6 +627,7 @@ def run_analysis(initial_query: str,
              original_step1_search_results = list(step1_search_results)
              step1_search_results = [] # Reset to rebuild with translations
 
+             # Pass LLM config from the run request for translation
              translated_step1_snippets = nlp_processor.translate_snippets(snippets_to_translate, 'en', llm_provider_to_use, llm_model_to_use)
 
              translated_urls = {s.get('url') for s in translated_step1_snippets if isinstance(s, dict) and s.get('url')}
@@ -559,15 +657,15 @@ def run_analysis(initial_query: str,
         step1_relationships = []
         step1_entity_names = []
         # Check for all required NLP extraction functions
-        required_extract_funcs = ['extract_entities_only', 'extract_risks_only', 'link_entities_to_risk',
-                                  'extract_relationships_only', 'extract_regulatory_sanction_relationships']
-        nlp_extraction_available = nlp_processor_available and all(hasattr(nlp_processor, func) and callable(getattr(nlp_processor, func)) for func in required_extract_funcs)
+        # nlp_extraction_available covers these
+        nlp_extraction_step1_ok = nlp_extraction_available
 
 
-        if step1_search_results and nlp_extraction_available:
+        if step1_search_results and nlp_extraction_step1_ok:
             step1_context = f"Analyze search results for query '{initial_query}'. Extract relevant entities, risks, and relationships based ONLY on the provided text snippets."
             print(f"[Step 1 Extract] Calling NLP processor (Multi-Call)... Context: {step1_context[:100]}...")
 
+            # Pass LLM config from the run request
             step1_entities = nlp_processor.extract_entities_only(step1_search_results, step1_context, llm_provider_to_use, llm_model_to_use)
             # Filter entities to only include valid ones with names
             step1_entities_filtered = [e for e in step1_entities if isinstance(e, dict) and e.get('name')]
@@ -575,6 +673,7 @@ def run_analysis(initial_query: str,
             print(f"[Step 1 Extract] Extracted {len(step1_entities_filtered)} entities of various types.")
             time.sleep(1.0)
 
+            # Pass LLM config from the run request
             step1_risks_initial = nlp_processor.extract_risks_only(step1_search_results, step1_context, llm_provider_to_use, llm_model_to_use)
             time.sleep(1.0)
 
@@ -582,6 +681,7 @@ def run_analysis(initial_query: str,
             if step1_risks_initial and step1_entity_names:
                  print(f"[Step 1 Linker] Starting entity linking for {len(step1_risks_initial)} risks against {len(step1_entity_names)} filtered entities...")
                  # Ensure all_snippets_map is passed
+                 # Pass LLM config from the run request
                  step1_risks = nlp_processor.link_entities_to_risk(
                      risks=step1_risks_initial,
                      list_of_entity_names=step1_entity_names,
@@ -599,6 +699,7 @@ def run_analysis(initial_query: str,
             step1_entities_company_org = [e for e in step1_entities_filtered if e.get('type') in ["COMPANY", "ORGANIZATION"]]
             if step1_entities_company_org:
                  print(f"[Step 1 Extract] Calling NLP for Ownership Relationships...")
+                 # Pass LLM config from the run request
                  step1_ownership_relationships = nlp_processor.extract_relationships_only(step1_search_results, step1_context, step1_entities_company_org, llm_provider_to_use, llm_model_to_use)
             else: print("[Step 1 Extract] Skipping ownership relationship extraction - no COMPANY/ORGANIZATION entities found.")
             time.sleep(1.0)
@@ -607,6 +708,7 @@ def run_analysis(initial_query: str,
             # Regulatory/Sanction relationships can involve any relevant entity type
             if step1_entities_filtered:
                  print(f"[Step 1 Extract] Calling NLP for Regulatory/Sanction Relationships...")
+                 # Pass LLM config from the run request
                  step1_reg_sanc_relationships = nlp_processor.extract_regulatory_sanction_relationships(step1_search_results, step1_context, step1_entities_filtered, llm_provider_to_use, llm_model_to_use)
             else: print("[Step 1 Extract] Skipping regulatory/sanction relationship extraction - no entities found.")
             time.sleep(1.0)
@@ -635,10 +737,10 @@ def run_analysis(initial_query: str,
         step1_5_start = time.time()
         step1_5_status = "Skipped (Linkup not available)"
         structured_data_status = "not_run"
-        # raw_linkup_structured_data_collected = [] # Moved initialization to before try block
+        # raw_linkup_structured_data_collected is initialized before try
 
         # Check if Linkup structured search and processing functions are available
-        linkup_structured_available_orchestrator = linkup_structured_search_available and nlp_processor_available and hasattr(nlp_processor, 'process_linkup_structured_data') and callable(nlp_processor.process_linkup_structured_data)
+        linkup_structured_available_orchestrator = linkup_structured_search_available and nlp_extraction_available # nlp_processor.process_linkup_structured_data is included in nlp_extraction_available
 
 
         if linkup_structured_available_orchestrator:
@@ -665,10 +767,15 @@ def run_analysis(initial_query: str,
 
                           try:
                                # search_linkup_structured no longer accepts 'country_code' parameter causing TypeError
+                               # Pass the configured LLM provider and model to search_linkup_structured as it might use NLP internally
                                structured_ownership_data_item = search_engines.search_linkup_structured(
                                     query=ownership_query,
                                     structured_output_schema=LINKUP_SCHEMA_OWNERSHIP,
-                                    depth="deep" # Use deep for potentially more results
+                                    depth="deep", # Use deep for potentially more results
+                                    # Removed country_code param
+                                    # Added LLM config params
+                                    llm_provider=llm_provider_to_use,
+                                    llm_model=llm_model_to_use
                                )
                                # search_linkup_structured can return dict, list of dicts, or None
                                if structured_ownership_data_item is not None:
@@ -700,10 +807,15 @@ def run_analysis(initial_query: str,
 
                           try:
                                # search_linkup_structured no longer accepts 'country_code' parameter causing TypeError
+                               # Pass the configured LLM provider and model to search_linkup_structured as it might use NLP internally
                                structured_risks_data_item = search_engines.search_linkup_structured(
                                     query=risks_query,
                                     structured_output_schema=LINKUP_SCHEMA_KEY_RISKS,
-                                    depth="deep" # Use deep for potentially more results
+                                    depth="deep", # Use deep for potentially more results
+                                    # Removed country_code param
+                                     # Added LLM config params
+                                    llm_provider=llm_provider_to_use,
+                                    llm_model=llm_model_to_use
                                )
                                # search_linkup_structured can return dict, list of dicts, or None
                                if structured_risks_data_item is not None:
@@ -737,6 +849,7 @@ def run_analysis(initial_query: str,
                  if raw_linkup_structured_data_collected:
                       print(f"[Step 1.5 Structured] Processing {len(raw_linkup_structured_data_collected)} raw structured results.")
                       # Process the raw structured data into internal format
+                      # Pass LLM config from the run request to nlp_processor
                       processed_structured = nlp_processor.process_linkup_structured_data(raw_linkup_structured_data_collected, initial_query)
                       # Extend the final extracted data lists
                       if processed_structured.get("entities"): results["final_extracted_data"]["entities"].extend(processed_structured["entities"])
@@ -766,7 +879,8 @@ def run_analysis(initial_query: str,
         print(f"\n--- Running Step 2: Translating Keywords ---")
         step2_start = time.time()
         # Check if nlp_processor and specific functions are available before calling
-        if nlp_processor_available and hasattr(nlp_processor, 'translate_keywords_for_context') and callable(nlp_processor.translate_keywords_for_context):
+        # The check for nlp_extraction_available covers these
+        if nlp_extraction_available:
              translated_keywords = nlp_processor.translate_keywords_for_context(
                   initial_query, f"{specific_search_context} relevant for {specific_country_code}",
                   llm_provider_to_use, llm_model_to_use
@@ -806,9 +920,11 @@ def run_analysis(initial_query: str,
         step3_english_queries_web = list(set([q.strip() for q in step3_english_queries_web if q.strip()])) # Deduplicate
 
         step3_chinese_queries = []
-        if specific_country_code.lower() == 'cn' and nlp_processor_available and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text):
+        # nlp_extraction_available check includes translate_text
+        if specific_country_code.lower() == 'cn' and nlp_extraction_available:
             print("[Step 3 Search] Translating queries to Chinese for Baidu search...")
             for query_en in step3_english_queries_base:
+                # Pass LLM config from the run request for translation
                 translated_query_zh = nlp_processor.translate_text(query_en, 'zh', llm_provider_to_use, llm_model_to_use)
                 if translated_query_zh and isinstance(translated_query_zh, str) and translated_query_zh.strip():
                     step3_chinese_queries.append(translated_query_zh.strip())
@@ -828,22 +944,21 @@ def run_analysis(initial_query: str,
         if linkup_snippet_search_available:
              print(f"[Step 3 Search] Attempting Linkup snippet search: q='{specific_query_base}' (and variants)") # Removed num= param from log
              try:
-                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results.
+                  # Linkup search_linkup_snippets handles multiple queries and returns combined unique results
                   # It no longer accepts 'num' or 'country_code' as parameters causing TypeError.
-                  # Pass the combined query to search_linkup_snippets.
-                  linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries) # Removed num and country_code
+                  # Pass the combined query to search_linkup_snippets. Removed num and country_code params.
+                  linkup_specific_results = search_engines.search_linkup_snippets(query=step3_all_queries)
                   if linkup_specific_results:
-                       print(f"    Linkup Snippet Search returned {len(linkup_specific_results)} unique results after internal deduplication.")
-                       # **REMOVED TRUNCATION:** We keep all unique results returned by search_engines.search_linkup_snippets
-                       # linkup_specific_results_limited = linkup_specific_results[:max_specific_results]
-                       # if len(linkup_specific_results) > len(linkup_specific_results_limited):
-                       #      print(f"    Truncating Linkup results to max_specific_results: {len(linkup_specific_results_limited)} results kept.")
+                       # Ensure Linkup results are standardized before adding to the map/list
+                       standardized_linkup_results = [search_engines.standardize_result(r, source='linkup_snippet_step3') for r in linkup_specific_results]
+                       standardized_linkup_results = [r for r in standardized_linkup_results if r is not None] # Filter out invalid ones
 
-                       for r in linkup_specific_results: # Iterate through the *full* list returned by search_linkup_snippets
+                       print(f"    Linkup Snippet Search returned {len(standardized_linkup_results)} unique *standardized* results after internal deduplication.")
+
+                       for r in standardized_linkup_results:
                             if isinstance(r, dict) and r.get('url') and isinstance(r.get('url'), str) and r['url'] not in all_search_results_map:
-                                r['source'] = r.get('source', 'linkup_snippet_step3') # Preserve source
-                                step3_search_results.append(r) # Add directly to final list for step 3
-                                all_search_results_map[r['url']] = r
+                                 step3_search_results.append(r) # Add directly to final list for step 3
+                                 all_search_results_map[r['url']] = r
                   else: print("    Linkup Snippet Search returned no results.")
                   time.sleep(0.8)
              except Exception as e:
@@ -909,7 +1024,10 @@ def run_analysis(initial_query: str,
                            else: print(f"    SerpApi {serpapi_engine} returned no results for this query.")
 
                       time.sleep(0.5)
-                 except Exception as e: print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}"); traceback.print_exc()
+                 except Exception as e:
+                      print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
+                      traceback.print_exc()
+
         elif serpapi_available and not config.SERPAPI_KEY:
              print("[Step 3 Search] Skipping Serpapi search - not configured.")
         elif len(step3_search_results) >= required_for_threshold:
@@ -922,7 +1040,8 @@ def run_analysis(initial_query: str,
 
 
         snippets_to_translate = []
-        if nlp_processor_available and hasattr(nlp_processor, 'translate_snippets') and callable(nlp_processor.translate_snippets):
+        # nlp_extraction_available check includes translate_snippets
+        if nlp_extraction_available:
              # Only translate if original language is known and not English, and snippet is available
              snippets_to_translate = [s for s in step3_search_results if isinstance(s, dict) and s.get('snippet') and isinstance(s.get('snippet'), str) and s.get('original_language') and s['original_language'].lower() not in ['en', 'english']]
 
@@ -933,6 +1052,7 @@ def run_analysis(initial_query: str,
              original_step3_search_results = list(step3_search_results)
              step3_search_results = [] # Reset to rebuild with translations
 
+             # Pass LLM config from the run request for translation
              translated_step3_snippets = nlp_processor.translate_snippets(snippets_to_translate, 'en', llm_provider_to_use, llm_model_to_use)
 
              translated_urls = {s.get('url') for s in translated_step3_snippets if isinstance(s, dict) and s.get('url')}
@@ -961,15 +1081,15 @@ def run_analysis(initial_query: str,
         step3_entity_names = []
 
         # Check if all required NLP extraction functions are available
-        required_extract_funcs = ['extract_entities_only', 'extract_risks_only', 'link_entities_to_risk',
-                                  'extract_relationships_only', 'extract_regulatory_sanction_relationships']
-        nlp_extraction_available = nlp_processor_available and all(hasattr(nlp_processor, func) and callable(getattr(nlp_processor, func)) for func in required_extract_funcs)
+        # nlp_extraction_available covers these
+        nlp_extraction_step3_ok = nlp_extraction_available
 
 
-        if step3_search_results and nlp_extraction_available:
+        if step3_search_results and nlp_extraction_step3_ok:
             step3_context = specific_search_context
             print(f"[Step 3 Extract] Calling NLP processor (Multi-Call)... Context: {step3_context[:100]}...")
 
+            # Pass LLM config from the run request
             step3_entities = nlp_processor.extract_entities_only(step3_search_results, step3_context, llm_provider_to_use, llm_model_to_use)
             # Filter entities to only include valid ones with names
             step3_entities_filtered = [e for e in step3_entities if isinstance(e, dict) and e.get('name')]
@@ -977,6 +1097,7 @@ def run_analysis(initial_query: str,
             print(f"[Step 3 Extract] Extracted {len(step3_entities_filtered)} entities of various types.")
             time.sleep(1.0)
 
+            # Pass LLM config from the run request
             step3_risks_initial = nlp_processor.extract_risks_only(step3_search_results, step3_context, llm_provider_to_use, llm_model_to_use)
             time.sleep(1.0)
 
@@ -984,6 +1105,7 @@ def run_analysis(initial_query: str,
             if step3_risks_initial and step3_entity_names:
                  print(f"[Step 3 Linker] Starting entity linking for {len(step3_risks_initial)} risks against {len(step3_entity_names)} filtered entities...")
                  # Ensure all_snippets_map is passed
+                 # Pass LLM config from the run request
                  step3_risks = nlp_processor.link_entities_to_risk(
                      risks=step3_risks_initial,
                      list_of_entity_names=step3_entity_names,
@@ -1001,6 +1123,7 @@ def run_analysis(initial_query: str,
             step3_entities_company_org = [e for e in step3_entities_filtered if e.get('type') in ["COMPANY", "ORGANIZATION"]]
             if step3_entities_company_org:
                  print(f"[Step 3 Extract] Calling NLP for Ownership Relationships...")
+                 # Pass LLM config from the run request
                  step3_ownership_relationships = nlp_processor.extract_relationships_only(step3_search_results, step3_context, step3_entities_company_org, llm_provider_to_use, llm_model_to_use)
             else: print("[Step 3 Extract] Skipping ownership relationship extraction - no COMPANY/ORGANIZATION entities found.")
             time.sleep(1.0)
@@ -1009,13 +1132,14 @@ def run_analysis(initial_query: str,
             # Regulatory/Sanction relationships can involve any relevant entity type
             if step3_entities_filtered:
                  print(f"[Step 3 Extract] Calling NLP for Regulatory/Sanction Relationships...")
+                 # Pass LLM config from the run request
                  step3_reg_sanc_relationships = nlp_processor.extract_regulatory_sanction_relationships(step3_search_results, step3_context, step3_entities_filtered, llm_provider_to_use, llm_model_to_use)
             else: print("[Step 3 Extract] Skipping regulatory/sanction relationship extraction - no entities found.")
             time.sleep(1.0)
 
             step3_relationships = step3_ownership_relationships + step3_reg_sanc_relationships
 
-            print(f"[Step 3 Extract] Multi-Call Results: E:{len(step3_entities_filtered)}, R:{len(step3_risks)}, Rel:{len(step3_relationships)} (Ownership: {len(step3_ownership_relationships)}, Reg/Sanc: {len(step3_reg_sanc_relationships)})")
+            print(f"[Step 3 Extract] Multi-Call Results: E: {len(step3_entities_filtered)}, R:{len(step3_risks)}, Rel:{len(step3_relationships)} (Ownership: {len(step3_ownership_relationships)}, Reg/Sanc: {len(step3_reg_sanc_relationships)})")
 
             # Assign the extracted data for this step
             step3_extracted_data["entities"] = step3_entities_filtered
@@ -1038,91 +1162,137 @@ def run_analysis(initial_query: str,
         print(f"\n--- Running Step 3.5: Generating High Risk Exposures ---")
         step3_5_start = time.time()
 
+        # Retrieve the *final* accumulated lists from the results dict after all extraction steps
         all_entities_accumulated = results["final_extracted_data"].get("entities", [])
         all_risks_accumulated = results["final_extracted_data"].get("risks", [])
-        all_collected_relationships = list(results["final_extracted_data"].get("relationships", []))
+        all_collected_relationships = results["final_extracted_data"].get("relationships", []) # Use .get() just in case
+
 
         # Recalculate likely Chinese company/org names based on ALL accumulated entities
         # This is crucial for filtering consistently across sheets and KG
-        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION"]}
-        likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities.")
+        # Include names from Linkup structured data and derived entities tagged as COMPANY/ORGANIZATION
+        likely_chinese_company_org_names_set = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY", "SANCTION"]} # Added SANCTION as they can be subjects
+        structured_companies_from_raw_data = {item.get('data',{}).get('company_name','') for item in results.get("linkup_structured_data", []) if isinstance(item, dict) and item.get("schema") in ["ownership", "key_risks"]}
+        likely_chinese_company_org_names_set.update(structured_companies_from_raw_data)
+        # Add names from entities derived from structured data processing (should have _source_type: linkup_structured)
+        structured_derived_entities = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY", "SANCTION"]}
+        likely_chinese_company_org_names_set.update(structured_derived_entities)
+
+        likely_chinese_company_org_names_set.discard('') # Remove empty strings
 
 
-        print(f"[Step 3.5 Exposures] Analyzing {len(all_risks_accumulated)} accumulated risks and {len(all_entities_accumulated)} entities.")
+        # Recalculate the set of triggering entities based on all accumulated data
+        # Find ALL relevant risks (High/Severe) and SUBJECT_TO relationships involving the triggering entity (any entity type for now)
+        high_severe_risks = [r for r in all_risks_accumulated if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"]]
+        relevant_risk_categories_lower = ['compliance', 'financial', 'legal', 'regulatory', 'governance'] # Added more categories
+        companies_with_high_severe_relevant_risks = set()
+        for risk in high_severe_risks:
+             risk_desc = risk.get('description', '').lower()
+             risk_category = risk.get('risk_category', '').lower() # Use extracted category
+             if risk_category in relevant_risk_categories_lower or (risk_category == "UNKNOWN" and any(keyword in risk_desc for keyword in relevant_risk_categories_lower + ['sanction', 'fine', 'penalty', 'violation', 'lawsuit', 'investigation', 'fraud', 'corruption'])):
+                   for entity_name in risk.get('related_entities', []):
+                        # Check if the related entity is in the set of *all* accumulated names initially deemed potentially Chinese
+                        if isinstance(entity_name, str) and entity_name.strip().lower() in likely_chinese_company_org_names_set: # Use set of all potential names here
+                             companies_with_high_severe_relevant_risks.add(entity_name.strip().lower())
 
-        # Identify Chinese Regulatory Agencies and Sanctions from the accumulated entities
-        # These will be used to identify the 'subject_to' relationships involving Chinese entities
-        chinese_reg_agency_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
-        chinese_sanction_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
-        chinese_reg_agency_names_lower = {name.lower() for name in chinese_reg_agency_names}
-        chinese_sanction_names_lower = {name.lower() for name in chinese_sanction_names}
-        chinese_reg_sanc_names_lower = chinese_reg_agency_names_lower.union(chinese_sanction_names_lower)
-
-
-        # --- Identify potential exposure triggers ---
-        # A trigger is a Chinese Company/Org that is either:
-        # 1. SUBJECT_TO a Chinese Regulator/Sanction
-        # 2. Has a HIGH/SEVERE risk related to Compliance (based on risk description/category) or Financial (based on category)
-
-        # 1. Entities SUBJECT_TO Chinese Reg/Sanc
+        # Find SUBJECT_TO relationships where entity1 is in the set of *all* accumulated names initially deemed potentially Chinese
         companies_subject_to_reg_sanc_rels = [
             rel for rel in all_collected_relationships
             if isinstance(rel, dict)
             and rel.get('relationship_type') == "SUBJECT_TO"
-            and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) # Ensure both entity names are strings
-            and rel.get('entity1').lower() in likely_chinese_company_org_names_lower # Entity1 is a Chinese Company/Org
-            and rel.get('entity2').lower() in chinese_reg_sanc_names_lower # Entity2 is a Chinese Regulator/Sanction
+            and isinstance(rel.get('entity1'), str) # Ensure entity1 is a string
+            and rel.get('entity1').strip().lower() in likely_chinese_company_org_names_set # Entity1 is a potentially Chinese Company/Org
+            # No need to check entity2 type/origin here for the trigger list calculation, just need entity1 to be the subject.
         ]
         companies_subject_to_names_lower = {rel['entity1'].strip().lower() for rel in companies_subject_to_reg_sanc_rels}
 
-        # 2. Entities with HIGH/SEVERE Compliance or Financial Risks
-        companies_with_high_severe_compliance_or_financial_risks = set()
-        high_severe_risks = [r for r in all_risks_accumulated if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"]]
-        for risk in high_severe_risks:
-             risk_desc = risk.get('description', '').lower()
-             risk_category = risk.get('risk_category', '').lower() # Use extracted category
-
-             # Check for "compliance" in description OR category is 'Compliance' or 'Financial'
-             if "compliance" in risk_desc or risk_category in ['compliance', 'financial']:
-                  for entity_name in risk.get('related_entities', []):
-                       if isinstance(entity_name, str) and entity_name.strip().lower() in likely_chinese_company_org_names_lower:
-                            companies_with_high_severe_compliance_or_financial_risks.add(entity_name.strip().lower())
+        # Combine all potentially Chinese entities that are triggers
+        triggering_chinese_company_org_names_lower_initial = companies_subject_to_names_lower.union(companies_with_high_severe_relevant_risks)
 
 
-        # Combine all Chinese Company/Org entities that are triggers
-        # A trigger is a Chinese Company/Org that is either SUBJECT_TO or has a HIGH/SEVERE Compliance/Financial Risk
-        triggering_chinese_company_org_names_lower = companies_subject_to_names_lower.union(companies_with_high_severe_compliance_or_financial_risks)
+        if specific_country_code.lower() == 'cn':
+             # Keep names that were identified AND contain Chinese characters OR are already translated English names that were linked to Chinese sources/context (more complex check)
+             # For simplicity now, let's just assume entities with Chinese characters are "Chinese" for the sheet/KG filtering in the CN run.
+             # A more robust approach would involve language detection on the entity name or source snippet.
+             # Keep triggers even if name is English translation if the trigger logic identified them based on relationships/risks involving Chinese entities
+             likely_chinese_company_org_names = {name for name in likely_chinese_company_org_names_set if contains_chinese(name) or name.lower() in triggering_chinese_company_org_names_lower_initial}
+        else:
+             # If not a CN run, this filtering logic might be less relevant or need different criteria.
+             # For now, assume we save/KG entities identified if not in common non-country specific list.
+             # Revert to a simpler filter or adapt based on non-CN requirements.
+             # For this code version focused on the CN example, we'll stick to the CN-centric filter if specific_country_code is 'cn'.
+             # If not 'cn', we'll skip this Chinese-character based filtering for entity names and use all identified as potentially relevant.
+             likely_chinese_company_org_names = likely_chinese_company_org_names_set # In non-CN run, keep all initially identified as potential
+             # triggering_chinese_company_org_names_lower_initial is already calculated above and needed for the exposure loop below.
 
 
-        print(f"[Step 3.5 Exposures] Identified {len(triggering_chinese_company_org_names_lower)} Chinese Companies/Orgs that are potential exposure triggers (Subject To OR High/Severe Compliance/Financial Risk).")
+        # Make sure triggering_chinese_company_org_names_lower_initial is a set of lowercase strings
+        # It already is from the calculation above, but adding a safety check
+        triggering_chinese_company_org_names_lower_initial = {name.lower() for name in triggering_chinese_company_org_names_lower_initial if isinstance(name, str)}
 
 
-        consolidated_exposures: Dict[Tuple, Dict] = {} # Key will be (Triggering Chinese Co/Org Name, Related Chinese Co/Org Name, Ownership/Affiliate/JV Relationship Type)
+        likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
 
-        # Iterate through the Chinese Company/Org entities that are triggers
-        for triggering_company_name_lower in triggering_chinese_company_org_names_lower:
-             triggering_company_name = next((name for name in likely_chinese_company_org_names if name.lower() == triggering_company_name_lower), triggering_company_name_lower) # Get original casing if possible
+        # Identify Regulatory Agencies and Sanctions from the accumulated entities
+        # These will be used to identify the 'subject_to' relationships involving Chinese entities
+        all_reg_agency_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
+        all_sanction_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+
+        # Also include Regulatory Agencies and Sanctions potentially identified from structured data
+        structured_derived_reg_sanc_entities = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
+        all_reg_agency_names.update(structured_derived_reg_sanc_entities) # Just lump them here for now, refinement might need specific type check
+
+        all_reg_agency_names.discard('')
+        all_sanction_names.discard('')
+
+        all_reg_agency_names_lower = {name.lower() for name in all_reg_agency_names}
+        all_sanction_names_lower = {name.lower() for name in all_sanction_names}
+        all_reg_sanc_names_lower = all_reg_agency_names_lower.union(all_sanction_names_lower)
 
 
-             # Find relationships where this triggering Chinese Company/Org is involved in the required Ownership/Affiliate relationships
+        # --- Identify potential exposure triggers ---
+        # A trigger is a Chinese Company/Org that is either:
+        # 1. SUBJECT_TO a Chinese Regulator/Sanction (based on extracted relationships)
+        # 2. Has a HIGH/SEVERE risk related to Compliance, Financial, Legal, Regulatory, or Governance (based on risk description/category and linking)
+
+        # Now, the exposure definition is: A *likely Chinese Company/Org* from the `triggering_and_likely_chinese_entities_lower` set
+        # that is related to *another likely Chinese Company/Org* via an Ownership/Affiliate/JV relationship.
+
+        # The exposure generation loop should iterate over the intersection of triggers and likely Chinese entities
+        # This set is calculated correctly above as `triggering_and_likely_chinese_entities_lower`
+
+
+        consolidated_exposures: Dict[Tuple, Dict] = {} # Key will be (Triggering Co/Org Name Lower, Related Co/Org Name Lower, Ownership/Affiliate/JV Relationship Type) - Broader key definition now
+
+        # Iterate through the likely Chinese Company/Org entities that are triggers
+        for triggering_company_name_lower in triggering_and_likely_chinese_entities_lower:
+             # Find the original casing name from the accumulated entities list
+             triggering_company_name_obj = next((e for e in all_entities_accumulated if isinstance(e, dict) and e.get('name','') and e['name'].lower() == triggering_company_name_lower), None)
+             triggering_company_name = triggering_company_name_obj.get('name') if triggering_company_name_obj else triggering_company_name_lower # Get original casing if entity object exists, otherwise use lowercased
+
+
+             # Find relationships where this triggering entity is involved in the required Ownership/Affiliate relationships
+             # Relationships can be from *any* source (snippet or structured)
              required_ownership_relationships_involving_triggering_entity = [
                  rel for rel in all_collected_relationships
                  if isinstance(rel, dict)
                  and rel.get('relationship_type') in ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER"] # Added Joint Venture here
                  and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str)
-                 and (rel.get('entity1').lower() == triggering_company_name_lower or rel.get('entity2').lower() == triggering_company_name_lower)
-                 # Ensure the OTHER entity in the relationship is also a Chinese Company/Org
+                 and (rel.get('entity1').strip().lower() == triggering_company_name_lower or rel.get('entity2').strip().lower() == triggering_company_name_lower)
+                 # Ensure the OTHER entity in the relationship is also a likely Chinese Company/Org *if* specific_country_code is 'cn'
+                 # If not 'cn', the other entity can be any entity in likely_chinese_company_org_names_lower (which is all identified companies/orgs in non-CN case)
                  and (
-                      (rel.get('entity1').lower() == triggering_company_name_lower and rel.get('entity2').lower() in likely_chinese_company_org_names_lower) or
-                      (rel.get('entity2').lower() == triggering_company_name_lower and rel.get('entity1').lower() in likely_chinese_company_org_names_lower)
+                      (rel.get('entity1').strip().lower() == triggering_company_name_lower and rel.get('entity2').strip().lower() in likely_chinese_company_org_names_lower) or
+                      (rel.get('entity2').strip().lower() == triggering_company_name_lower and rel.get('entity1').strip().lower() in likely_chinese_company_org_names_lower)
                      )
              ]
 
+             # We create an exposure row for each *pair* of entities linked by a required ownership relationship,
+             # BUT *only* if one of them is in the 'triggering_and_likely_chinese_entities_lower' list (which is what we are iterating over).
+             # If no required ownership relationships were found involving this triggering entity *with another likely Chinese Co/Org*, skip creating relationship-based exposure rows for THIS triggering entity.
              if not required_ownership_relationships_involving_triggering_entity:
-                  # If a triggering Chinese Company/Org has NO required Ownership/Affiliate relationship with *another* Chinese Co/Org, it does NOT trigger a sheet exposure row.
-                  # print(f"Skipping exposure for triggering Chinese Company/Org '{triggering_company_name}': No PARENT_COMPANY_OF, SUBSIDIARY_OF, AFFILIATE_OF, or JOINT_VENTURE_PARTNER relationship found with another Chinese Company/Org.")
-                  continue # Skip to the next triggering entity
+                  # print(f"Skipping relationship-based exposure row creation for triggering entity '{triggering_company_name}' because no required ownership relationship was found with another likely Chinese Company/Org.")
+                  continue # Skip to the next triggering entity for relationship-based rows
 
 
              # Process the valid required ownership relationships found for the triggering entity
@@ -1132,14 +1302,19 @@ def run_analysis(initial_query: str,
                  if not isinstance(r_type_raw, str) or not isinstance(e1_name, str) or not isinstance(e2_name, str): continue
                  r_type_upper = r_type_raw.upper()
 
-                 # Determine the OTHER Chinese Company/Org involved in this relationship
-                 other_chinese_company_name = None
-                 if e1_name.lower() == triggering_company_name_lower:
-                     other_chinese_company_name = e2_name.strip()
-                 elif e2_name.lower() == triggering_company_name_lower:
-                     other_chinese_company_name = e1_name.strip()
+                 # Determine the OTHER entity involved in this relationship (which we already know is in likely_chinese_company_org_names_lower based on the filter above)
+                 other_entity_name_lower = None
+                 if e1_name.strip().lower() == triggering_company_name_lower:
+                     other_entity_name_lower = e2_name.strip().lower()
+                 elif e2_name.strip().lower() == triggering_company_name_lower:
+                     other_entity_name_lower = e1_name.strip().lower()
                  else:
                      continue # Should not happen if logic is correct
+
+                 # Find the original casing name for the other entity
+                 other_entity_name_obj = next((e for e in all_entities_accumulated if isinstance(e, dict) and e.get('name','') and e['name'].lower() == other_entity_name_lower), None)
+                 other_entity_name = other_entity_name_obj.get('name') if other_entity_name_obj else other_entity_name_lower # Get original casing if entity object exists, otherwise use lowercased
+
 
                  # Determine the roles for the Exposure columns (Parent, Subsidiary/Affiliate)
                  parent_col_value = ""
@@ -1149,94 +1324,95 @@ def run_analysis(initial_query: str,
 
                  if r_type_upper == "PARENT_COMPANY_OF":
                       # If triggering_entity is entity1 (parent) -> triggering_entity is Parent, entity2 is Sub/Aff
-                      if e1_name.lower() == triggering_company_name_lower:
-                           parent_col_value = triggering_company_name
-                           sub_aff_col_value = other_chinese_company_name
+                      if e1_name.strip().lower() == triggering_company_name_lower:
+                           parent_col_value = triggering_company_name # Use original casing for display
+                           sub_aff_col_value = other_entity_name # Use original casing for display
                            exposure_risk_type_label = "Parent Company Risk" # Risk on parent entity affects subsidiary
                       # If triggering_entity is entity2 (subsidiary) -> entity1 is Parent, triggering_entity is Sub/Aff
-                      elif e2_name.lower() == triggering_company_name_lower:
-                           parent_col_value = other_chinese_company_name
-                           sub_aff_col_value = triggering_company_name
+                      elif e2_name.strip().lower() == triggering_company_name_lower:
+                           parent_col_value = other_entity_name # Use original casing for display
+                           sub_aff_col_value = triggering_company_name # Use original casing for display
                            exposure_risk_type_label = "Subsidiary Risk" # Risk on subsidiary affects parent
-                      else: continue # Should not happen
-
+                      else: continue
 
                  elif r_type_upper == "SUBSIDIARY_OF":
                       # Inverse of PARENT_COMPANY_OF
                       # If triggering_entity is entity1 (subsidiary) -> entity2 is Parent, triggering_entity is Sub/Aff
-                      if e1_name.lower() == triggering_company_name_lower:
-                           parent_col_value = other_chinese_company_name
-                           sub_aff_col_value = triggering_company_name
+                      if e1_name.strip().lower() == triggering_company_name_lower:
+                           parent_col_value = other_entity_name # Use original casing for display
+                           sub_aff_col_value = triggering_company_name # Use original casing for display
                            exposure_risk_type_label = "Subsidiary Risk" # Risk on subsidiary affects parent
                       # If triggering_entity is entity2 (parent) -> triggering_entity is Parent, entity1 is Sub/Aff
-                      elif e2_name.lower() == triggering_company_name_lower:
-                           parent_col_value = triggering_company_name
-                           sub_aff_col_value = e1_name.strip() # The other entity is the sub/affiliate
+                      elif e2_name.strip().lower() == triggering_company_name_lower:
+                           parent_col_value = triggering_company_name # Use original casing for display
+                           sub_aff_col_value = e1_name.strip() # The other entity is the sub/affiliate (use original from relation)
                            exposure_risk_type_label = "Parent Company Risk" # Risk on parent entity affects subsidiary
                       else: continue
 
                  elif r_type_upper == "AFFILIATE_OF":
                       # For Affiliate, the triggering entity is one affiliate, the other is the other affiliate/partner
                       parent_col_value = "" # No strict parent/sub in affiliate
-                      sub_aff_col_value = f"{triggering_company_name} (Affiliate) / {other_chinese_company_name} (Partner)"
+                      # Use original casing names found
+                      sub_aff_col_value = f"{triggering_company_name} (Affiliate) / {other_entity_name} (Partner)" # Format for clarity
                       exposure_risk_type_label = "Affiliate Risk" # Risk on one affiliate/partner affects the other
 
                  elif r_type_upper == "JOINT_VENTURE_PARTNER":
                        # For Joint Venture, the triggering entity is one partner, the other is the other partner
                        parent_col_value = ""
-                       sub_aff_col_value = f"{triggering_company_name} (JV Partner) / {other_chinese_company_name} (Partner)"
+                       # Use original casing names found
+                       sub_aff_col_value = f"{triggering_company_name} (JV Partner) / {other_entity_name} (Partner)" # Format for clarity
                        exposure_risk_type_label = "Joint Venture Risk" # Risk on one partner affects the other
 
                  else:
-                      # This should not be hit based on the 'ONLY these three relationships' filter + JV above,
-                      # but including a safety print
-                      print(f"Warning: Encountered unexpected relationship type for exposure generation (should be Parent/Sub/Affiliate/JV): '{r_type_raw}'. Skipping relationship {ownership_rel}")
+                      # This should not be hit based on the filter above, but include safety
+                      print(f"Warning: Encountered unexpected relationship type for exposure generation logic: '{r_type_raw}'. Skipping relationship {ownership_rel}")
                       continue
 
+                 # Define the key for consolidating exposures.
+                 # Use the triggering company name + the other involved company name + relationship type.
+                 # Ensure names are lowercase and stripped for consistency in the key.
+                 triggering_name_for_key = triggering_company_name_lower # Already lowercased
+                 other_name_for_key = other_entity_name_lower # Already lowercased
 
-                 # Define the key for consolidating exposures
-                 # Key will be (Triggering Chinese Co/Org Name, Related Chinese Co/Org Name, Ownership/Affiliate/JV Relationship Type)
-                 # Example: ('alibaba group', 'aliexpress', 'SUBSIDIARY_OF') --> sanctioned_entity is AliExpress, related is Alibaba
-                 # Example: ('alibaba group', 'aliexpress', 'PARENT_COMPANY_OF') --> sanctioned_entity is Alibaba, related is AliExpress
-                 # Use sorted names to make the key consistent regardless of which entity came first in the relationship tuple
-                 # Ensure both names are strings and not empty before lower() and strip()
-                 triggering_name_for_key = triggering_company_name.strip().lower() if isinstance(triggering_company_name, str) else ''
-                 other_name_for_key = other_chinese_company_name.strip().lower() if isinstance(other_chinese_company_name, str) else ''
+                 # Use sorted entity names for the key regardless of entity1/entity2 order
+                 entity_pair_sorted_lower = tuple(sorted((triggering_name_for_key, other_name_for_key)))
 
-                 entity_pair_sorted = tuple(sorted((triggering_name_for_key, other_name_for_key)))
 
                  # Ensure the tuple key is valid (no empty strings from names)
-                 if not all(entity_pair_sorted):
-                      print(f"Warning: Skipping exposure key due to invalid entity names: {entity_pair_sorted}. Relationship: {ownership_rel}")
+                 if not all(entity_pair_sorted_lower):
+                      print(f"Warning: Skipping exposure key due to invalid entity names: {entity_pair_sorted_lower}. Relationship: {ownership_rel}")
                       continue
 
-                 relationship_exposure_key = (entity_pair_sorted[0], entity_pair_sorted[1], r_type_upper)
+                 relationship_exposure_key = (entity_pair_sorted_lower[0], entity_pair_sorted_lower[1], r_type_upper)
 
 
                  # Consolidate data if the same relationship between the same entities has multiple risks/sanctions apply
                  if relationship_exposure_key not in consolidated_exposures:
                       consolidated_exposures[relationship_exposure_key] = {
-                          "Entity": triggering_company_name, # The Chinese Co/Org that is SUBJECT_TO or has Compliance Risk
-                          "Subsidiary/Affiliate": sub_aff_col_value,
-                          "Parent Company": parent_col_value,
+                          "Entity": triggering_company_name, # The Chinese Co/Org that is SUBJECT_TO or has Compliance Risk (use original casing)
+                          "Subsidiary/Affiliate": sub_aff_col_value, # Use formatted value
+                          "Parent Company": parent_col_value,       # Use formatted value
                           "Risk_Severity": "MEDIUM", # Start with MEDIUM, update based on found risks/sanctions
                           "Risk_Type_Label": exposure_risk_type_label, # Use the derived label (Parent, Subsidiary, Affiliate, JV Risk)
                           "Explanation_Details": set(), # Set to collect details (e.g., which sanctions/risks apply)
                           "Main_Sources": set() # Set to collect unique sources
                       }
+                 # Note: If the same trigger is related to the *same* other company via a *different* ownership type, they will become separate rows due to `r_type_upper` in the key.
+
 
                  # Find ALL relevant risks (High/Severe) and SUBJECT_TO relationships involving the triggering entity
                  # Add details and sources to the consolidated entry for this key
 
                  # Find relevant risks for this triggering entity
+                 # Risks can be from *any* source (snippet or structured)
                  relevant_risks = [
                      r for r in all_risks_accumulated
                      if isinstance(r, dict) and r.get('severity') in ["HIGH", "SEVERE"] # Only High/Severe risks
-                     and any(isinstance(e_name, str) and e_name.lower() == triggering_company_name_lower for e_name in r.get('related_entities', []))
+                     and any(isinstance(e_name, str) and e_name.strip().lower() == triggering_company_name_lower for e_name in r.get('related_entities', []))
                  ]
                  for risk in relevant_risks:
                       if isinstance(risk.get('description'), str):
-                           # Include risk category in the detail
+                           # Include risk category in the detail if available
                            risk_desc_detail = risk['description'].strip()
                            risk_category_detail = risk.get('risk_category', 'UNKNOWN').strip()
                            detail_string = f"Risk ({risk_category_detail}): {risk_desc_detail}"
@@ -1251,14 +1427,14 @@ def run_analysis(initial_query: str,
                       consolidated_exposures[relationship_exposure_key]["Main_Sources"].update(risk.get('source_urls', []))
 
 
-                 # Find relevant SUBJECT_TO relationships for this triggering entity
+                 # Find relevant SUBJECT_TO relationships for this triggering entity (from *any* source)
                  relevant_subject_to_rels = [
                      rel for rel in all_collected_relationships
                      if isinstance(rel, dict)
                      and rel.get('relationship_type') == "SUBJECT_TO"
                      and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) # Ensure both entity names are strings
-                     and rel.get('entity1').lower() == triggering_company_name_lower # Entity1 is the triggering company
-                     and rel.get('entity2').lower() in chinese_reg_sanc_names_lower # Entity2 is a Chinese Regulator/Sanction
+                     and rel.get('entity1').strip().lower() == triggering_company_name_lower # Entity1 is the triggering company
+                     and rel.get('entity2').strip().lower() in all_reg_sanc_names_lower # Entity2 is a Regulator/Sanction (could be Chinese or not, but must be an extracted one)
                  ]
                  for rel in relevant_subject_to_rels:
                       if isinstance(rel.get('entity2'), str):
@@ -1272,6 +1448,7 @@ def run_analysis(initial_query: str,
                                 consolidated_exposures[relationship_exposure_key]["Risk_Severity"] = "HIGH" # At least High
                            # Check if the entity2 is a SANCTION node explicitly for Severe
                            subject_to_entity_name_lower = subject_to_entity_name.lower()
+                           # Find the entity object to check its type
                            subject_to_entity_obj = next((e for e in all_entities_accumulated if isinstance(e, dict) and e.get('name','') and e['name'].lower() == subject_to_entity_name_lower), None)
                            if subject_to_entity_obj and subject_to_entity_obj.get('type') == "SANCTION":
                                 if severity_order.index("SEVERE") > severity_order.index(consolidated_exposures[relationship_exposure_key]["Risk_Severity"]):
@@ -1317,9 +1494,9 @@ def run_analysis(initial_query: str,
              display_risk_type = data["Risk_Type_Label"].replace(" Risk", "").strip()
 
              exposure_row = {
-                 "Entity": data["Entity"],
-                 "Subsidiary/Affiliate": data["Subsidiary/Affiliate"],
-                 "Parent Company": data["Parent Company"],
+                 "Entity": data["Entity"], # Use original casing, will be formatted for sheet later
+                 "Subsidiary/Affiliate": data["Subsidiary/Affiliate"], # Use original casing/formatted, will be formatted for sheet later
+                 "Parent Company": data["Parent Company"], # Use original casing/formatted, will be formatted for sheet later
                  "Risk_Severity": data["Risk_Severity"],
                  "Risk_Type": display_risk_type, # Use the derived label (Parent Company, Subsidiary, Affiliate, Joint Venture)
                  "Explanation": explanation,
@@ -1370,140 +1547,145 @@ def run_analysis(initial_query: str,
         urls_to_check = list(set(all_snippet_urls_combined + list(structured_data_urls) + list(exposure_source_urls))) # Combine and deduplicate all unique URLs
 
         wayback_checks = []
+        wayback_status = "Skipped (Wayback not available)"
         if wayback_available:
+            wayback_status = "OK" # Assume OK unless errors occur
             print(f"[Step 4 Wayback] Checking {len(urls_to_check)} URLs via Wayback Machine...");
             if urls_to_check:
                 for url in urls_to_check:
                     # Add a small delay between Wayback checks if needed to avoid rate limits
                     # time.sleep(0.2) # Uncomment if needed
                     # print(f"  Checking: {url}") # Too verbose for many URLs
-                    wayback_result = search_engines.check_wayback_machine(url);
-                    wayback_checks.append(wayback_result);
+                    try:
+                         wayback_result = search_engines.check_wayback_machine(url);
+                         wayback_checks.append(wayback_result);
+                         if wayback_result.get("status", "").startswith("Error") or wayback_result.get("status") == "skipped_invalid_url":
+                              wayback_status = "Error/Skipped" # Update status if any check fails
+                    except Exception as e:
+                         print(f"Error checking Wayback for {url}: {type(e).__name__}: {e}")
+                         wayback_checks.append({"status": f"Error: {type(e).__name__}", "message": str(e), "original_url": url})
+                         wayback_status = "Error/Skipped" # Update status on exception
                 print(f"Finished checking {len(urls_to_check)} URLs via Wayback Machine.")
-            else: print("[Step 4 Wayback] No URLs found to check.")
+            else:
+                 print("[Step 4 Wayback] No URLs found to check.")
+                 wayback_status = "No URLs to Check"
         else:
              print("[Step 4 Wayback] Skipping Wayback Machine check: search_engines.check_wayback_machine not available.")
              wayback_checks = [{"status": "skipped", "message": "check_wayback_machine not available", "original_url": "N/A"}] # Add placeholder if skipped
 
+
         results["wayback_results"] = wayback_checks
         # Update status based on whether checks were attempted and successful
-        wayback_status = "OK" if wayback_checks and not any(chk.get("status", "").startswith("Error") or chk.get("status") == "skipped_invalid_url" for chk in wayback_checks) else "Error/Skipped"
-        if not wayback_checks: wayback_status = "No URLs to Check"
+        # wayback_status is already updated in the block above based on results of the checks.
+
 
         results["steps"].append({ "name": "Wayback Machine Check", "duration": round(time.time() - step4_start, 2), "urls_checked": len(urls_to_check), "status": wayback_status })
 
         print(f"\n--- Running Step 5: Prepare Data for Sheet & KG Update ---")
         step5_prep_start = time.time()
 
-        # --- Filtering Logic (Moved here from _save_analysis_to_gsheet) ---
-        all_entities_from_run = results.get("final_extracted_data", {}).get("entities", [])
-        all_risks_from_run = results.get("final_extracted_data", {}).get("risks", [])
-        all_relationships_from_run = results.get("final_extracted_data", {}).get("relationships", [])
-        all_exposures_from_run = results.get("high_risk_exposures", []) # Use the list generated in step 3.5
+        # --- Filtering Logic ---
+        # Re-retrieve accumulated data lists for clarity, although they are still in scope from Step 3.5
+        all_entities_accumulated_for_filter = results.get("final_extracted_data", {}).get("entities", [])
+        all_risks_accumulated_for_filter = results.get("final_extracted_data", {}).get("risks", [])
+        all_collected_relationships_for_filter = results.get("final_extracted_data", {}).get("relationships", [])
+        # exposures_to_save_to_sheet is already the generated list from Step 3.5 at this point
 
-        # Recalculate likely Chinese company/org names based on ALL accumulated entities
-        # This is crucial for filtering consistently across sheets and KG
-        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]} # Added potential other types for completeness in Chinese list
-        likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 5 Prep] Identified {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for filtering.")
+        # Recalculate sets used for filtering based on the current state of accumulated data
+        likely_chinese_company_org_names_set_filter = {e.get('name','') for e in all_entities_accumulated_for_filter if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY", "SANCTION"]}
+        structured_companies_from_raw_data_filter = {item.get('data',{}).get('company_name','') for item in results.get("linkup_structured_data", []) if isinstance(item, dict) and item.get("schema") in ["ownership", "key_risks"]}
+        likely_chinese_company_org_names_set_filter.update(structured_companies_from_raw_data_filter)
+        structured_derived_entities_filter = {e.get('name','') for e in all_entities_accumulated_for_filter if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY", "SANCTION"]}
+        likely_chinese_company_org_names_set_filter.update(structured_derived_entities_filter)
+        likely_chinese_company_org_names_set_filter.discard('')
 
-        # Identify Chinese Regulatory Agencies and Sanctions based on filtering rules for sheet/KG
-        chinese_reg_agency_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
-        chinese_sanction_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+        if specific_country_code.lower() == 'cn':
+             # Need the triggering names set calculated in Step 3.5 again for the CN filter
+             likely_chinese_company_org_names_filter = {name for name in likely_chinese_company_org_names_set_filter if contains_chinese(name) or name.lower() in triggering_chinese_company_org_names_lower_initial}
+        else:
+             likely_chinese_company_org_names_filter = likely_chinese_company_org_names_set_filter
 
-        chinese_reg_agency_names_lower = {name.lower() for name in chinese_reg_agency_names}
-        chinese_sanction_names_lower = {name.lower() for name in chinese_sanction_names}
+        likely_chinese_company_org_names_lower_filter = {name.lower() for name in likely_chinese_company_org_names_filter}
+
+        all_reg_agency_names_filter = {e.get('name','') for e in all_entities_accumulated_for_filter if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
+        all_sanction_names_filter = {e.get('name','') for e in all_entities_accumulated_for_filter if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+        structured_derived_reg_sanc_entities_filter = {e.get('name','') for e in all_entities_accumulated_for_filter if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
+        all_reg_agency_names_filter.update(structured_derived_reg_sanc_entities_filter)
+        all_reg_agency_names_filter.discard('')
+        all_sanction_names_filter.discard('')
+        all_reg_agency_names_lower_filter = {name.lower() for name in all_reg_agency_names_filter}
+        all_sanction_names_lower_filter = {name.lower() for name in all_sanction_names_filter}
+        all_reg_sanc_names_lower_filter = all_reg_agency_names_lower_filter.union(all_sanction_names_lower_filter)
 
 
-        # Filter entities for the sheet/KG: ONLY Entities identified as likely Chinese Companies/Organizations,
-        # AND ONLY Regulatory Agencies and Sanctions identified as likely Chinese (simplified check).
-        entities_to_save_to_sheet = [] # Use a different variable name
-        # List of common known non-Chinese regulators/sanctions/orgs/countries for filtering
+        # --- CORRECTED LINE: Replaced all_risks_from_run and all_entities_from_run ---
+        print(f"[Step 5 Prep] Analyzing {len(all_risks_accumulated_for_filter)} raw risks and {len(all_entities_accumulated_for_filter)} raw entities for Sheet/KG filtering.")
+
+        entities_to_save_to_sheet = []
         common_non_chinese_entities_lower = {
             "sec", "securities and exchange commission", "ofac", "office of foreign assets control",
             "hmrc", "irs", "fbi", "eu commission", "european commission", "us department of justice", "doj",
             "uk hmrc", "uk government", "united states", "us", "united kingdom", "uk",
             "germany", "de", "india", "in", "france", "fr", "japan", "jp", "canada", "ca", "australia", "au",
-            "nato", "un", "world bank", "imf", "oecd", "international monetary fund", "world trade organization", "wto" # Added more international orgs
-        } # Added more country/org names that might be misidentified
+            "nato", "un", "world bank", "imf", "oecd", "international monetary fund", "world trade organization", "wto", # Added more international orgs
+            "google", "apple", "microsoft", "amazon", "facebook", "meta", "twitter", "x", "alibaba", "tencent", "baidu", "huawei", # Add common tech/large company names if they get misclassified
+            "shanghai", "beijing", "shenzhen", "guangzhou", "hong kong", "taiwan", # Add cities/regions if misclassified
+            "people's republic of china", "prc" # Sometimes PRC itself gets extracted as an entity
+        }
 
-
-        for e in all_entities_from_run:
+        # --- CORRECTED LOOP VARIABLE: Replaced all_entities_from_run with all_entities_accumulated_for_filter ---
+        for e in all_entities_accumulated_for_filter: # Filter from ALL accumulated entities
             if isinstance(e, dict) and e.get('name'):
                  entity_name = e.get('name')
-                 entity_name_lower = entity_name.lower()
+                 entity_name_lower = entity_name.lower().strip()
                  entity_type = e.get('type')
 
-                 # Include Companies or Organizations if they are in the likely Chinese list
-                 if entity_type in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]: # Include related ORG types if they were identified
-                      if entity_name_lower in likely_chinese_company_org_names_lower:
+                 # Skip common non-Chinese entities regardless of type if they match the filter list
+                 if entity_name_lower in common_non_chinese_entities_lower:
+                      continue
+
+                 if entity_type in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]:
+                      if entity_name_lower in likely_chinese_company_org_names_lower_filter:
                            entities_to_save_to_sheet.append(e)
-                       # else: print(f"[Step 5 Prep] Filtering out non-Chinese Company/Org '{entity_name}'.") # Optional logging
-                 # Include Regulators or Sanctions IF their name is NOT in the common non-Chinese list
-                 # AND does NOT contain common non-Chinese country indicators.
                  elif entity_type in ["REGULATORY_AGENCY", "SANCTION"]:
-                      if entity_name_lower not in common_non_chinese_entities_lower:
-                           non_chinese_country_indicators = ["us", "uk", "eu", "usa", "united states", "united kingdom", "european", "germany", "india", "france", "japan", "canada", "australia"]
-                           if not any(indicator in entity_name_lower for indicator in non_chinese_country_indicators):
-                                # Assuming any regulator/sanction not explicitly filtered or containing foreign indicators is Chinese for now.
-                                # A more robust approach would use country identified during NLP extraction if possible.
-                                entities_to_save_to_sheet.append(e)
-                           else:
-                                print(f"[Step 5 Prep] Filtering out likely non-Chinese regulator/sanction '{entity_name}' based on country indicator.")
-                      else:
-                           print(f"[Step 5 Prep] Filtering out likely non-Chinese regulator/sanction '{entity_name}' from sheet/KG save (common list).")
-                 elif entity_type == "ORGANIZATION":
-                      # Include ORGANIZATION type only if it's in the likely Chinese company/org list
-                      # (This captures Chinese state-owned enterprises often classified as ORGANIZATIONS)
-                      if entity_name_lower in likely_chinese_company_org_names_lower:
-                           entities_to_save_to_sheet.append(e)
-                      # else: print(f"[Step 5 Prep] Filtering out non-Chinese or non-relevant ORGANIZATION '{entity_name}'.") # Optional logging
-                 # else: print(f"[Step 5 Prep] Filtering out entity '{entity_name}' with type '{entity_type}' not explicitly allowed for sheet/KG save.")
+                      if entity_name_lower in all_reg_agency_names_lower_filter or entity_name_lower in all_sanction_names_lower_filter:
+                          entities_to_save_to_sheet.append(e)
 
 
-        # Filter risks: only save risks that are related to at least one Chinese Company/Organization entity
+        # Filter risks: only save risks that are related to at least one entity that will be saved to the sheet/KG
+        entity_names_saved_lower = {e.get('name','').lower() for e in entities_to_save_to_sheet if isinstance(e, dict) and e.get('name')}
+
+        # --- CORRECTED LOOP VARIABLE: Replaced all_risks_from_run with all_risks_accumulated_for_filter ---
         risks_to_save_to_sheet = [
-            r for r in all_risks_from_run
+            r for r in all_risks_accumulated_for_filter # Filter from ALL accumulated risks
             if isinstance(r, dict) and r.get('description')
-            and any(isinstance(entity_name, str) and entity_name.lower() in likely_chinese_company_org_names_lower for entity_name in r.get('related_entities', []))
+            and any(isinstance(entity_name, str) and entity_name.strip().lower() in entity_names_saved_lower for entity_name in r.get('related_entities', []))
         ]
 
         # Filter relationships: Only include relationships where BOTH entities were deemed worthy of saving to the Entity sheet/KG
         relationships_to_save_to_sheet = []
-        # Rebuild the set of entity names that *will* be saved based on the filtering above
-        entity_names_that_will_be_saved_lower = {e.get('name','').lower() for e in entities_to_save_to_sheet if isinstance(e, dict) and e.get('name')}
+        allowed_sheet_rel_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER", "REGULATED_BY", "ISSUED_BY", "SUBJECT_TO", "MENTIONED_WITH", "ACQUIRED", "RELATED_COMPANY"]
 
-        # Updated allowed relationship types for the Relationships sheet (Removing ACQUIRED, RELATED_COMPANY as requested)
-        allowed_sheet_rel_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER", "REGULATED_BY", "ISSUED_BY", "SUBJECT_TO", "MENTIONED_WITH"]
-
-
-        for rel in all_relationships_from_run:
+        # --- CORRECTED LOOP VARIABLE: Replaced all_relationships_from_run with all_collected_relationships_for_filter ---
+        for rel in all_collected_relationships_for_filter: # Filter from ALL collected relationships
             if isinstance(rel, dict) and rel.get('entity1') and rel.get('relationship_type') and rel.get('entity2'):
                  e1_name = rel.get('entity1'); e2_name = rel.get('entity2'); r_type_raw = rel.get('relationship_type')
                  if isinstance(r_type_raw, str) and isinstance(e1_name, str) and isinstance(e2_name, str):
-
-                     e1_name_lower = e1_name.lower()
-                     e2_name_lower = e2_name.lower()
+                     e1_name_lower = e1_name.strip().lower()
+                     e2_name_lower = e2_name.strip().lower()
                      r_type_upper = r_type_raw.upper()
 
-                     # Only include relationships where BOTH entities were deemed worthy of saving to the Entity sheet/KG
-                     if e1_name_lower in entity_names_that_will_be_saved_lower and e2_name_lower in entity_names_that_will_be_saved_lower:
-                          # Check if the relationship type is allowed for the sheet
+                     if e1_name_lower in entity_names_saved_lower and e2_name_lower in entity_names_saved_lower:
                           if r_type_upper in allowed_sheet_rel_types:
                                relationships_to_save_to_sheet.append(rel)
-                          else:
-                                print(f"[Step 5 Prep] Filtering out relationship type '{r_type_raw}' not explicitly allowed for sheet/KG save between saved entities.")
-                     # else: print(f"[Step 5 Prep] Filtering out relationship {rel} because one or both entities ('{e1_name}', '{e2_name}') were not saved to the entity list.") # Optional logging
 
 
-        # Filter exposures: The list results["high_risk_exposures"] already contains only exposures matching the specified criteria from Step 3.5
-        # So, we just need to assign it to the variable used for saving.
-        exposures_to_save_to_sheet = list(results.get("high_risk_exposures", []))
-
+        # exposures_to_save_to_sheet is already populated from Step 3.5 and needs no further filtering here
+        # exposures_to_save_to_sheet = list(results.get("high_risk_exposures", [])) # Already done above
 
         print(f"[Step 5 Prep] Finished filtering data: Entities:{len(entities_to_save_to_sheet)}, Risks:{len(risks_to_save_to_sheet)}, Relationships:{len(relationships_to_save_to_sheet)}, Exposures:{len(exposures_to_save_to_sheet)}.")
 
-        results["steps"].append({"name": "Prepare Data for Sheet & KG", "duration": round(time.time() - step5_prep_start, 2), "filtered_counts": {"entities": len(entities_to_save_to_sheet), "risks": len(risks_to_save_to_sheet), "relationships": len(relationships_to_save_to_sheet), "exposures": len(exposures_to_save_to_sheet)}, "status": "OK"})
+        results["steps"].append({"name": "Prepare Data for Sheet & KG", "duration": round(time.time() - step5_prep_start, 2), "filtered_counts": {"entities": len(entities_to_save_to_sheet), "risks": len(risks_to_save_to_sheet), "relationships": len(relationships_to_save_to_sheet), "exposures": len(exposures_to_save_to_sheet)}, "status": "OK" if exposures_to_save_to_sheet or entities_to_save_to_sheet or risks_to_save_to_sheet or relationships_to_save_to_sheet else "No Data Filtered" })
 
 
         print(f"\n--- Running Step 5.1: Knowledge Graph Update ---") # Renamed to 5.1 as prep is 5.0
@@ -1576,8 +1758,9 @@ def run_analysis(initial_query: str,
                            unique_risks_dict[key] = r.copy()
                            unique_risks_dict[key]['related_entities'] = list(set(r.get('related_entities', []))) # Ensure unique related entities
                            unique_risks_dict[key]['source_urls'] = list(set(r.get('source_urls', []))) # Ensure unique source urls
+                           unique_risks_dict[key]['risk_category'] = r.get('risk_category', 'UNKNOWN') # Include category
                       else:
-                           # Merge related entities and sources
+                           # Merge related entities and sources and update category if UNKNOWN
                            existing_entities = unique_risks_dict[key].get('related_entities', [])
                            new_entities = r.get('related_entities', [])
                            merged_entities = list(set(existing_entities + new_entities))
@@ -1587,6 +1770,10 @@ def run_analysis(initial_query: str,
                            new_urls = r.get('source_urls', [])
                            merged_urls = list(set(existing_urls + new_urls))
                            unique_risks_dict[key]['source_urls'] = merged_urls
+                           # Update category only if existing is UNKNOWN and new is known
+                           if unique_risks_dict[key].get('risk_category', 'UNKNOWN') == 'UNKNOWN' and r.get('risk_category') != 'UNKNOWN':
+                                unique_risks_dict[key]['risk_category'] = r.get('risk_category')
+
 
             unique_entities = list(unique_entities_dict.values())
             unique_relationships = list(unique_relationships_dict.values())
@@ -1622,19 +1809,14 @@ def run_analysis(initial_query: str,
         structured_data_list = results.get("linkup_structured_data", [])
         structured_data_present = bool(structured_data_list)
 
-        print(f"[Step 5.5 Summary] Data for summary: E:{len(final_data_for_summary.get('entities',[]))}, R:{len(final_data_for_summary.get('risks',[]))}, Rel:{len(final_data_for_summary.get('relationships',[]))}, Exp:{exposures_for_summary_count}, Structured:{structured_data_present}.")
+        print(f"[Step 5.5 Summary] Data for summary: E:{len(final_data_for_summary.get('entities',[]))}, R:{len(final_data_for_summary.get('risks',[]))}, Rel:{len(final_data_for_summary.get('relationships',[]))}, Exp:{exposures_for_summary_count}, Structured: {structured_data_present}.")
 
         # Check if there is ANY data collected before attempting summary
         if final_data_for_summary.get("entities") or final_data_for_summary.get("risks") or final_data_for_summary.get("relationships") or exposures_for_summary_count > 0 or structured_data_present:
-             summary_data_payload = {
-                 "entities": final_data_for_summary.get("entities", []),
-                 "risks": final_data_for_summary.get("risks", []),
-                 "relationships": final_data_for_summary.get("relationships", []),
-                 "linkup_structured_data": structured_data_list,
-                 "high_risk_exposures": results.get("high_risk_exposures", []) # Include exposures for summary context
-             }
-             if nlp_processor_available and hasattr(nlp_processor, 'generate_analysis_summary') and callable(nlp_processor.generate_analysis_summary):
-                 # Pass the full results dictionary here
+             # Pass the full results dictionary here
+             # nlp_extraction_available check includes generate_analysis_summary
+             if nlp_extraction_available:
+                 # Pass LLM config from the run request
                  summary = nlp_processor.generate_analysis_summary(
                      results, # Pass the full results dict
                      initial_query,
@@ -1698,10 +1880,13 @@ def run_analysis(initial_query: str,
                   results["steps"].append({"name": "Orchestrator Error", "status": f"Error: {error_type}", "error_message": error_msg, "duration": round(time.time() - start_run_time, 2)}) # Log duration up to error
 
              # Ensure extracted_data_counts is added to steps if it wasn't already
-             for step_data in results["steps"]:
+             for step_data in results.get("steps", []):
                   if isinstance(step_data, dict) and "extracted_data" in step_data:
-                       if isinstance(step_data.get("extracted_data"), dict):
-                            step_data["extracted_data_counts"] = {k: len(v) for k,v in step_data["extracted_data"].items()}
+                       # Ensure extracted_data_counts is added if it wasn't by the error handler
+                       if "extracted_data_counts" not in step_data:
+                            if isinstance(step_data.get("extracted_data"), dict):
+                                  step_data["extracted_data_counts"] = {k: len(v) for k,v in step_data["extracted_data"].items()}
+                            else: step_data["extracted_data_counts"] = {}
                        del step_data["extracted_data"] # Remove large data from step log
 
 
@@ -1710,7 +1895,7 @@ def run_analysis(initial_query: str,
              # Attempt to save basic error info to sheet if possible
              try:
                  if google_sheets_available:
-                      exc_type, exc_value, exc_traceback = sys.exc_info()
+                      exc_type, exc_value, exc_traceback_obj = sys.exc_info()
                       basic_error_results = {
                          "query": initial_query,
                          "run_duration_seconds": round(time.time() - start_run_time, 2),
@@ -1718,8 +1903,8 @@ def run_analysis(initial_query: str,
                          "error": f"Critical Orchestrator Failure: {type(exc_value).__name__}: {exc_value}",
                          "analysis_summary": "Analysis failed due to critical internal error."
                      }
-                      # Pass empty lists as no data was filtered/prepared
-                      _save_analysis_to_gsheet(basic_error_results, [], [], [], [])
+                      # Pass the initialized lists to _save_analysis_to_gsheet
+                      _save_analysis_to_gsheet(basic_error_results, entities_to_save_to_sheet, risks_to_save_to_sheet, relationships_to_save_to_sheet, exposures_to_save_to_sheet, llm_provider_to_use, llm_model_to_use)
              except Exception as save_e:
                   print(f"CRITICAL ERROR: Failed to save even basic error info to sheets: {save_e}")
                   traceback.print_exc()
@@ -1741,23 +1926,23 @@ def run_analysis(initial_query: str,
              # Remove large data structures from final results to avoid issues with JSON serialization if not needed
              # Example: Remove raw search results or redundant data from step logs
              for step_data in results.get("steps", []):
-                 if isinstance(step_data, dict) and "extracted_data" in step_data:
-                       # Ensure extracted_data_counts is added if it wasn't by the error handler
-                       if "extracted_data_counts" not in step_data:
-                            if isinstance(step_data.get("extracted_data"), dict):
-                                  step_data["extracted_data_counts"] = {k: len(v) for k,v in step_data["extracted_data"].items()}
-                            else: step_data["extracted_data_counts"] = {}
-                       del step_data["extracted_data"] # Remove the large list of data
+                  if isinstance(step_data, dict) and "extracted_data" in step_data:
+                       if isinstance(step_data['extracted_data'], dict):
+                            step_data['extracted_data_counts'] = {k: len(v) for k,v in step_data['extracted_data'].items()}
+                       del step_data["extracted_data"] # Remove large list of data
 
              # Pass the filtered data (now defined in the main try block scope) to the save function
+             # These lists are initialized before the try block, so they are always available
              if google_sheets_available:
-                 # Ensure lists exist even if filtering failed partially by checking locals()
+                 # --- CORRECTED CALL: Removed unnecessary locals() checks ---
                  _save_analysis_to_gsheet(
                      results,
-                     entities_to_save_to_sheet if 'entities_to_save_to_sheet' in locals() else [],
-                     risks_to_save_to_sheet if 'risks_to_save_to_sheet' in locals() else [],
-                     relationships_to_save_to_sheet if 'relationships_to_save_to_sheet' in locals() else [],
-                     exposures_to_save_to_sheet if 'exposures_to_save_to_sheet' in locals() else []
+                     entities_to_save_to_sheet,
+                     risks_to_save_to_sheet,
+                     relationships_to_save_to_sheet,
+                     exposures_to_save_to_sheet, # This list is populated in Step 3.5/5
+                     llm_provider_to_use, # Pass LLM config
+                     llm_model_to_use # Pass LLM config
                  )
              else: print("Skipping save to Google Sheets: Configuration missing or invalid.")
         else:
@@ -1770,6 +1955,19 @@ def run_analysis(initial_query: str,
 
 
     return results
+
+# Check nlp_processor availability at module level for helper functions
+nlp_processor_available = True
+if nlp_processor is None:
+    nlp_processor_available = False
+    print("Warning: nlp_processor module is not available in orchestrator. NLP-dependent features will be disabled.")
+# Check specific functions needed for translation in the save function
+if nlp_processor_available and (not hasattr(nlp_processor, 'translate_text') or not callable(nlp_processor.translate_text)):
+     nlp_processor_available_for_translation = False
+     print("Warning: nlp_processor.translate_text is not available. Translation for sheet saving will be skipped.")
+else:
+     nlp_processor_available_for_translation = nlp_processor_available # If nlp_processor is available and translate_text exists, translation is possible
+
 
 if __name__ == "__main__":
     print("\n--- Running Local Orchestrator Tests ---")
@@ -1800,12 +1998,14 @@ if __name__ == "__main__":
         printable_results = test_run_results.copy()
         if 'linkup_structured_data' in printable_results:
              printable_results['linkup_structured_data_count'] = len(printable_results['linkup_structured_data'])
+             # Optionally truncate or remove details if the list is very long
+             # printable_results['linkup_structured_data_sample'] = printable_results['linkup_structured_data'][:3]
              del printable_results['linkup_structured_data']
         if 'wayback_results' in printable_results:
              printable_results['wayback_results_count'] = len(printable_results['wayback_results'])
              # Optionally truncate or remove details if the list is very long
              # printable_results['wayback_results_sample'] = printable_results['wayback_results'][:3]
-             # del printable_results['wayback_results']
+             del printable_results['wayback_results']
         if 'final_extracted_data' in printable_results:
              # Summarize counts within final_extracted_data
              printable_results['final_extracted_data_counts'] = {
@@ -1817,7 +2017,7 @@ if __name__ == "__main__":
              printable_results['high_risk_exposures_count'] = len(printable_results['high_risk_exposures'])
              # Optionally truncate or remove details if the list is very long
              # printable_results['high_risk_exposures_sample'] = printable_results['high_risk_exposures'][:3]
-             # del printable_results['high_risk_exposures']
+             del printable_results['high_risk_exposures']
 
         # Clean up steps data to show counts rather than full extracted_data lists
         if 'steps' in printable_results:
