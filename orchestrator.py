@@ -807,7 +807,6 @@ def run_analysis(initial_query: str,
 
                  if raw_linkup_structured_data_collected:
                       print(f"[Step 1.5 Structured] Processing {len(raw_linkup_structured_data_collected)} raw structured results.")
-                      # Process the raw structured data into internal format
                       processed_structured = nlp_processor.process_linkup_structured_data(raw_linkup_structured_data_collected, initial_query)
                       # Extend the final extracted data lists
                       if processed_structured.get("entities"): results["final_extracted_data"]["entities"].extend(processed_structured["entities"])
@@ -955,7 +954,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step3_search_results) < max_specific_results and len(step3_search_results) < required_for_threshold:
-            print("[Step 3 Search] Running SerpApi queries...")
+            print("[Step 3 Search] Running Serpapi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step3_all_queries # Use all queries including Chinese ones for Serpapi (especially Baidu)
             for q_idx, query_text in enumerate(queries_for_serpapi):
@@ -1886,7 +1885,7 @@ if __name__ == "__main__":
              printable_results['high_risk_exposures_count'] = len(printable_results['high_risk_exposures'])
              # Optionally truncate or remove details if the list is very long
              # printable_results['high_risk_exposures_sample'] = printable_results['high_risk_exposures'][:3]
-             # del printable_results['high_risk_exposures']
+             del printable_results['high_risk_exposures']
 
         # Clean up steps data to show counts rather than full extracted_data lists
         if 'steps' in printable_results:
