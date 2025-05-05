@@ -535,24 +535,24 @@ def run_analysis(initial_query: str,
             print("[Step 1 Search] Running Google CSE queries...")
             queries_for_google = step1_english_queries
             for q_idx, query_text in enumerate(queries_for_google):
-                if len(step1_search_results) >= max_global_results:
-                     print("Stopping Google CSE search early due to sufficient total results.")
-                     break
-                lang_to_use = None # Let Google detect or use default
-                print(f"  Google Query {q_idx+1}/{len(queries_for_google)}: '{query_text}'")
-                try:
-                    # search_google_official respects num=10 limit internally
-                    raw_results = search_engines.search_google_official(query=query_text, lang=lang_to_use, num=max_global_results);
-                    if raw_results:
-                        print(f"    Google CSE found {len(raw_results)} raw results.")
-                        for r in raw_results:
-                            standardized = search_engines.standardize_result(r, f"google_cse_q{q_idx+1}")
-                            if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
+                 if len(step1_search_results) >= max_global_results:
+                      print("Stopping Google CSE search early due to sufficient total results.")
+                      break
+                 lang_to_use = None # Let Google detect or use default
+                 print(f"  Google Query {q_idx+1}/{len(queries_for_google)}: '{query_text}'")
+                 try:
+                     # search_google_official respects num=10 limit internally
+                     raw_results = search_engines.search_google_official(query=query_text, lang=lang_to_use, num=max_global_results);
+                     if raw_results:
+                         print(f"    Google CSE found {len(raw_results)} raw results.")
+                         for r in raw_results:
+                             standardized = search_engines.standardize_result(r, f"google_cse_q{q_idx+1}")
+                             if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
                                  step1_search_results.append(standardized)
                                  all_search_results_map[standardized['url']] = standardized
-                    else: print("    Google CSE returned no results.")
-                    time.sleep(0.5)
-                except Exception as e: print(f"    Google CSE call failed for query '{query_text}': {type(e).__name__}: {e}"); traceback.print_exc()
+                     else: print("    Google CSE returned no results.")
+                     time.sleep(0.5)
+                 except Exception as e: print(f"    Google CSE call failed for query '{query_text}': {type(e).__name__}: {e}"); traceback.print_exc()
         elif not google_cse_available:
             print("[Step 1 Search] Skipping Google CSE queries - not configured.")
         elif len(step1_search_results) >= search_threshold_results:
@@ -586,7 +586,11 @@ def run_analysis(initial_query: str,
                            else: print(f"    SerpApi {serpapi_engine} returned no results for this query.")
 
                       time.sleep(0.5)
-                 except Exception as e: print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}"); traceback.print_exc()
+                 except Exception as e:
+                      # --- CORRECTED MISSING PARENTHESIS ---
+                      print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
+                      traceback.print_exc()
+
         elif serpapi_available and not config.SERPAPI_KEY:
              print("[Step 1 Search] Skipping Serpapi search - not configured.")
         elif len(step1_search_results) >= search_threshold_results:
@@ -981,7 +985,7 @@ def run_analysis(initial_query: str,
 
         # Check threshold again before running the next engine
         if serpapi_available and len(step3_search_results) < max_specific_results and len(step3_search_results) < required_for_threshold:
-            print("[Step 3 Search] Running SerpApi queries...")
+            print("[Step 3 Search] Running Serpapi queries...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
             queries_for_serpapi = step3_all_queries # Use all queries including Chinese ones for Serpapi (especially Baidu)
             for q_idx, query_text in enumerate(queries_for_serpapi):
@@ -1006,7 +1010,11 @@ def run_analysis(initial_query: str,
                            else: print(f"    SerpApi {serpapi_engine} returned no results for this query.")
 
                       time.sleep(0.5)
-                 except Exception as e: print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}"; traceback.print_exc()
+                 except Exception as e:
+                      # --- CORRECTED MISSING PARENTHESIS ---
+                      print(f"    SerpApi ({serpapi_engine}) call failed for query '{query_text[:50]}...': {type(e).__name__}: {e}") # Added closing parenthesis
+                      traceback.print_exc()
+
         elif serpapi_available and not config.SERPAPI_KEY:
              print("[Step 3 Search] Skipping Serpapi search - not configured.")
         elif len(step3_search_results) >= required_for_threshold:
@@ -1215,18 +1223,18 @@ def run_analysis(initial_query: str,
 
 
         likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
-        print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities.")
+        print(f"[Step 3.5 Exposures] Considering entities and relationships involving {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for Sheet/KG filtering.")
 
 
-        print(f"[Step 3.5 Exposures] Analyzing {len(all_risks_accumulated)} accumulated risks and {len(all_entities_accumulated)} entities.")
+        print(f"[Step 3.5 Exposures] Analyzing {len(all_risks_from_run)} raw risks and {len(all_entities_from_run)} raw entities for Sheet/KG filtering.")
 
         # Identify Regulatory Agencies and Sanctions from the accumulated entities
         # These will be used to identify the 'subject_to' relationships involving Chinese entities
-        all_reg_agency_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
-        all_sanction_names = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+        all_reg_agency_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
+        all_sanction_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
 
         # Also include Regulatory Agencies and Sanctions potentially identified from structured data
-        structured_derived_reg_sanc_entities = {e.get('name','') for e in all_entities_accumulated if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
+        structured_derived_reg_sanc_entities = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('_source_type') == 'linkup_structured' and e.get('type') in ["REGULATORY_AGENCY", "SANCTION"]}
         all_reg_agency_names.update(structured_derived_reg_sanc_entities) # Just lump them here for now, refinement might need specific type check
 
         all_reg_agency_names.discard('')
@@ -1582,7 +1590,7 @@ def run_analysis(initial_query: str,
         # Filter based on presence of Chinese characters as a proxy for "likely Chinese" if country is CN
         # If country is not CN, this filter logic might need adjustment.
         # --- Fix for UnboundLocalError ---
-        # Initialize triggering_chinese_company_org_names_lower_initial if the specific_country_code == 'cn' block is skipped
+        # Initialize triggering_chinese_company_org_names_lower_initial before the if/else block that might use it.
         triggering_chinese_company_org_names_lower_initial: set[str] = set() # Initialize as empty set
 
 
