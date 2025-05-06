@@ -253,7 +253,7 @@ async def search_via_serpapi(query: str, engine: str, country_code: str = 'cn', 
 
 async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, country_code: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Search using Linkup API client with output_type='searchResults' (async).
+    Search using Linkup API client with output_type='searchResults' (async wrapper).
     Accepts a single query string or a list of query strings.
     Maps Linkup results to the standard snippet format expected by NLP.
     Returns all unique results found across executed queries.
@@ -277,7 +277,7 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
     print(f"Executing async Linkup Snippet Search for {len(queries_to_run)} queries (num parameter passed per query: {num}, requested_country_code={country_code})...")
 
     # We can make multiple Linkup calls concurrently for different queries if the SDK supports it.
-    # LinkupClient.search should be async. Let's gather tasks.
+    # Since the underlying client is synchronous, we'll run each search in an executor thread.
     async def _perform_single_linkup_snippet_query(q):
          try:
               print(f"  Linkup Query: '{q[:50]}...'") # Print truncated query
@@ -293,8 +293,10 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
               # country_code is NOT a direct parameter according to previous errors.
               # Country context should ideally be in the query string itself.
 
-              # Assume linkup_client.search is an async method
-              response = await linkup_client.search(**params)
+              # FIX: Wrap the synchronous call in run_in_executor
+              loop = asyncio.get_running_loop()
+              response = await loop.run_in_executor(None, lambda: linkup_client.search(**params))
+
 
               if isinstance(response, LinkupSearchResults) and hasattr(response, 'results') and isinstance(response.results, list):
                    print(f"    Linkup API returned {len(response.results)} results for query '{q[:50]}...'.")
@@ -312,7 +314,7 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
               return [] # Return empty list on error
 
 
-    # Gather all the async query tasks
+    # Gather all the async query tasks (each internally wraps a sync call)
     query_tasks = [_perform_single_linkup_snippet_query(q) for q in queries_to_run]
     # Run them concurrently
     list_of_results_lists = await asyncio.gather(*query_tasks, return_exceptions=True) # Gather results, capture exceptions
@@ -344,7 +346,7 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
 
 async def search_linkup_structured(query: str, structured_output_schema: str, depth: str = "deep", country_code: Optional[str] = None) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
-    Search using Linkup API client with output_type='structured' (async).
+    Search using Linkup API client with output_type='structured' (async wrapper).
     Returns the parsed JSON response (dict or list of dicts) or None on failure.
     """
     if not linkup_search_enabled or linkup_client is None:
@@ -370,8 +372,9 @@ async def search_linkup_structured(query: str, structured_output_schema: str, de
             # Removed country_code and num here as per previous errors
         }
 
-        # Pass the parameters to the async Linkup search method using **params
-        response = await linkup_client.search(**params)
+        # FIX: Wrap the synchronous call in run_in_executor
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: linkup_client.search(**params))
 
         if response is not None:
             # Linkup structured search can return various types.
@@ -612,7 +615,7 @@ async def search_for_ownership_docs(entity_name: str,
                              # Add SerpApi results to the main map
                              all_raw_results_map[standardized['url']] = standardized
 
-              print(f"  Finished SerpApi fallback search. Total unique results now: {len(all_raw_results_map)}")
+              print(f"  Finished Serpapi fallback search. Total unique results now: {len(all_raw_results_map)}")
          else:
               print("  No SerpApi fallback search tasks were added.")
 
