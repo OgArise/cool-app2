@@ -164,9 +164,9 @@ async def _save_analysis_to_gsheet(run_results: Dict,
     if service is None: print("Aborting save: GSheet service unavailable or config missing."); return
 
     # Check NLP availability for translation specifically
-    nlp_available_for_translation = nlp_processor is not None and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text)
+    nlp_available_for_translation = nlp_processor is not None and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text) and asyncio.iscoroutinefunction(nlp_processor.translate_text)
     if not nlp_available_for_translation:
-        print("Warning: NLP processor or translate_text function not available. Chinese entity names in Exposures sheet will not be translated.")
+        print("Warning: NLP processor or translate_text function not available or not async. Chinese entity names in Exposures sheet will not be translated.")
     elif not llm_provider_for_translation or not llm_model_for_translation:
          print("Warning: LLM config for translation is missing. Chinese entity names in Exposures sheet will not be translated.")
          nlp_available_for_translation = False # Disable translation if LLM config is bad
@@ -252,12 +252,12 @@ async def _save_analysis_to_gsheet(run_results: Dict,
                       try:
                            # Await the async translate_text call
                            translated_name = await nlp_processor.translate_text(name_str, 'en', llm_provider_for_translation, llm_model_for_translation)
-                           if translated_name and isinstance(translated_name, str) and translated_name.strip():
+                           if translated_name is not None and isinstance(translated_name, str) and translated_name.strip(): # Check explicitly for None
                                 # Combine translated English with original Chinese in brackets
                                 return f"{translated_name.strip()} ({name_str})"
                            else:
                                 print(f"[Sheet Save] Translation failed for '{name_str}'. Using original.")
-                                return name_str # Use original if translation fails
+                                return name_str # Use original if translation fails or returns None
 
                       except Exception as e:
                            print(f"[Sheet Save] Error during translation for '{name_str}' ({original_field_key}): {type(e).__name__}: {e}. Using original.")
@@ -366,6 +366,12 @@ if nlp_processor is None or not hasattr(nlp_processor, '_get_llm_client_and_mode
      print("Warning: NLP processor module or essential functions not available.")
      nlp_processor_available = False
 
+# Check for required async NLP functions
+required_nlp_funcs_async = ['translate_text', 'translate_snippets', 'translate_keywords_for_context',
+                            'extract_entities_only', 'extract_risks_only', 'link_entities_to_risk',
+                            'extract_relationships_only', 'extract_regulatory_sanction_relationships',
+                            'generate_analysis_summary']
+required_nlp_funcs_sync = ['process_linkup_structured_data'] # This one remains sync for now
 
 # Main analysis function converted to async
 async def run_analysis(initial_query: str,
@@ -424,15 +430,8 @@ async def run_analysis(initial_query: str,
          results["kg_update_status"] = "skipped_module_unavailable"
 
 
-    # Re-check NLP processor availability and essential async functions
+    # Re-check NLP processor availability and essential async/sync functions
     nlp_processor_available = True
-    required_nlp_funcs_async = ['translate_text', 'translate_snippets', 'translate_keywords_for_context',
-                                'extract_entities_only', 'extract_risks_only', 'link_entities_to_risk',
-                                'extract_relationships_only', 'extract_regulatory_sanction_relationships',
-                                'generate_analysis_summary']
-    required_nlp_funcs_sync = ['process_linkup_structured_data'] # This one remains sync for now
-
-
     if nlp_processor is None:
          print("Warning: NLP processor module not available.")
          nlp_processor_available = False
@@ -483,8 +482,11 @@ async def run_analysis(initial_query: str,
 
 
     # Define the threshold for triggering the SerpApi fallback search
-    # Only trigger SerpApi if Linkup + Google CSE combined results are below this threshold
+    # Only trigger Serpapi if Linkup + Google CSE combined results are below this threshold
     serpapi_fallback_threshold = 15
+
+    # FIX: Define the limit for Wayback Machine URLs
+    WAYBACK_URL_LIMIT = 50
 
 
     # Initialize lists here so they are in scope for the finally block
@@ -537,9 +539,15 @@ async def run_analysis(initial_query: str,
 
         if linkup_snippet_search_available:
              print(f"  Adding Linkup snippet search task (broad query: '{initial_query}')")
-             concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=step1_all_queries, num=max_global_results)) # Pass num
+             # search_linkup_snippets handles multiple queries internally and returns a list of results
+             # It no longer accepts num as a parameter to the search call itself
+             linkup_query_combined = f'"{initial_query}" OR {" OR ".join([f'"{q}"' for q in step1_all_queries])}' # Use initial query + variants for broad search
+             # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+             # Based on the implementation, search_linkup_snippets processes multiple queries itself
+             # and might use the num parameter for each.
+             concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=linkup_query_combined, num=max_global_results)) # Pass num
         else:
-             print("  Linkup snippet search not available, skipping task.")
+             print("  Linkup snippet search not available or not async, skipping task.")
 
         if google_cse_available:
             print(f"  Adding Google CSE search tasks ({len(step1_english_queries)} English queries)")
@@ -564,22 +572,25 @@ async def run_analysis(initial_query: str,
                   continue # Skip processing this result list
 
              for r in result_list_or_exc:
-                  # standardize_result handles various formats including LinkupSDK objects and dicts
+                  # standardize_result handles various formats including LinkupSDK objects
                   standardized = search_engines.standardize_result(r, source=f'initial_concurrent') # Generic source for initial concurrent batch
                   if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
-                       step1_search_results.append(standardized) # Add directly to final list for step 1
+                       # We are building a map here first, convert to list at the end
                        all_search_results_map[standardized['url']] = standardized # Store standardized result directly
+
+        # Convert map values to list for Step 1 results
+        step1_search_results = list(all_search_results_map.values()) # Use the map to ensure uniqueness across sources
 
         print(f"[Step 1 Search] Total results from initial concurrent searches (Linkup + Google CSE): {len(step1_search_results)}")
 
 
         # --- SerpApi Fallback Search (Async) ---
-        # Only run SerpApi if the number of results is below the fallback threshold AND SerpApi is available
+        # Only run Serpapi if the number of results is below the fallback threshold AND Serpapi is available
         serpapi_fallback_results = []
         if serpapi_available and len(step1_search_results) < serpapi_fallback_threshold:
-            print(f"[Step 1 Search] Result count ({len(step1_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting SerpApi fallback search...")
+            print(f"[Step 1 Search] Result count ({len(step1_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting Serpapi fallback search...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
-            # Use all query variants for SerpApi fallback
+            # Use all query variants for Serpapi fallback
             serpapi_queries = step1_all_queries
 
             serpapi_fallback_tasks = []
@@ -591,10 +602,10 @@ async def run_analysis(initial_query: str,
                  print(f"  Running {len(serpapi_fallback_tasks)} SerpApi fallback search tasks...")
                  serpapi_fallback_results_lists = await asyncio.gather(*serpapi_fallback_tasks, return_exceptions=True) # Gather results, capture exceptions
 
-                 # Process and deduplicate results from SerpApi
-                 for result_list_or_exc in serpapi_fallback_results_lists:
-                      if isinstance(result_list_or_exc, Exception):
-                           print(f"  Warning: One of the SerpApi fallback search tasks raised an exception: {type(result_list_or_exc).__name__}: {result_list_or_exc}")
+                 # Process and deduplicate results from Serpapi
+                 for results_list_or_exc in serpapi_fallback_results_lists:
+                      if isinstance(results_list_or_exc, Exception):
+                           print(f"  Warning: The Serpapi fallback search task raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
                            traceback.print_exc() # Print traceback for search errors
                            continue # Skip processing this result list
 
@@ -602,28 +613,30 @@ async def run_analysis(initial_query: str,
                            standardized = search_engines.standardize_result(r, source=f'serpapi_{serpapi_engine}_fallback_step1')
                            # standardize_result attempts to set original_language. If not set, default based on engine
                            if standardized and standardized.get('original_language') is None:
-                               # For Baidu, assume Chinese unless it clearly wasn't the search language
-                               if serpapi_engine == 'baidu': standardized['original_language'] = 'zh'
-                               # For Google, it's less certain, can leave as None or default to 'en'
-                               # The NLP translation step will handle non-English snippets anyway.
+                               if serpapi_engine == 'baidu': standardized['original_language'] = 'zh' # Assume Baidu results are Chinese
 
                            if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
-                                # Add SerpApi results to the main step1_search_results list as well
-                                step1_search_results.append(standardized)
+                                # Add Serpapi results to the main map
                                 all_search_results_map[standardized['url']] = standardized
 
-                 print(f"  Finished SerpApi fallback search. Total results for Step 1 now: {len(step1_search_results)}")
+                 # Update step1_search_results from the map after adding SerpApi results
+                 step1_search_results = list(all_search_results_map.values())
+
+                 print(f"  Finished Serpapi fallback search. Total results for Step 1 now: {len(step1_search_results)}")
             else:
-                 print("  No SerpApi fallback search tasks were added.")
+                 print("  No Serpapi fallback search tasks were added.")
 
         elif serpapi_available:
             print(f"[Step 1 Search] Skipping Serpapi fallback. Initial concurrent searches yielded {len(step1_search_results)} results (>= {serpapi_fallback_threshold} threshold).")
         elif not serpapi_available:
-            print("[Step 1 Search] Serpapi fallback search not available, skipping.")
+            print("[Step 1 Search] SerpApi fallback search not available, skipping.")
 
 
         # Step 1 search results are now finalized (Linkup + Google CSE + optional SerpApi fallback)
+        # Ensure step1_search_results is unique based on the map at the end of all searches for this step
+        step1_search_results = list(all_search_results_map.values())
         print(f"[Step 1 Search] Total standardized results for Step 1 after all searches & deduplication: {len(step1_search_results)}")
+
 
         # --- Step 1 Snippet Translation (Async) ---
         snippets_to_translate_step1 = []
@@ -854,10 +867,10 @@ async def run_analysis(initial_query: str,
 
         print(f"\n--- Running Step 2: Translating Keywords ---")
         step2_start = time.time()
-        # Await the async keyword translation
+        # Await the async keyword generation
         if nlp_processor_available and hasattr(nlp_processor, 'translate_keywords_for_context') and callable(nlp_processor.translate_keywords_for_context) and asyncio.iscoroutinefunction(nlp_processor.translate_keywords_for_context):
              translated_keywords = await nlp_processor.translate_keywords_for_context(
-                  initial_query, f"{specific_search_context} relevant for {specific_country_code}",
+                  initial_query, global_search_context,
                   llm_provider_to_use, llm_model_to_use
                   )
         if not translated_keywords: translated_keywords = [initial_query]
@@ -895,7 +908,7 @@ async def run_analysis(initial_query: str,
         step3_english_queries_web = list(set([q.strip() for q in step3_english_queries_web if q.strip()])) # Deduplicate
 
         step3_chinese_queries = []
-        # Await async translation if needed
+        # Await the async translation if needed
         if nlp_processor_available and hasattr(nlp_processor, 'translate_text') and callable(nlp_processor.translate_text) and asyncio.iscoroutinefunction(nlp_processor.translate_text) and specific_country_code.lower() == 'cn':
             print("[Step 3 Search] Translating queries to Chinese for Baidu search...")
             translate_tasks = []
@@ -920,9 +933,15 @@ async def run_analysis(initial_query: str,
 
         if linkup_snippet_search_available:
              print(f"  Adding Linkup snippet search task (specific queries)")
-             concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=step3_all_queries, num=max_specific_results)) # Pass num
+             # search_linkup_snippets handles multiple queries internally and returns a list of results
+             # It no longer accepts num as a parameter to the search call itself
+             linkup_query_combined_specific = f'"{specific_query_base}" OR {" OR ".join([f'"{q}"' for q in step3_all_queries])}' # Use specific query + variants for search
+             # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+             # Based on the implementation, search_linkup_snippets processes multiple queries itself
+             # and might use the num parameter for each.
+             concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=linkup_query_combined_specific, num=max_specific_results)) # Pass num
         else:
-             print("  Linkup snippet search not available, skipping task.")
+             print("  Linkup snippet search not available or not async, skipping task.")
 
         if google_cse_available:
             print(f"  Adding Google CSE search tasks ({len(step3_english_queries_web)} English country-specific queries)")
@@ -949,19 +968,22 @@ async def run_analysis(initial_query: str,
              for r in result_list_or_exc:
                   standardized = search_engines.standardize_result(r, source=f'specific_concurrent') # Generic source for specific concurrent batch
                   if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
-                       step3_search_results.append(standardized) # Add directly to final list for step 3
+                       # We are building a map here first, convert to list at the end
                        all_search_results_map[standardized['url']] = standardized # Store standardized result directly
 
-        print(f"[Step 3 Search] Total results from initial concurrent searches (Linkup + Google CSE): {len(step3_search_results)}")
+        # Convert map values to list for Step 3 results
+        step3_search_results = list(all_search_results_map.values()) # Use the map to ensure uniqueness across sources
+
+        print(f"[Step 3 Search] Total results from initial concurrent specific searches (Linkup + Google CSE): {len(step3_search_results)}")
 
 
         # --- SerpApi Fallback Search (Async) ---
-        # Only run SerpApi if the number of results is below the fallback threshold AND SerpApi is available
+        # Only run Serpapi if the number of results is below the fallback threshold AND Serpapi is available
         serpapi_fallback_results_step3 = []
         if serpapi_available and len(step3_search_results) < serpapi_fallback_threshold:
-            print(f"[Step 3 Search] Result count ({len(step3_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting SerpApi fallback search...")
+            print(f"[Step 3 Search] Result count ({len(step3_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting Serpapi fallback search...")
             serpapi_engine = 'baidu' if specific_country_code.lower() == 'cn' else 'google'
-            # Use all query variants (including Chinese) for SerpApi fallback
+            # Use all query variants for Serpapi fallback (including Chinese)
             serpapi_queries = step3_all_queries
 
             serpapi_fallback_tasks_step3 = []
@@ -973,10 +995,10 @@ async def run_analysis(initial_query: str,
                  print(f"  Running {len(serpapi_fallback_tasks_step3)} SerpApi fallback search tasks...")
                  serpapi_fallback_results_lists_step3 = await asyncio.gather(*serpapi_fallback_tasks_step3, return_exceptions=True) # Gather results, capture exceptions
 
-                 # Process and deduplicate results from SerpApi
-                 for result_list_or_exc in serpapi_fallback_results_lists_step3:
-                      if isinstance(result_list_or_exc, Exception):
-                           print(f"  Warning: One of the SerpApi fallback search tasks raised an exception: {type(result_list_or_exc).__name__}: {result_list_or_exc}")
+                 # Process and deduplicate results from Serpapi
+                 for results_list_or_exc in serpapi_fallback_results_lists_step3:
+                      if isinstance(results_list_or_exc, Exception):
+                           print(f"  Warning: The Serpapi fallback search task raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
                            traceback.print_exc() # Print traceback for search errors
                            continue # Skip processing this result list
 
@@ -987,22 +1009,26 @@ async def run_analysis(initial_query: str,
                                if serpapi_engine == 'baidu': standardized['original_language'] = 'zh' # Assume Baidu results are Chinese
 
                            if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_search_results_map:
-                                # Add SerpApi results to the main step3_search_results list as well
-                                step3_search_results.append(standardized)
+                                # Add Serpapi results to the main map
                                 all_search_results_map[standardized['url']] = standardized
 
-                 print(f"  Finished SerpApi fallback search. Total results for Step 3 now: {len(step3_search_results)}")
+                 # Update step3_search_results from the map after adding SerpApi results
+                 step3_search_results = list(all_search_results_map.values())
+
+                 print(f"  Finished Serpapi fallback search. Total results for Step 3 now: {len(step3_search_results)}")
             else:
-                 print("  No SerpApi fallback search tasks were added.")
+                 print("  No Serpapi fallback search tasks were added.")
 
         elif serpapi_available:
             print(f"[Step 3 Search] Skipping Serpapi fallback. Initial concurrent searches yielded {len(step3_search_results)} results (>= {serpapi_fallback_threshold} threshold).")
         elif not serpapi_available:
-            print("[Step 3 Search] Serpapi fallback search not available, skipping.")
-
+            print("[Step 3 Search] SerpApi fallback search not available, skipping.")
 
         # Step 3 search results are now finalized (Linkup + Google CSE + optional SerpApi fallback)
+        # Ensure step3_search_results is unique based on the map at the end of all searches for this step
+        step3_search_results = list(all_search_results_map.values())
         print(f"[Step 3 Search] Total standardized results for Step 3 after all searches & deduplication: {len(step3_search_results)}")
+
 
         # --- Step 3 Snippet Translation (Async) ---
         snippets_to_translate_step3 = []
@@ -1319,7 +1345,7 @@ async def run_analysis(initial_query: str,
                            consolidated_exposures[relationship_exposure_key]["Explanation_Details"].add(detail_string)
 
                       if isinstance(risk.get('severity'), str) and risk.get('severity') in ["HIGH", "SEVERE"]:
-                           # Update severity if the current risk is higher
+                           # Update severity if the current severity is lower than the risk severity
                            current_severity = consolidated_exposures[relationship_exposure_key]["Risk_Severity"]
                            severity_order = ["LOW", "MEDIUM", "HIGH", "SEVERE"]
                            if severity_order.index(risk['severity']) > severity_order.index(current_severity):
@@ -1348,6 +1374,7 @@ async def run_analysis(initial_query: str,
                                 consolidated_exposures[relationship_exposure_key]["Risk_Severity"] = "HIGH" # At least High
                            # Check if the entity2 is a SANCTION node explicitly for Severe
                            subject_to_entity_name_lower = subject_to_entity_name.lower()
+                           # Check if the entity2 object exists and has type SANCTION (using all_entities_accumulated)
                            subject_to_entity_obj = next((e for e in all_entities_accumulated if isinstance(e, dict) and e.get('name','') and e['name'].lower() == subject_to_entity_name_lower), None)
                            if subject_to_entity_obj and subject_to_entity_obj.get('type') == "SANCTION":
                                 if severity_order.index("SEVERE") > severity_order.index(consolidated_exposures[relationship_exposure_key]["Risk_Severity"]):
@@ -1445,6 +1472,12 @@ async def run_analysis(initial_query: str,
 
         urls_to_check = list(set(all_snippet_urls_combined + list(structured_data_urls) + list(exposure_source_urls))) # Combine and deduplicate all unique URLs
 
+        # FIX: Apply the limit to the number of URLs checked via Wayback Machine
+        if WAYBACK_URL_LIMIT is not None and WAYBACK_URL_LIMIT > 0:
+            urls_to_check = urls_to_check[:WAYBACK_URL_LIMIT]
+            print(f"[Step 4 Wayback] Limiting Wayback checks to {WAYBACK_URL_LIMIT} URLs.")
+
+
         wayback_checks = []
         if wayback_available:
             print(f"[Step 4 Wayback] Checking {len(urls_to_check)} URLs via Wayback Machine asynchronously...");
@@ -1454,20 +1487,54 @@ async def run_analysis(initial_query: str,
                      # Schedule async wayback check task
                      wayback_tasks.append(search_engines.check_wayback_machine(url))
                 # Await all wayback tasks concurrently
-                wayback_checks = await asyncio.gather(*wayback_tasks)
+                wayback_checks = await asyncio.gather(*wayback_tasks, return_exceptions=True) # Gather results, capture exceptions
+
+                # Process exceptions from wayback checks
+                processed_wayback_checks = []
+                for res in wayback_checks:
+                    if isinstance(res, Exception):
+                        print(f"  Warning: A Wayback check task raised an exception: {type(res).__name__}: {res}")
+                        # Optionally log the traceback for the specific failed check
+                        # traceback.print_exc()
+                        # Add a placeholder error entry for this check
+                        processed_wayback_checks.append({"status": "error", "message": f"Check failed: {type(res).__name__}", "original_url": "N/A"}) # Original URL might be lost here
+                    elif isinstance(res, dict):
+                         processed_wayback_checks.append(res) # Add valid check result
+                    else:
+                         print(f"  Warning: Unexpected result type from Wayback check task: {type(res)}. Result: {res}")
+                         processed_wayback_checks.append({"status": "error", "message": f"Unexpected result type: {type(res).__name__}", "original_url": "N/A"})
+
+                wayback_checks = processed_wayback_checks # Use the processed list
+
 
                 print(f"Finished checking {len(urls_to_check)} URLs via Wayback Machine.")
             else: print("[Step 4 Wayback] No URLs found to check.")
         else:
-             print("[Step 4 Wayback] Skipping Wayback Machine check: search_engines.check_wayback_machine not available.")
+             print("[Step 4 Wayback] Skipping Wayback Machine check: search_engines.check_wayback_machine not available or not async.")
              wayback_checks = [{"status": "skipped", "message": "check_wayback_machine not available", "original_url": "N/A"}] # Add placeholder if skipped
 
         results["wayback_results"] = wayback_checks
         # Update status based on whether checks were attempted and successful
-        wayback_status = "OK" if wayback_checks and not any(chk.get("status", "").startswith("Error") or chk.get("status") == "skipped_invalid_url" for chk in wayback_checks) else "Error/Skipped"
-        if not wayback_checks: wayback_status = "No URLs to Check"
+        # Count how many checks were *not* skipped or had errors
+        successful_wayback_checks_count = sum(1 for chk in wayback_checks if chk.get("status") in ["found", "not_found"]) # 'not_found' is still a successful check
+        error_wayback_checks_count = sum(1 for chk in wayback_checks if chk.get("status", "").startswith("Error") or chk.get("status") == "skipped_invalid_url")
+        skipped_wayback_checks_count = sum(1 for chk in wayback_checks if chk.get("status") == "skipped")
+
+
+        wayback_status = "OK"
+        if skipped_wayback_checks_count == len(wayback_checks) and len(urls_to_check) > 0:
+             wayback_status = "Skipped" # Skipped all when there were URLs to check
+        elif error_wayback_checks_count > 0:
+             wayback_status = f"Error ({error_wayback_checks_count})"
+        elif len(urls_to_check) > 0 and successful_wayback_checks_count == 0:
+             wayback_status = "No Results Found" # Attempted checks but found no archives/errors
+
+        if not urls_to_check:
+             wayback_status = "No URLs to Check"
+
 
         results["steps"].append({ "name": "Wayback Machine Check", "duration": round(time.time() - step4_start, 2), "urls_checked": len(urls_to_check), "status": wayback_status })
+
 
         print(f"\n--- Running Step 5: Prepare Data for Sheet & KG Update (Synchronous) ---")
         step5_prep_start = time.time()
@@ -1697,8 +1764,8 @@ async def run_analysis(initial_query: str,
         # Use the FINAL, accumulated data for the summary
         final_data_for_summary = results.get("final_extracted_data", {})
         exposures_for_summary_count = len(results.get("high_risk_exposures", [])) # Use the count of generated exposures
-        structured_data_list = results.get("linkup_structured_data", [])
-        structured_data_present = bool(structured_data_list)
+        structured_raw_data_list = results.get("linkup_structured_data", [])
+        structured_data_present = bool(structured_raw_data_list)
 
         print(f"[Step 5.5 Summary] Data for summary: E:{len(final_data_for_summary.get('entities',[]))}, R:{len(final_data_for_summary.get('risks',[]))}, Rel:{len(final_data_for_summary.get('relationships',[]))}, Exp:{exposures_for_summary_count}, Structured:{structured_data_present}.")
 
@@ -1708,7 +1775,7 @@ async def run_analysis(initial_query: str,
                  "entities": final_data_for_summary.get("entities", []),
                  "risks": final_data_for_summary.get("risks", []),
                  "relationships": final_data_for_summary.get("relationships", []),
-                 "linkup_structured_data": structured_data_list,
+                 "linkup_structured_data": structured_raw_data_list,
                  "high_risk_exposures": results.get("high_risk_exposures", []) # Include exposures for summary context
              }
              # Await the async summary generation
@@ -1797,8 +1864,8 @@ async def run_analysis(initial_query: str,
                          "error": f"Critical Orchestrator Failure: {type(exc_value).__name__}: {exc_value}",
                          "analysis_summary": "Analysis failed due to critical internal error."
                      }
-                      # Pass empty lists and LLM config to the now async save function
-                      # Check if llm_provider_to_use and llm_model_to_use are defined before passing
+                      # Pass empty lists as no data was filtered/prepared
+                      # Pass the LLM config for translation, even if translation didn't happen
                       _save_analysis_to_gsheet_task = None
                       if 'llm_provider_to_use' in locals() and 'llm_model_to_use' in locals():
                          _save_analysis_to_gsheet_task = _save_analysis_to_gsheet(basic_error_results, [], [], [], [], llm_provider_to_use, llm_model_to_use)

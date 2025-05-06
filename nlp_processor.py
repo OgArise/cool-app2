@@ -52,6 +52,9 @@ DEFAULT_LLM_CONCURRENCY_LIMIT = 5 # Limit concurrent LLM calls
 # Initialize the semaphore
 LLM_SEMAPHORE = asyncio.Semaphore(DEFAULT_LLM_CONCURRENCY_LIMIT)
 
+# FIX: Define allowed_entity_types globally so it's accessible to multiple functions
+ALLOWED_ENTITY_TYPES = ["COMPANY", "ORGANIZATION", "REGULATORY_AGENCY", "SANCTION"]
+
 
 def _get_llm_client_and_model(provider: str, model_name: str):
     """Initializes and returns the LLM client and effective model name. Checks for library availability."""
@@ -315,7 +318,7 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
                         raw_content = None # Treat as empty response
 
                 except Exception as e_google:
-                    print(f"--- [{function_name}] ERROR Google AI call: {type(e_google).__name__}: {e_google} ---")
+                    print(f"--- [{function_name}] ERROR during async Google AI call: {type(e_google).__name__}: {e_google} ---")
                     traceback.print_exc()
                     api_error = e_google
                     raw_content = None
@@ -553,6 +556,7 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
     is_suspiciously_short = len(cleaned_content) < max(len(text) * 0.1, 5) # Too short (less than 10% of original, or less than 5 chars)
     is_only_fillers = len(words_in_response) < 5 and any(re.search(r'\b' + re.escape(word) + r'\b', cleaned_content.lower()) for word in conversational_only_phrases) # Very few words AND contain fillers
 
+
     if not cleaned_content or is_pure_filler or is_suspiciously_short or is_only_fillers:
         print(f"Warning: Translation response short/empty/conversational: '{cleaned_content[:100]}...' for text '{text[:50]}...'.")
         return None
@@ -708,7 +712,8 @@ Begin analysis of text snippets:
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_entities = []
-    allowed_entity_types = ["COMPANY", "ORGANIZATION", "REGULATORY_AGENCY", "SANCTION"]
+    # Use the globally defined ALLOWED_ENTITY_TYPES
+    # allowed_entity_types = ["COMPANY", "ORGANIZATION", "REGULATORY_AGENCY", "SANCTION"] # Removed local definition
     # Add a simple check to filter common country names if they are tagged as REGULATORY_AGENCY by mistake
     common_country_names_lower = {"united states", "us", "china", "cn", "united kingdom", "uk", "germany", "de", "india", "in", "france", "fr", "japan", "jp", "canada", "ca", "australia", "au"} # Add more as needed
     # Add known broad non-Chinese organizations that might be misidentified as companies or regulators
@@ -729,7 +734,8 @@ Begin analysis of text snippets:
              entity_type = entity.get("type")
              entity_mentions = entity.get("mentions")
 
-             if entity_name and isinstance(entity_name, str) and entity_type in allowed_entity_types and \
+             # Use the global ALLOWED_ENTITY_TYPES here
+             if entity_name and isinstance(entity_name, str) and entity_type in ALLOWED_ENTITY_TYPES and \
                 isinstance(entity_mentions, list) and entity_mentions and all(isinstance(m, str) for m in entity_mentions):
 
                  entity_name_lower = entity_name.lower()
@@ -752,7 +758,7 @@ Begin analysis of text snippets:
          print(f"--- [{function_name}] Failed to parse valid 'entities' list from LLM response. Parsed content type: {type(parsed_json.get('entities')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
-    print(f"--- [{function_name}] Returning {len(validated_entities)} validated entities ({', '.join(allowed_entity_types)} only). ---")
+    print(f"--- [{function_name}] Returning {len(validated_entities)} validated entities ({', '.join(ALLOWED_ENTITY_TYPES)} only). ---")
     return validated_entities
 
 # Extraction functions using _call_llm_and_parse_json now need to be async
@@ -1042,7 +1048,6 @@ Begin analysis of text snippets:
     # Ensure parsed_json is a dictionary and contains the 'relationships' key which is a list
     relationships_list_from_llm = parsed_json.get("relationships", []) if isinstance(parsed_json, dict) else []
 
-
     if isinstance(relationships_list_from_llm, list):
         for rel in relationships_list_from_llm:
              # Ensure the item is a dictionary before checking keys
@@ -1310,7 +1315,7 @@ Begin analysis of text snippets:
                            if e1_type not in ["COMPANY", "ORGANIZATION"] or e2_type not in ["SANCTION", "REGULATORY_AGENCY"]: is_valid_rel_type = False
                       elif r_type_upper == "MENTIONED_WITH":
                           # MENTIONED_WITH can be between any of the allowed entity types
-                          if e1_type not in allowed_entity_types or e2_type not in allowed_entity_types: is_valid_rel_type = False
+                          if e1_type not in ALLOWED_ENTITY_TYPES or e2_type not in ALLOWED_ENTITY_TYPES: is_valid_rel_type = False # Use global list
 
 
                       if is_valid_rel_type:
@@ -1382,11 +1387,11 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
              # This looks like the raw structured content dict itself
              structured_data_content = result_item # The data is the item itself
              # Try to infer schema name from keys
-             if result_item.get("ownership_relationships") is not None: schema_name = "ownership"
-             elif result_item.get("key_risks_identified") is not None: schema_name = "key_risks"
-             elif result_item.get("actions_found") is not None: schema_name = "regulatory_actions" # Assuming this key for a hypothetical schema
+             if structured_data_content.get("ownership_relationships") is not None: schema_name = "ownership"
+             elif structured_data_content.get("key_risks_identified") is not None: schema_name = "key_risks"
+             elif structured_data_content.get("actions_found") is not None: schema_name = "regulatory_actions" # Assuming this key for a hypothetical schema
              else: schema_name = "unknown_structured" # Fallback
-             entity_name_context = result_item.get("company_name", result_item.get("regulator_name", "Unknown Entity")) # Try getting entity name from content
+             entity_name_context = structured_data_content.get("company_name", structured_data_content.get("regulator_name", "Unknown Entity")) # Try getting entity name from content
 
         else:
              print(f"Warning: Skipping invalid structured result item format (doesn't match known structured formats): {result_item}")
@@ -1517,7 +1522,7 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
         #                       for affected_entity_name in affected_entities:
         #                            if affected_entity_name and isinstance(affected_entity_name, str):
         #                                 # Relationship: Company SUBJECT_TO Sanction
-        #                                 processed_relationships.append({"entity1": target_entity_name.strip(), "relationship_type": "SUBJECT_TO", "entity2": reg_name.strip(), "context_urls": [source_url] if source_url and isinstance(source_url, str) else [], "_source_type": "linkup_structured"})
+        #                                 processed_relationships.append({"entity1": affected_entity_name.strip(), "relationship_type": "SUBJECT_TO", "entity2": reg_name.strip(), "context_urls": [source_url] if source_url and isinstance(source_url, str) else [], "_source_type": "linkup_structured"})
         #                                 # Can also add a risk related to this entity and sanction
         #                                 # internal_risk = {
         #                                 #      "description": f"Subject to sanction: {sanc_name.strip()}",
