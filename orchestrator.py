@@ -73,19 +73,8 @@ if config:
               print(f"ERROR parsing GCP JSON from config: {e}")
               SERVICE_ACCOUNT_INFO = None
     elif config.GOOGLE_SHEET_ID:
-         print("Warning: GCP_SERVICE_ACCOUNT_JSON_STR environment variable not set or empty, but GOOGLE_SHEET_ID is. Google Sheets saving will be disabled.")
-
-    DEFAULT_PROVIDER = "openai"
-    DEFAULT_MODEL = config.DEFAULT_OPENAI_MODEL if config and hasattr(config, 'DEFAULT_OPENAI_MODEL') else "gpt-4o-mini"
-    FALLBACK_LLM_CONFIG = (DEFAULT_PROVIDER, DEFAULT_MODEL)
-
-    if config and (getattr(config, 'OPENAI_API_KEY', None) or getattr(config, 'OPENROUTER_API_KEY', None) or getattr(config, 'GOOGLE_AI_API_KEY', None)):
-         if DEFAULT_PROVIDER == "openai" and not getattr(config, 'OPENAI_API_KEY', None):
-              if getattr(config, 'OPENROUTER_API_KEY', None) and hasattr(config, 'DEFAULT_OPENROUTER_MODEL'): FALLBACK_LLM_CONFIG = ("openrouter", config.DEFAULT_OPENROUTER_MODEL)
-              elif getattr(config, 'GOOGLE_AI_API_KEY', None) and hasattr(config, 'DEFAULT_GOOGLE_AI_MODEL'): FALLBACK_LLM_CONFIG = ("google_ai", config.DEFAULT_GOOGLE_AI_MODEL)
-
-    if FALLBACK_LLM_CONFIG == (None, None):
-         print("ERROR: No valid default LLM configuration found. Automation script will not be able to run queries if LLM columns in sheet are empty.")
+         print("Warning: GCP_SERVICE_SERVICE_ACCOUNT_JSON_STR environment variable not set or empty, but GOOGLE_SHEET_ID is. Google Sheets saving will be disabled.")
+    # ... (rest of config processing)
 
 # The overall availability depends on library available AND configured credentials are valid
 google_sheets_available = google_sheets_library_available and google_sheets_configured
@@ -481,7 +470,7 @@ async def run_analysis(initial_query: str,
     search_engines_available_any = google_cse_available or serpapi_available or linkup_snippet_search_available or linkup_structured_search_available # Check availability of at least one search method
 
 
-    # Define the threshold for triggering the SerpApi fallback search
+    # Define the threshold for triggering the Serpapi fallback search
     # Only trigger Serpapi if Linkup + Google CSE combined results are below this threshold
     serpapi_fallback_threshold = 15
 
@@ -543,17 +532,12 @@ async def run_analysis(initial_query: str,
              # It no longer accepts num as a parameter to the search call itself
              # FIX: Build the OR joined string separately to avoid f-string syntax error
              queries_to_join = [f'"{q}"' for q in step1_all_queries if q] # Ensure queries are not empty strings
-             if queries_to_join:
-                 queries_joined_for_linkup = " OR ".join(queries_to_join)
-                 # linkup_query_combined = f'"{initial_query}" OR {queries_joined_for_linkup}' # Original problem line
-                 linkup_query_combined = f'({queries_joined_for_linkup})' # Simpler query for Linkup using all variants
+             linkup_query_combined = initial_query # Default Linkup query is just the initial query
 
-                 # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
-                 # Based on the implementation, search_linkup_snippets processes multiple queries itself
-                 # and might use the num parameter for each.
-                 concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=linkup_query_combined, num=max_global_results)) # Pass num
-             else:
-                  print("  No valid queries to join for Linkup snippet search task, skipping.")
+             if queries_to_join: # Only join if there are actual queries beyond the initial one
+                 linkup_query_combined = f'"{initial_query}" OR {" OR ".join(queries_to_join)}'
+
+             concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=linkup_query_combined, num=max_global_results)) # Pass num
         else:
              print("  Linkup snippet search not available or not async, skipping task.")
 
@@ -945,15 +929,14 @@ async def run_analysis(initial_query: str,
              # It no longer accepts num as a parameter to the search call itself
              # FIX: Build the OR joined string separately to avoid f-string syntax error
              queries_to_join_specific = [f'"{q}"' for q in step3_all_queries if q] # Ensure queries are not empty strings
-             if queries_to_join_specific:
-                  queries_joined_for_linkup_specific = " OR ".join(queries_to_join_specific)
-                  linkup_query_combined_specific = f'({queries_joined_for_linkup_specific})' # Use specific query + variants for search
-                  # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
-                  # Based on the implementation, search_linkup_snippets processes multiple queries itself
-                  # and might use the num parameter for each.
-                  concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=linkup_query_combined_specific, num=max_specific_results)) # Pass num
-             else:
-                  print("  No valid queries to join for Linkup snippet search task, skipping.")
+             linkup_query_combined_specific = specific_query_base # Default is just the specific query base
+             if queries_to_join_specific: # Only join if there are actual queries beyond the base
+                 linkup_query_combined_specific = f'"{specific_query_base}" OR {" OR ".join(queries_to_join_specific)}'
+
+             # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+             # Based on the implementation, search_linkup_snippets processes multiple queries itself
+             # and might use the num parameter for each.
+             concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=linkup_query_combined_specific, num=max_specific_results)) # Pass num
         else:
              print("  Linkup snippet search not available or not async, skipping task.")
 
@@ -991,7 +974,7 @@ async def run_analysis(initial_query: str,
         print(f"[Step 3 Search] Total results from initial concurrent specific searches (Linkup + Google CSE): {len(step3_search_results)}")
 
 
-        # --- SerpApi Fallback Search (Async) ---
+        # --- Serpapi Fallback Search (Async) ---
         # Only run Serpapi if the number of results is below the fallback threshold AND SerpApi is available
         serpapi_fallback_results_step3 = []
         if serpapi_available and len(step3_search_results) < serpapi_fallback_threshold:
@@ -1036,9 +1019,9 @@ async def run_analysis(initial_query: str,
         elif serpapi_available:
             print(f"[Step 3 Search] Skipping Serpapi fallback. Initial concurrent searches yielded {len(step3_search_results)} results (>= {serpapi_fallback_threshold} threshold).")
         elif not serpapi_available:
-            print("[Step 3 Search] SerpApi fallback search not available, skipping.")
+            print("[Step 3 Search] Serpapi fallback search not available, skipping.")
 
-        # Step 3 search results are now finalized (Linkup + Google CSE + optional SerpApi fallback)
+        # Step 3 search results are now finalized (Linkup + Google CSE + optional Serpapi fallback)
         # Ensure step3_search_results is unique based on the map at the end of all searches for this step
         step3_search_results = list(all_search_results_map.values())
         print(f"[Step 3 Search] Total standardized results for Step 3 after all searches & deduplication: {len(step3_search_results)}")
@@ -1147,7 +1130,6 @@ async def run_analysis(initial_query: str,
         if step3_extracted_data["risks"]: results["final_extracted_data"]["risks"].extend(step3_extracted_data["risks"])
         if step3_extracted_data["relationships"]: results["final_extracted_data"]["relationships"].extend(step3_extracted_data["relationships"])
 
-
         results["steps"].append({ "name": f"Specific Search ({specific_country_code}) & Snippet Extraction", "duration": round(time.time() - step3_start, 2), "search_results_count": len(step3_search_results), "extracted_data_counts": {k: len(v) for k,v in step3_extracted_data.items()}, "status": "OK" if step3_search_results else "No Results/Error" })
 
 
@@ -1187,7 +1169,7 @@ async def run_analysis(initial_query: str,
             if isinstance(rel, dict)
             and rel.get('relationship_type') == "SUBJECT_TO"
             and isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) # Ensure both entity names are strings
-            and rel.get('entity1').lower() in likely_chinese_company_org_names_lower # Entity1 is a Chinese Company/Org
+            and rel.get('entity1').lower() == triggering_company_name_lower # Entity1 is a Chinese Company/Org
             and rel.get('entity2').lower() in chinese_reg_sanc_names_lower # Entity2 is a Chinese Regulator/Sanction
         ]
         companies_subject_to_names_lower = {rel['entity1'].strip().lower() for rel in companies_subject_to_reg_sanc_rels}
@@ -1554,20 +1536,21 @@ async def run_analysis(initial_query: str,
         step5_prep_start = time.time()
 
         # --- Filtering Logic (Moved here from _save_analysis_to_gsheet) ---
-        all_entities_from_run = results.get("final_extracted_data", {}).get("entities", [])
-        all_risks_from_run = results.get("final_extracted_data", {}).get("risks", [])
-        all_relationships_from_run = results.get("final_extracted_data", {}).get("relationships", [])
-        all_exposures_from_run = results.get("high_risk_exposures", []) # Use the list generated in step 3.5
+        all_entities_from_raw = results.get("final_extracted_data", {}).get("entities", []) # Use raw data for filtering
+        all_risks_from_raw = results.get("final_extracted_data", {}).get("risks", [])       # Use raw data for filtering
+        all_relationships_from_raw = list(results.get("final_extracted_data", {}).get("relationships", [])) # Use raw data for filtering
+        all_exposures_from_generation = results.get("high_risk_exposures", []) # Use the list generated in step 3.5
+
 
         # Recalculate likely Chinese company/org names based on ALL accumulated entities
         # This is crucial for filtering consistently across sheets and KG
-        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]} # Added potential other types for completeness in Chinese list
+        likely_chinese_company_org_names = {e.get('name','') for e in all_entities_from_raw if isinstance(e, dict) and e.get('name') and e.get('type') in ["COMPANY", "ORGANIZATION", "ORGANIZATION_NON_PROFIT", "GOVERNMENT_BODY"]} # Added potential other types for completeness in Chinese list
         likely_chinese_company_org_names_lower = {name.lower() for name in likely_chinese_company_org_names}
         print(f"[Step 5 Prep] Identified {len(likely_chinese_company_org_names_lower)} likely Chinese Company/Organization entities for filtering.")
 
         # Identify Chinese Regulatory Agencies and Sanctions based on filtering rules for sheet/KG
-        chinese_reg_agency_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
-        chinese_sanction_names = {e.get('name','') for e in all_entities_from_run if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
+        chinese_reg_agency_names = {e.get('name','') for e in all_entities_from_raw if isinstance(e, dict) and e.get('name') and e.get('type') == "REGULATORY_AGENCY"}
+        chinese_sanction_names = {e.get('name','') for e in all_entities_from_raw if isinstance(e, dict) and e.get('name') and e.get('type') == "SANCTION"}
 
         chinese_reg_agency_names_lower = {name.lower() for name in chinese_reg_agency_names}
         chinese_sanction_names_lower = {name.lower() for name in chinese_sanction_names}
@@ -1575,8 +1558,7 @@ async def run_analysis(initial_query: str,
 
         # Filter entities for the sheet/KG: ONLY Entities identified as likely Chinese Companies/Organizations,
         # AND ONLY Regulatory Agencies and Sanctions identified as likely Chinese (simplified check).
-        # Initialize lists here so they are populated by the loop for the finally block
-        entities_to_save_to_sheet = []
+        entities_to_save_to_sheet = [] # Initialize lists for filtered data
         # List of common known non-Chinese regulators/sanctions/orgs/countries for filtering
         common_non_chinese_entities_lower = {
             "sec", "securities and exchange commission", "ofac", "office of foreign assets control",
@@ -1587,7 +1569,7 @@ async def run_analysis(initial_query: str,
         } # Added more country/org names that might be misidentified
 
 
-        for e in all_entities_from_run:
+        for e in all_entities_from_raw:
             if isinstance(e, dict) and e.get('name'):
                  entity_name = e.get('name')
                  entity_name_lower = entity_name.lower()
@@ -1620,23 +1602,26 @@ async def run_analysis(initial_query: str,
                  # else: print(f"[Step 5 Prep] Filtering out entity '{entity_name}' with type '{entity_type}' not explicitly allowed for sheet/KG save.")
 
 
-        # Filter risks: only save risks that are related to at least one Chinese Company/Organization entity
+        # Filter risks: only save risks that are related to at least one Chinese Company/Organization entity that will be SAVED
+        # Need to use the *filtered* list of entities for linking risks
+        entity_names_that_will_be_saved_lower = {e.get('name','').lower() for e in entities_to_save_to_sheet if isinstance(e, dict) and e.get('name')}
+
         risks_to_save_to_sheet = [
-            r for r in all_risks_from_run
+            r for r in all_risks_from_raw
             if isinstance(r, dict) and r.get('description')
-            and any(isinstance(entity_name, str) and entity_name.lower() in likely_chinese_company_org_names_lower for entity_name in r.get('related_entities', []))
+            and any(isinstance(entity_name, str) and entity_name.strip().lower() in entity_names_that_will_be_saved_lower for entity_name in r.get('related_entities', [])) # Use the filtered names here
         ]
 
         # Filter relationships: Only include relationships where BOTH entities were deemed worthy of saving to the Entity sheet/KG
         relationships_to_save_to_sheet = []
         # Rebuild the set of entity names that *will* be saved based on the filtering above
-        entity_names_that_will_be_saved_lower = {e.get('name','').lower() for e in entities_to_save_to_sheet if isinstance(e, dict) and e.get('name')}
+        # entity_names_that_will_be_saved_lower is already defined above
 
         # Updated allowed relationship types for the Relationships sheet (Removing ACQUIRED, RELATED_COMPANY as requested)
         allowed_sheet_rel_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER", "REGULATED_BY", "ISSUED_BY", "SUBJECT_TO", "MENTIONED_WITH"]
 
 
-        for rel in all_relationships_from_run:
+        for rel in all_relationships_from_raw:
             if isinstance(rel, dict) and rel.get('entity1') and rel.get('relationship_type') and rel.get('entity2'):
                  e1_name = rel.get('entity1'); e2_name = rel.get('entity2'); r_type_raw = rel.get('relationship_type')
                  if isinstance(r_type_raw, str) and isinstance(e1_name, str) and isinstance(e2_name, str):
@@ -1657,12 +1642,25 @@ async def run_analysis(initial_query: str,
 
         # Filter exposures: The list results["high_risk_exposures"] already contains only exposures matching the specified criteria from Step 3.5
         # So, we just need to assign it to the variable used for saving.
-        exposures_to_save_to_sheet = list(results.get("high_risk_exposures", []))
+        # Note: The Exposures list generated in Step 3.5 is already filtered based on triggers involving Chinese Co/Org entities
+        # and relationships *in the raw data*. If you want exposures to only cover entities/relationships that *passed* Step 5 filtering,
+        # you would need to regenerate or filter the exposures list *after* Step 5.
+        # For now, keeping the exposures generated in Step 3.5 as the list to save.
+        exposures_to_save_to_sheet = all_exposures_from_generation
 
 
         print(f"[Step 5 Prep] Finished filtering data: Entities:{len(entities_to_save_to_sheet)}, Risks:{len(risks_to_save_to_sheet)}, Relationships:{len(relationships_to_save_to_sheet)}, Exposures:{len(exposures_to_save_to_sheet)}.")
 
-        results["steps"].append({"name": "Prepare Data for Sheet & KG", "duration": round(time.time() - step5_prep_start, 2), "filtered_counts": {"entities": len(entities_to_save_to_sheet), "risks": len(risks_to_save_to_sheet), "relationships": len(relationships_to_save_to_sheet), "exposures": len(exposures_to_save_to_sheet)}, "status": "OK"})
+        # FIX: Update results["final_extracted_data"] to hold the FILTERED data
+        results["final_extracted_data"] = {
+            "entities": entities_to_save_to_sheet,
+            "risks": risks_to_save_to_sheet,
+            "relationships": relationships_to_save_to_sheet,
+        }
+        # Keep the exposures list separate as it's a different structure than entities/risks/rels
+        results["high_risk_exposures"] = exposures_to_save_to_sheet # Ensure results exposures is also the filtered list
+
+        results["steps"].append({"name": "Prepare Data for Sheet & KG", "duration": round(time.time() - step5_prep_start, 2), "filtered_counts": {k: len(v) for k,v in results["final_extracted_data"].items()}, "exposures_count": len(results["high_risk_exposures"]), "status": "OK"})
 
 
         print(f"\n--- Running Step 5.1: Knowledge Graph Update (Synchronous) ---") # Renamed to 5.1 as prep is 5.0
@@ -1672,10 +1670,12 @@ async def run_analysis(initial_query: str,
 
         # Only attempt KG update if driver is available and update function exists
         if kg_driver_available and kg_driver is not None and hasattr(knowledge_graph, 'update_knowledge_graph') and callable(knowledge_graph.update_knowledge_graph):
-            # Deduplication logic
+            # Deduplication logic is applied to the data *to be saved*
             unique_entities_dict = {}
-            # Use the already filtered list for KG entities
-            entities_for_kg = entities_to_save_to_sheet
+            entities_for_kg = results["final_extracted_data"].get("entities", []) # Use the FILTERED list
+            risks_for_kg = results["final_extracted_data"].get("risks", []) # Use the FILTERED list
+            relationships_for_kg = results["final_extracted_data"].get("relationships", []) # Use the FILTERED list
+
 
             for e in entities_for_kg:
                  if isinstance(e, dict) and e.get('name') and e.get('type'):
@@ -1693,13 +1693,10 @@ async def run_analysis(initial_query: str,
 
             unique_relationships_dict = {}
             # Use the already filtered list for KG relationships
-            relationships_for_kg = relationships_to_save_to_sheet
 
             # Note: The KG update function itself already filters by allowed types and checks node labels,
-            # so this filtering step here is partially redundant with KG's internal checks,
-            # but it aligns the data sent to KG with the data saved to the sheet.
-            # No need to explicitly list allowed_rel_types here, KG update function handles that check internally.
-
+            # so this deduplication step here is partially redundant with KG's internal checks,
+            # but it aligns the data sent to KG with the data saved to the sheet and the summary.
 
             for r in relationships_for_kg:
                  if isinstance(r, dict) and isinstance(r.get('entity1'), str) and isinstance(r.get('relationship_type'), str) and isinstance(r.get('entity2'), str):
@@ -1725,7 +1722,6 @@ async def run_analysis(initial_query: str,
 
             unique_risks_dict = {}
             # Use the already filtered list for KG risks
-            risks_for_kg = risks_to_save_to_sheet
 
             for r in risks_for_kg:
                  if isinstance(r, dict) and isinstance(r.get('description'), str):
@@ -1775,30 +1771,25 @@ async def run_analysis(initial_query: str,
         print(f"\n--- Running Step 5.5: Generating Analysis Summary (Async) ---")
         step5_5_start = time.time()
         summary = "Summary generation skipped or failed."
-        # Use the FINAL, accumulated data for the summary
+        # Use the FINAL, FILTERED data for the summary (now stored in results["final_extracted_data"])
         final_data_for_summary = results.get("final_extracted_data", {})
-        exposures_for_summary_count = len(results.get("high_risk_exposures", [])) # Use the count of generated exposures
-        structured_raw_data_list = results.get("linkup_structured_data", [])
+        exposures_for_summary_list = results.get("high_risk_exposures", []) # Use the FILTERED exposures list
+        exposures_for_summary_count = len(exposures_for_summary_list)
+        structured_raw_data_list = results.get("linkup_structured_data", []) # Still use raw structured data for summary context
         structured_data_present = bool(structured_raw_data_list)
 
         print(f"[Step 5.5 Summary] Data for summary: E:{len(final_data_for_summary.get('entities',[]))}, R:{len(final_data_for_summary.get('risks',[]))}, Rel:{len(final_data_for_summary.get('relationships',[]))}, Exp:{exposures_for_summary_count}, Structured:{structured_data_present}.")
 
-        # Check if there is ANY data collected before attempting summary
+        # Check if there is ANY data collected before attempting summary (use filtered counts)
         if final_data_for_summary.get("entities") or final_data_for_summary.get("risks") or final_data_for_summary.get("relationships") or exposures_for_summary_count > 0 or structured_data_present:
-             summary_data_payload = {
-                 "entities": final_data_for_summary.get("entities", []),
-                 "risks": final_data_for_summary.get("risks", []),
-                 "relationships": final_data_for_summary.get("relationships", []),
-                 "linkup_structured_data": structured_raw_data_list,
-                 "high_risk_exposures": results.get("high_risk_exposures", []) # Include exposures for summary context
-             }
-             # Await the async summary generation
+             # summary_data_payload is not needed as we pass the results dict directly
+             # Use the filtered counts for generating the summary text internally within the NLP function
              if nlp_processor_available and hasattr(nlp_processor, 'generate_analysis_summary') and callable(nlp_processor.generate_analysis_summary) and asyncio.iscoroutinefunction(nlp_processor.generate_analysis_summary):
-                 # Pass the full results dictionary here
+                 # Pass the results dict (which now contains FILTERED data in final_extracted_data)
                  summary = await nlp_processor.generate_analysis_summary(
-                     results, # Pass the full results dict
+                     results, # Pass the results dict
                      initial_query,
-                     exposures_for_summary_count,
+                     exposures_for_summary_count, # Pass the count from the filtered list
                      llm_provider_to_use,
                      llm_model_to_use
                      )
@@ -1926,15 +1917,16 @@ async def run_analysis(initial_query: str,
                             step_data["extracted_data_counts"] = {k: len(v) for k,v in step_data["extracted_data"].items()}
                        del step_data["extracted_data"] # Remove large list of data
 
-             # Pass the filtered data (now defined in the main try block scope) to the save function
+             # Pass the filtered data (now stored in results["final_extracted_data"]) to the async save function
              # Also pass the LLM config for translation
              if google_sheets_available:
                  _save_analysis_to_gsheet_task = None
                  # Ensure filtered lists are defined before passing (handle case where error occurred early)
-                 _entities = entities_to_save_to_sheet if 'entities_to_save_to_sheet' in locals() else []
-                 _risks = risks_to_save_to_sheet if 'risks_to_save_to_sheet' in locals() else []
-                 _relationships = relationships_to_save_to_sheet if 'relationships_to_save_to_sheet' in locals() else []
-                 _exposures = exposures_to_save_to_sheet if 'exposures_to_save_to_sheet' in locals() else []
+                 # These lists are now the values in results["final_extracted_data"] and results["high_risk_exposures"]
+                 _entities = results["final_extracted_data"].get("entities", [])
+                 _risks = results["final_extracted_data"].get("risks", [])
+                 _relationships = results["final_extracted_data"].get("relationships", [])
+                 _exposures = results.get("high_risk_exposures", []) # Exposures are handled separately
 
                  # Ensure llm_provider_to_use and llm_model_to_use are defined before passing
                  _llm_provider_for_save = llm_provider_to_use if 'llm_provider_to_use' in locals() else "unknown"
@@ -2004,34 +1996,41 @@ if __name__ == "__main__":
             print("\n--- Test Run Results ---")
             # Print results nicely, but avoid printing huge lists directly
             printable_results = test_run_results.copy()
-            if 'linkup_structured_data' in printable_results:
-                 printable_results['linkup_structured_data_count'] = len(printable_results['linkup_structured_data'])
-                 del printable_results['linkup_structured_data']
+            # FIX: These counts should now match the filtered data in final_extracted_data
+            # Use the counts already present in the results dict from Step 5Prep/main_api
+            # if 'linkup_structured_data' in printable_results: # Removed raw list from UI response
+            #      printable_results['linkup_structured_data_count'] = len(printable_results['linkup_structured_data'])
+            #      del printable_results['linkup_structured_data']
             if 'wayback_results' in printable_results:
+                 # The UI receives the limited list, so len is correct
                  printable_results['wayback_results_count'] = len(printable_results['wayback_results'])
                  # Optionally truncate or remove details if the list is very long
                  # printable_results['wayback_results_sample'] = printable_results['wayback_results'][:3]
-                 # del printable_results['wayback_results']
+                 # del printable_results['wayback_results'] # Kept limited list in UI response
+            # FIX: final_extracted_data now contains filtered data in results dict sent to UI
             if 'final_extracted_data' in printable_results:
-                 # Summarize counts within final_extracted_data
+                 # Summarize counts from the filtered lists
                  printable_results['final_extracted_data_counts'] = {
                      k: len(v) for k, v in printable_results['final_extracted_data'].items()
                  }
-                 # Optionally remove the full lists if they are large
-                 # del printable_results['final_extracted_data']
+                 # Optionally remove the full lists if they are large (UI now expects counts + exposures list)
+                 del printable_results['final_extracted_data']
+            # FIX: high_risk_exposures now contains the filtered list in results dict sent to UI
             if 'high_risk_exposures' in printable_results:
+                 # UI receives the list, so len is correct
                  printable_results['high_risk_exposures_count'] = len(printable_results['high_risk_exposures'])
-                 # Optionally truncate or remove details if the list is very long
-                 # printable_results['high_risk_exposures_sample'] = printable_results['high_risk_exposures'][:3]
-                 del printable_results['high_risk_exposures']
+                 # The UI needs the list for the table, so don't delete the original list
+                 # del printable_results['high_risk_exposures'] # Removed deletion
+
 
             # Clean up steps data to show counts rather than full extracted_data lists
             if 'steps' in printable_results:
                  for step in printable_results['steps']:
                       if isinstance(step, dict) and 'extracted_data' in step:
-                           if isinstance(step['extracted_data'], dict):
+                           # These counts should already be in 'extracted_data_counts' added in Step 5Prep
+                           if isinstance(step.get('extracted_data'), dict): # Check if it's a dict before accessing keys
                                 step['extracted_data_counts'] = {k: len(v) for k,v in step['extracted_data'].items()}
-                           del step['extracted_data']
+                           del step['extracted_data'] # Remove large list of data
 
 
             print(json.dumps(printable_results, indent=2))

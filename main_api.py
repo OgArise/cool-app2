@@ -66,7 +66,7 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
     Returns a summary of the analysis results, including exposures, but not all raw extracted data.
     """
     print(f"Received analysis request for query: '{request.query}'")
-    print(f"LLM Config received from UI: Provider={request.llm_provider}, Model={request.llm_model}")
+    print(f"LLM Config received from UI: Provider=request.llm_provider, Model=request.llm_model")
 
     if not request.llm_provider or not request.llm_model:
          raise HTTPException(status_code=400, detail="Missing required LLM configuration in request (provider, model).")
@@ -86,6 +86,7 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
 
         # --- Prepare the subset of results to return to the UI ---
         # Extract necessary data from the full results dictionary
+        # These counts now reflect the filtered data from orchestrator's Step 5
         extracted_data_counts = {
             "entities": len(full_results.get("final_extracted_data", {}).get("entities", [])),
             "risks": len(full_results.get("final_extracted_data", {}).get("risks", [])),
@@ -99,12 +100,12 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
             "run_duration_seconds": full_results.get("run_duration_seconds"),
             "analysis_summary": full_results.get("analysis_summary", "Summary could not be generated or analysis failed early."), # Default message matches UI expectation
             "kg_update_status": full_results.get("kg_update_status", "not_run"),
-            "high_risk_exposures": full_results.get("high_risk_exposures", []), # Return the list of exposures
+            "high_risk_exposures": full_results.get("high_risk_exposures", []), # Return the list of exposures (which is now the filtered list)
             "backend_error": full_results.get("error"), # Return the backend error message if any
             "steps": full_results.get("steps", []), # Return the steps details
-            "extracted_data_counts": extracted_data_counts, # Return counts
-            "linkup_structured_data_count": len(full_results.get("linkup_structured_data", [])), # Return count
-            "wayback_results_count": len(full_results.get("wayback_results", [])), # Return count
+            "extracted_data_counts": extracted_data_counts, # Return counts (now filtered counts)
+            "linkup_structured_data_count": len(full_results.get("linkup_structured_data", [])), # Return count of raw structured items
+            "wayback_results_count": len(full_results.get("wayback_results", [])), # Return count of wayback results (limited list)
         }
 
         # If the orchestrator reported an error, return a 500 HTTP status code

@@ -544,7 +544,7 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
     cleaned_content = cleaned_content.strip()
 
 
-    # FIX: Refined conversational filler check for translation specifically
+    # FIX: Use the refined conversational and short checks for translation specifically
     # Check if the entire response looks like only conversational fillers or is too short/empty
     conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "translate", "based on the text", "hello", "hi", "greetings"]
     # Check if the entire cleaned response (case-insensitive, stripped) is one of the filler phrases
@@ -641,11 +641,9 @@ def _prepare_context_text(search_results: List[Dict[str, Any]]) -> Tuple[str, in
 
         translation_info = ""
         if translated_from:
-             # Indicate if it was translated and from which language
              translation_info = f" (Translated from {translated_from})"
         # Check if original_lang is a string AND not English AND it hasn't been translated
         elif isinstance(original_lang, str) and original_lang.lower() not in ['en', 'english'] and not translated_from:
-             # Indicate original language if known and not English (and not translated)
              translation_info = f" (Original Language: {original_lang})"
 
 
@@ -1257,11 +1255,8 @@ Relationship Types:
 
 Focus ONLY on relationships where BOTH entity1 and entity2 are from the provided list of identified entities.
 The relationship_type MUST be one of: REGULATED_BY, ISSUED_BY, SUBJECT_TO, or MENTIONED_WITH.
-Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. No explanations or markdown.
+Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
 
-Begin analysis of text snippets:
-{context_text}
-"""
     # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
@@ -1569,7 +1564,7 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
         #                  if sanc_name and target_entities and isinstance(sanc_name, str) and isinstance(target_entities, list):
         #                       for target_entity_name in target_entities:
         #                            if target_entity_name and isinstance(target_entity_name, str):
-        #                                 # Relationship: Company/Org SUBJECT_TO Sanction
+        #                                 # Relationship: Company SUBJECT_TO Sanction
         #                                 processed_relationships.append({"entity1": target_entity_name.strip(), "relationship_type": "SUBJECT_TO", "entity2": sanc_name.strip(), "context_urls": [source_url] if source_url and isinstance(source_url, str) else [], "_source_type": "linkup_structured"})
         #                                 # Can also add a risk related to this entity and sanction
         #                                 # internal_risk = {
@@ -1613,18 +1608,26 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
          return f"Summary generation skipped due to LLM client error: {type(e).__name__}"
 
 
-    # Use the full results dict passed in
+    # Use the FILTERED data from the results dict passed in
     entities = results.get("final_extracted_data", {}).get("entities", [])
     risks = results.get("final_extracted_data", {}).get("risks", [])
     relationships = results.get("final_extracted_data", {}).get("relationships", [])
+    # Exposures list is also taken from the results dict, and is the filtered list
+    exposures_list = results.get("high_risk_exposures", [])
+    exposures_count_filtered = len(exposures_list) # Use the count of the filtered list
+
+    # Structured raw data is still used for summary context, even if it didn't contribute to final filtered data
     structured_raw_data_list = results.get("linkup_structured_data", [])
-    exposures_list = results.get("high_risk_exposures", []) # Get the actual list of exposures
+    structured_data_present = bool(structured_raw_data_list)
+
+    # Use the FILTERED counts for the summary log
+    print(f"[Step 5.5 Summary] Data for summary (FILTERED): E:{len(entities)}, R:{len(risks)}, Rel:{len(relationships)}, Exp:{exposures_count_filtered}, Structured:{structured_data_present}.")
 
 
-    if not any([entities, risks, relationships, exposures_count > 0, structured_raw_data_list]): return "No significant data extracted or exposures identified to generate a summary."
+    if not any([entities, risks, relationships, exposures_count_filtered > 0, structured_data_present]): return "No significant data extracted or exposures identified across steps to generate a summary."
     summary_parts = []
     if entities:
-        # Include new entity types in summary count/list
+        # Include new entity types in summary count/list (based on FILTERED entities)
         company_count = len([e for e in entities if isinstance(e, dict) and e.get('type') == 'COMPANY'])
         org_count = len([e for e in entities if isinstance(e, dict) and e.get('type') == 'ORGANIZATION'])
         reg_agency_count = len([e for e in entities if isinstance(e, dict) and e.get('type') == 'REGULATORY_AGENCY'])
@@ -1635,7 +1638,7 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
         if reg_agency_count: entity_types_summary.append(f"{reg_agency_count} Regulatory Agencies")
         if sanction_count: entity_types_summary.append(f"{sanction_count} Sanctions")
 
-        # Include a sample of entity names, prioritizing Companies/Orgs involved in exposures if possible
+        # Include a sample of entity names (from FILTERED entities)
         sample_entity_names = []
         exposed_entity_names = {exp.get('Entity','') for exp in exposures_list if isinstance(exp, dict) and exp.get('Entity')}
         # Add exposed entities first
@@ -1656,15 +1659,16 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
 
 
     if risks:
+        # Risk counts based on FILTERED risks
         high_risks = [r for r in risks if isinstance(r, dict) and r.get('severity') in ['HIGH', 'SEVERE']]
         med_risks = [r for r in risks if isinstance(r, dict) and r.get('severity') == 'MEDIUM']
         low_risks = [r for r in risks if isinstance(r, dict) and r.get('severity') == 'LOW']
         risk_summary = f"- Risks ({len(risks)} total): {len(high_risks)} High/Severe, {len(med_risks)} Medium, {len(low_risks)} Low."
 
-        # Include sample risk descriptions, prioritizing High/Severe risks linked to exposed entities
+        # Include sample risk descriptions (from FILTERED risks)
         sample_risk_descriptions = []
+        # Find High/Severe risks linked to exposed entities (using names from FILTERED exposures)
         exposed_entity_names_lower = {name.lower() for name in exposed_entity_names}
-        # Find High/Severe risks linked to exposed entities
         relevant_high_severe_risks = [r for r in high_risks if any(isinstance(e_name, str) and e_name.lower() in exposed_entity_names_lower for e_name in r.get('related_entities', []))]
         for r in relevant_high_severe_risks:
              if isinstance(r.get('description'), str):
@@ -1693,19 +1697,19 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
 
 
     if relationships:
-        # Count relationship types relevant to sheet/KG (excluding those explicitly filtered)
+        # Count relationship types relevant to sheet/KG (based on FILTERED relationships)
         # Use the allowed types defined in orchestrator for sheet saving
         allowed_sheet_rel_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER", "REGULATED_BY", "ISSUED_BY", "SUBJECT_TO", "MENTIONED_WITH"]
 
-        relevant_rels = [r for r in relationships if isinstance(r, dict) and r.get('relationship_type') in allowed_sheet_rel_types]
+        # relevant_rels = [r for r in relationships if isinstance(r, dict) and r.get('relationship_type') in allowed_sheet_rel_types] # Relationships are already filtered
 
         ownership_types = ["PARENT_COMPANY_OF", "SUBSIDIARY_OF", "AFFILIATE_OF", "JOINT_VENTURE_PARTNER"]
         reg_sanc_types = ["REGULATED_BY", "ISSUED_BY", "SUBJECT_TO"]
         mentioned_type = ["MENTIONED_WITH"]
 
-        ownership_rels_count = len([r for r in relevant_rels if r.get('relationship_type') in ownership_types])
-        reg_sanc_rels_count = len([r for r in relevant_rels if r.get('relationship_type') in reg_sanc_types])
-        mentioned_rels_count = len([r for r in relevant_rels if r.get('relationship_type') in mentioned_type])
+        ownership_rels_count = len([r for r in relationships if r.get('relationship_type') in ownership_types]) # Count from filtered list
+        reg_sanc_rels_count = len([r for r in relationships if r.get('relationship_type') in reg_sanc_types]) # Count from filtered list
+        mentioned_rels_count = len([r for r in relationships if r.get('relationship_type') in mentioned_type]) # Count from filtered list
 
         rel_types_summary = []
         if ownership_rels_count: rel_types_summary.append(f"{ownership_rels_count} Ownership/Affiliate/JV")
@@ -1713,11 +1717,11 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
         if mentioned_rels_count: rel_types_summary.append(f"{mentioned_rels_count} Mentioned With")
 
 
-        # Include sample relationships, prioritizing those involving exposed entities
+        # Include sample relationships (from FILTERED relationships)
         sample_rels = []
-        # Find relationships involving exposed entities
+        # Find relationships involving exposed entities (using names from FILTERED exposures)
         exposed_entity_names_lower = {name.lower() for name in exposed_entity_names}
-        relevant_rels_for_exposed = [rel for rel in relevant_rels if any(isinstance(e_name, str) and e_name.lower() in exposed_entity_names_lower for e_name in [rel.get('entity1',''), rel.get('entity2','')] )]
+        relevant_rels_for_exposed = [rel for rel in relationships if any(isinstance(e_name, str) and e_name.lower() in exposed_entity_names_lower for e_name in [rel.get('entity1',''), rel.get('entity2','')] )]
         for rel in relevant_rels_for_exposed:
              if isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) and isinstance(rel.get('relationship_type'), str):
                   if len(sample_rels) < 3: # Limit sample size
@@ -1725,7 +1729,7 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
                   else: break
         # Add other relevant relationships if sample isn't full
         if len(sample_rels) < 3:
-             for rel in relevant_rels:
+             for rel in relationships:
                   if isinstance(rel.get('entity1'), str) and isinstance(rel.get('entity2'), str) and isinstance(rel.get('relationship_type'), str) and rel not in relevant_rels_for_exposed:
                        if len(sample_rels) < 3:
                              sample_rels.append(f"{rel['entity1'].strip()} {rel['relationship_type'].replace('_', ' ').title()} {rel['entity2'].strip()}")
@@ -1733,19 +1737,19 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
 
 
         rel_list_str = "; ".join(sample_rels)
-        if len(relevant_rels) > 3: rel_list_str += "..."
-        if rel_types_summary: summary_parts.append(f"- Relationships ({len(relevant_rels)} total: {', '.join(rel_types_summary)}): " + rel_list_str + ".")
-        elif rel_list_str: summary_parts.append(f"- Relationships ({len(relevant_rels)}): " + rel_list_str + ".")
+        if len(relationships) > 3: rel_list_str += "..."
+        if rel_types_summary: summary_parts.append(f"- Relationships ({len(relationships)} total: {', '.join(rel_types_summary)}): " + rel_list_str + ".")
+        elif rel_list_str: summary_parts.append(f"- Relationships ({len(relationships)}): " + rel_list_str + ".")
 
 
-    if exposures_count > 0:
-         # Include sample exposures in the summary
+    if exposures_count_filtered > 0: # Use filtered count
+         # Include sample exposures in the summary (from FILTERED list)
          sample_exposures = []
-         for exp in exposures_list[:2]: # Sample first 2 exposures
+         for exp in exposures_list[:2]: # Sample first 2 exposures from the filtered list
               if isinstance(exp, dict) and exp.get('Entity'):
                    exp_summary = f"'{exp['Entity'].strip()}' ({exp.get('Risk_Type','?').replace(' Risk','')}, {exp.get('Risk_Severity','?')})" # Use cleaned Risk_Type label
                    sample_exposures.append(exp_summary)
-         exposure_summary = f"- Identified {exposures_count} potential High/Severe Risk Exposures linked to Chinese Companies/Orgs via Ownership/Affiliate/JV relationships."
+         exposure_summary = f"- Identified {exposures_count_filtered} potential High/Severe Risk Exposures linked to Chinese Companies/Orgs via Ownership/Affiliate/JV relationships." # Use filtered count in text
          if sample_exposures: exposure_summary += f" (Examples: {'; '.join(sample_exposures)})"
          summary_parts.append(exposure_summary)
 
@@ -1816,7 +1820,7 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
             words_in_response = [word.strip() for word in cleaned_content.split() if word.strip()]
             is_only_fillers = len(words_in_response) < 5 and any(re.search(r'\b' + re.escape(word) + r'\b', cleaned_content.lower()) for word in conversational_only_phrases) # Very few words AND contain fillers
 
-            is_too_short = len(cleaned_content) < 50 # Check minimum length for a summary
+            is_too_short = len(cleaned_summary) < 50 # Check minimum length for a summary
 
 
             if not cleaned_summary or is_pure_filler or is_too_short or is_only_fillers:
@@ -1834,281 +1838,92 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
         return f"Could not generate summary due to error: {type(e).__name__}"
 
 if __name__ == "__main__":
-    # Basic async test execution block
-    async def async_test_suite():
-        print("\n--- Running Local Async NLP Processor Tests ---")
-        print("NOTE: Local testing requires LLM API keys in .env.")
-        provider_to_test = None; model_to_test = None
-        import config
-        # Need to import search_engines for the local test to run fully
-        try:
-            import search_engines
-            search_engines_available_nlp_test = True
-        except ImportError:
-            search_engines = None
-            search_engines_available_nlp_test = False
-            print("Warning: search_engines.py not available. Limited NLP tests.")
+    # Main execution block needs to run the async orchestrator
+    async def main_test_run():
+        print("\n--- Running Local Orchestrator Tests ---")
+        print("NOTE: Requires LLM API keys and search API keys in .env.")
+        print("Ensure Neo4j is running if KG update is enabled.")
+        print("Ensure Google Sheets is configured if saving is enabled.")
 
+        test_query = "Corporate tax evasion cases in China 2023"
+        test_country = "cn"
 
-        # Determine provider based on configured keys, preferring OpenRouter if available
-        if config and config.OPENROUTER_API_KEY: provider_to_test = "openrouter"; model_to_test = config.DEFAULT_OPENROUTER_MODEL; print("--> Testing with OpenRouter")
-        elif config and config.OPENAI_API_KEY: provider_to_test = "openai"; model_to_test = config.DEFAULT_OPENAI_MODEL; print("--> Testing with OpenAI")
-        elif config and config.GOOGLE_AI_API_KEY: provider_to_test = "google_ai"; model_to_test = config.DEFAULT_GOOGLE_AI_MODEL; print("--> Testing with Google AI")
-
-        if not provider_to_test: print("No LLM API keys configured. Exiting tests.")
+        test_llm_provider = "openai"
+        # Ensure config is loaded for default model
+        if config:
+            test_llm_model = config.DEFAULT_OPENAI_MODEL if hasattr(config, 'DEFAULT_OPENAI_MODEL') else "gpt-4o-mini"
         else:
-            # Initialize LLM client once for testing and check availability
-            try:
-                 # No need to await here, _get_llm_client_and_model is sync
-                 test_client, test_client_type, test_model_used = _get_llm_client_and_model(provider_to_test, model_to_test)
-                 if test_client is None:
-                      print("Failed to initialize LLM client for testing. Exiting tests.")
-                      provider_to_test = None
-                 else:
-                    print(f"Successfully initialized LLM: {test_client_type} / {test_model_used}")
-            except Exception as e:
-                 print(f"Failed to initialize LLM client for testing: {e}. Exiting tests.")
-                 traceback.print_exc()
-                 provider_to_test = None
+            test_llm_model = "gpt-4o-mini"
 
 
-        # Only run tests if provider is available and search_engines module is available for relevant functions
-        if provider_to_test and search_engines_available_nlp_test and \
-           hasattr(search_engines, 'standardize_result') and callable(search_engines.standardize_result):
+        print(f"\nRunning analysis for query: '{test_query}' in country: '{test_country}'")
 
-
-            print("\nTesting async Keyword Translation...")
-            # Pass provider/model to the function call and await
-            kws = await translate_keywords_for_context("supply chain compliance issues 2023", "Baidu search in China", provider_to_test, model_to_test); print(f"Keywords: {kws}"); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nTesting async Text Translation (English to Chinese)...")
-            test_english_text = "Hello, world! This is a test snippet."
-            # Pass provider/model to the function call and await
-            translated_chinese = await translate_text(test_english_text, 'zh', provider_to_test, model_to_test)
-            print(f"Original: {test_english_text}\nTranslated (Chinese): {translated_chinese}"); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nTesting async Text Translation (Chinese to English)...")
-            test_chinese_text = "你好，世界！这是一个测试片段。"
-            # Pass provider/model to the function call and await
-            translated_english = await translate_text(test_chinese_text, 'en', provider_to_test, model_to_test)
-            print(f"Original: {test_chinese_text}\nTranslated (English): {translated_english}"); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nTesting async Snippet Translation (Chinese to English)...")
-            test_snippets_zh = [
-                 {"title": "中文新闻标题", "url": "https://example.com/zh1", "snippet": "这是一段中文测试文本，关于公司合规。", "source": "serpapi_baidu", "original_language": "zh"},
-                 {"title": "另一篇中文文章", "url": "https://example.com/zh2", "snippet": "中国公司受到新环境法规的影响。", "source": "linkup_snippet_step1", "original_language": "zh"},
-                 # Add an English one to test it's not translated
-                 {"title": "English Article", "url": "https://example.com/en1", "snippet": "This is an English test snippet.", "source": "google_cse", "original_language": "en"}
-            ]
-            # Pass provider/model to the function call and await
-            translated_snippets_list = await translate_snippets(test_snippets_zh, 'en', provider_to_test, model_to_test)
-            print("\nTranslated Snippets:")
-            print(json.dumps(translated_snippets_list, indent=2)); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nTesting async Multi-Call Data Extraction & Linking (using sample snippets including translated)...")
-            # Combine original and translated snippets for extraction test
-            sample_results_combined = translated_snippets_list # translated_snippets_list already includes originals if translation failed
-            all_test_snippets_map_combined = {r['url']: r for r in sample_results_combined if isinstance(r, dict) and r.get('url')} # Use map from translated list
-
-
-            test_context = "financial sector compliance, regulatory actions, and sanctions"
-
-            print("\nExtracting Entities (COMPANY, ORGANIZATION, REGULATORY_AGENCY, SANCTION) from Combined/Translated Snippets...")
-            # Pass provider/model to the function call and await
-            test_entities = await extract_entities_only(sample_results_combined, test_context, provider_to_test, model_to_test);
-            print("\nExtracted Entities:")
-            print(json.dumps(test_entities, indent=2)); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nExtracting Risks (Initial) from Combined/Translated Snippets...")
-            # Pass provider/model to the function call and await
-            test_risks_initial = await extract_risks_only(sample_results_combined, test_context, provider_to_test, model_to_test);
-            print("\nExtracted Risks (Initial):")
-            print(json.dumps(test_risks_initial, indent=2)); time.sleep(1) # Use sync sleep in test
-
-
-            print("\nLinking Entities to Risks (using filtered entity names and the combined map)...")
-            # Use only entities from the validated list with names for linking
-            test_entity_names = [e['name'] for e in test_entities if isinstance(e, dict) and e.get('name')]
-            test_risks_linked = [];
-            if test_risks_initial and test_entity_names:
-                # Pass provider/model to the function call, the combined map, and await
-                test_risks_linked = await link_entities_to_risk(test_risks_initial, test_entity_names, all_test_snippets_map_combined, provider_to_test, model_to_test);
-                print("\nRisks after Linking:")
-                print(json.dumps(test_risks_linked, indent=2))
-            else:
-                print("\nSkipping async entity linking (no initial risks or entities with names).")
-                test_risks_linked = test_risks_initial # Return initial risks if linking skipped
-            time.sleep(1) # Use sync sleep in test
-
-
-            print("\nExtracting Relationships (Ownership only) from Combined/Translated Snippets...")
-            # Use only Company and Organization entities from the validated list for ownership relationships
-            test_entities_company_org = [e for e in test_entities if isinstance(e, dict) and e.get('type') in ["COMPANY", "ORGANIZATION"]]
-            test_relationships_ownership = [];
-            if test_entities_company_org:
-                # Pass provider/model to the function call and the combined list of snippets, and await
-                test_relationships_ownership = await extract_relationships_only(sample_results_combined, test_context, test_entities_company_org, provider_to_test, model_to_test);
-                print("\nExtracted Relationships (Ownership/Affiliate/JV only):")
-                print(json.dumps(test_relationships_ownership, indent=2))
-            else:
-                print("\nSkipping ownership relationship extraction.")
-            time.sleep(1) # Use sync sleep in test
-
-
-            print("\nExtracting Regulatory/Sanction Relationships from Combined/Translated Snippets...")
-            # Use all validated entities for Regulatory/Sanction relationships
-            test_relationships_reg_sanc = [];
-            if test_entities:
-                # Pass provider/model to the function call and the combined list of snippets, and await
-                test_relationships_reg_sanc = await extract_regulatory_sanction_relationships(sample_results_combined, test_context, test_entities, provider_to_test, model_to_test);
-                print("\nExtracted Regulatory/Sanction Relationships:")
-                print(json.dumps(test_relationships_reg_sanc, indent=2))
-            else:
-                print("\nSkipping regulatory/sanction relationship extraction.")
-            time.sleep(1) # Use sync sleep in test
-
-            # Combine all relationships for the test output
-            test_relationships_combined = test_relationships_ownership + test_relationships_reg_sanc
-
-
-            print("\nTesting Processing of Linkup Structured Data (using hypothetical schema and data)...")
-            # This hypothetical data should match the structure expected by process_linkup_structured_data
-            # This function remains synchronous
-            hypothetical_structured_data_list = [
-                {
-                    "entity": "Acme Corp", # Entity the search was for
-                    "schema": "key_risks", # Schema used
-                    "data": { # The actual data returned by Linkup for this schema
-                        "company_name": "Acme Corp",
-                        "key_risks_identified": [
-                            {
-                                "risk_description": "Reported environmental violations in China",
-                                "risk_category": "environmental",
-                                "reported_severity": "high",
-                                "source_date": "2023-05-10",
-                                "source_description": "News Article",
-                                "source_url": "https://linkup.so/source/env_report_123"
-                            },
-                             { # Another risk for the same company
-                                "risk_description": "Compliance issues with import regulations",
-                                "risk_category": "compliance",
-                                "reported_severity": "medium",
-                                "source_date": "2024-01-20",
-                                "source_description": "Govt. Notice",
-                                "source_url": "https://linkup.so/source/govt_notice_456"
-                            }
-                        ]
-                    }
-                },
-                 {
-                 "entity": "Beta Industries", # Entity the search was for
-                 "schema": "ownership", # Schema used
-                 "data": { # The actual data returned by Linkup for this schema
-                      "company_name": "Beta Industries",
-                      "ownership_relationships": [
-                          {
-                              "parent_company": "Global Holdings",
-                              "subsidiary_affiliate": "Beta Industries",
-                              "relation_type": "subsidiary",
-                              "stake_percentage": 100,
-                              "source_date": "2022-11-01",
-                              "source_description": "SEC Filing",
-                               # Ensured source_url is included
-                              "source_url": "https://linkup.so/source/filing_789"
-                          },
-                           { # Another relationship for Beta Industries
-                               "parent_company": "Beta Industries",
-                               "subsidiary_affiliate": "SubCo Alpha",
-                               "relation_type": "parent", # Note: Linkup uses 'parent', we map to SUBSIDIARY_OF
-                               "stake_percentage": 51,
-                               "source_date": "2023-03-15",
-                               "source_description": "Annual Report",
-                                # Ensured source_url is included
-                               "source_url": "https://linkup.so/source/annual_report_111"
-                           }
-                      ]
-                 }
-            },
-             { # Hypothetical structured data for a Regulator/Sanction
-                 "entity": "SAMR", # Entity the search was for
-                 "schema": "regulatory_actions", # Hypothetical schema name
-                 "data": { # Hypothetical data structure
-                      "regulator_name": "State Administration for Market Regulation (SAMR)",
-                      "actions_found": [
-                          {
-                              "action_type": "Investigation",
-                              "description": "Investigation into anti-competitive practices",
-                              "affected_entities": ["Company S", "Company T"], # List of affected companies
-                              "source_date": "2024-04-01",
-                               # Ensured source_url is included
-                              "source_url": "https://linkup.so/source/samr_action_1"
-                          }
-                      ]
-                 }
-             }
-            ]
-            # Process the hypothetical structured data (sync function)
-            processed_structured = process_linkup_structured_data(hypothetical_structured_data_list, "Test Structured Data Query");
-            print("\nProcessed Structured Data (NLP Output):");
-            print(json.dumps(processed_structured, indent=2)); time.sleep(1) # Use sync sleep in test
-
-
-            # Example of combining processed structured data with snippet data for a final view
-            # Note: Orchestrator handles actual merging, this is just to show the combined format
-            test_final_entities = test_entities + processed_structured.get("entities", [])
-            test_final_risks = test_risks_linked + processed_structured.get("risks", [])
-            test_final_relationships = test_relationships_combined + processed_structured.get("relationships", [])
-
-            print("\n--- Combined Data from Snippets and Hypothetical Structured Data (Example) ---")
-            print(f"Entities: {len(test_final_entities)}")
-            print(f"Risks: {len(test_final_risks)}")
-            print(f"Relationships: {len(test_final_relationships)}")
-
-            # Example of generating a summary using the combined data
-            print("\n--- Generating Summary with Combined Data ---")
-            # For the summary test here, we'll create a dummy results dictionary
-            # that resembles what the orchestrator passes, including the KG status.
-            dummy_results_for_summary_test = {
-                 "query": "Combined Test Data Analysis",
-                 "final_extracted_data": {
-                      "entities": test_final_entities,
-                      "risks": test_final_risks,
-                      "relationships": test_final_relationships,
-                 },
-                 "linkup_structured_data": hypothetical_structured_data_list,
-                 "high_risk_exposures": [], # Assuming no exposures generated by this test data alone
-                 "kg_update_status": "success" # Dummy KG status for summary test
-            }
-            dummy_exposure_count = 0 # Assuming no exposures generated by this test data alone
-
-
-            test_summary = await generate_analysis_summary( # Await the async summary function
-                dummy_results_for_summary_test, # Pass the dummy results dict
-                "Combined Test Data Analysis",
-                dummy_exposure_count,
-                provider_to_test,
-                model_to_test
+        try:
+            # Await the async run_analysis function
+            test_run_results = await run_analysis(
+                initial_query=test_query,
+                llm_provider=test_llm_provider,
+                llm_model=test_llm_model,
+                specific_country_code=test_country,
+                max_global_results=20,
+                max_specific_results=20
             )
-            print("\nGenerated Summary (Test):")
-            print(test_summary)
+
+            print("\n--- Test Run Results ---")
+            # Print results nicely, but avoid printing huge lists directly
+            printable_results = test_run_results.copy()
+            # FIX: These counts should now match the filtered data in final_extracted_data
+            # Use the counts already present in the results dict from Step 5Prep/main_api
+            # if 'linkup_structured_data' in printable_results: # Removed raw list from UI response
+            #      printable_results['linkup_structured_data_count'] = len(printable_results['linkup_structured_data'])
+            #      del printable_results['linkup_structured_data']
+            if 'wayback_results' in printable_results:
+                 # The UI receives the limited list, so len is correct
+                 printable_results['wayback_results_count'] = len(printable_results['wayback_results'])
+                 # Optionally truncate or remove details if the list is very long
+                 # printable_results['wayback_results_sample'] = printable_results['wayback_results'][:3]
+                 # del printable_results['wayback_results'] # Kept limited list in UI response
+            # FIX: final_extracted_data now contains filtered data in results dict sent to UI
+            if 'final_extracted_data' in printable_results:
+                 # Summarize counts from the filtered lists
+                 printable_results['final_extracted_data_counts'] = {
+                     k: len(v) for k, v in printable_results['final_extracted_data'].items()
+                 }
+                 # Optionally remove the full lists if they are large (UI now expects counts + exposures list)
+                 del printable_results['final_extracted_data']
+            # FIX: high_risk_exposures now contains the filtered list in results dict sent to UI
+            if 'high_risk_exposures' in printable_results:
+                 # UI receives the list, so len is correct
+                 printable_results['high_risk_exposures_count'] = len(printable_results['high_risk_exposures'])
+                 # The UI needs the list for the table, so don't delete the original list
+                 # del printable_results['high_risk_exposures'] # Removed deletion
 
 
-        else:
-            print("\nSkipping structured data processing and related tests: search_engines.py not available or Linkup/LLM not enabled.")
+            # Clean up steps data to show counts rather than full extracted_data lists
+            if 'steps' in printable_results:
+                 for step in printable_results['steps']:
+                      if isinstance(step, dict) and 'extracted_data' in step:
+                           # These counts should already be in 'extracted_data_counts' added in Step 5Prep
+                           if isinstance(step.get('extracted_data'), dict): # Check if it's a dict before accessing keys
+                                step['extracted_data_counts'] = {k: len(v) for k,v in step['extracted_data'].items()}
+                           del step['extracted_data']
 
 
-    # Run the async test suite
-    if __name__ == "__main__":
-        try:
-            asyncio.run(async_test_suite())
-        except KeyboardInterrupt:
-            print("\nAsync test suite interrupted.")
+            print(json.dumps(printable_results, indent=2))
+
         except Exception as e:
-            print(f"\n--- Async Test Suite Exception ---")
-            print(f"An exception occurred during the async test run: {type(e).__name__}: {e}")
+            print(f"\n--- Test Run Exception ---")
+            print(f"An exception occurred during the test run: {type(e).__name__}: {e}")
             traceback.print_exc()
+
+        print("\n--- Local Orchestrator Tests Complete ---")
+
+    # Run the async main test function
+    try:
+        asyncio.run(main_test_run())
+    except KeyboardInterrupt:
+        print("\nOrchestrator test run interrupted.")
+    except Exception as e:
+        print(f"\n--- Critical Orchestrator Test Failure ---")
+        print(f"An unhandled exception occurred during the main async test run: {type(e).__name__}: {e}")
+        traceback.print_exc()

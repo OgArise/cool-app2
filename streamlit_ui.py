@@ -430,18 +430,20 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
         with col_metrics3: st.metric("KG Update Status", results.get("kg_update_status", "N/A"))
 
 
-        # Display counts of extracted data types
-        st.markdown("**Extracted Data Counts (before filtering for sheet/KG):**")
+        # FIX: Update the label for extracted data counts to reflect that these are the FILTERED counts
+        st.markdown("**Final Data Counts (Saved/Sent to KG):**")
         col_counts1, col_counts2, col_counts3, col_counts4, col_counts5 = st.columns(5)
+        # These counts are now the filtered counts from the API response
         extracted_counts = results.get("extracted_data_counts", {})
         with col_counts1: st.metric("Entities", extracted_counts.get("entities", "N/A"))
         with col_counts2: st.metric("Risks", extracted_counts.get("risks", "N/A"))
         with col_counts3: st.metric("Relationships", extracted_counts.get("relationships", "N/A"))
-        with col_counts4: st.metric("Linkup Structured Results", results.get("linkup_structured_data_count", "N/A"))
+        with col_counts4: st.metric("Linkup Structured Items", results.get("linkup_structured_data_count", "N/A")) # Label update
         with col_counts5: st.metric("URLs Checked (Wayback)", results.get("wayback_results_count", "N/A"))
 
 
         # Get exposures count from the results dictionary
+        # This list in the UI response is the filtered list of exposures
         exposures_list_from_results = results.get("high_risk_exposures", [])
         exposures_count = len(exposures_list_from_results)
         st.metric("High Risk Exposures Found (Saved to Sheet)", exposures_count)
@@ -484,20 +486,15 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
         with st.expander("Run Steps & Details", expanded=False):
             st.subheader("Run Steps & Durations");
             if results.get("steps"):
-                try:
+                try: # FIX: Ensure this try block is correctly structured
                     steps_data = []
                     for step in results["steps"]:
                          if isinstance(step, dict):
                                # Use extracted_data_counts if available, otherwise fallback to original keys if they exist
-                              entity_count_step = step.get("extracted_data_counts", {}).get("entities", step.get("extracted_data",{}).get("entities","N/A")) # Fallback check includes original structure
-                              risk_count_step = step.get("extracted_data_counts", {}).get("risks", step.get("extracted_data",{}).get("risks","N/A"))
-                              rel_count_step = step.get("extracted_data_counts", {}).get("relationships", step.get("extracted_data",{}).get("relationships","N/A"))
-
-                              # If fallback returned a list, get its length
-                              if isinstance(entity_count_step, list): entity_count_step = len(entity_count_step)
-                              if isinstance(risk_count_step, list): risk_count_step = len(risk_count_step)
-                              if isinstance(rel_count_step, list): rel_count_step = len(rel_count_step)
-
+                               # The backend should now send 'extracted_data_counts' for each step where extraction occurred
+                              entity_count_step = step.get("extracted_data_counts", {}).get("entities", "N/A")
+                              risk_count_step = step.get("extracted_data_counts", {}).get("risks", "N/A")
+                              rel_count_step = step.get("extracted_data_counts", {}).get("relationships", "N/A")
 
                               steps_data.append({
                                   "Name": step.get("name", "N/A"),
@@ -514,8 +511,7 @@ elif st.session_state.analysis_status in ["COMPLETE", "COMPLETE_WITH_ERROR"]:
                                   "Relationships Extracted (Step)": rel_count_step,
                                   "Error Message": step.get("error_message", "") # Error message from any step
                               })
-                         else:
-                              steps_data.append({"Name": "Invalid Step Data", "Status": "Error", "Error Message": "Step data is not a dictionary."})
+                         else: steps_data.append({"Name": "Invalid Step Data", "Status": "Error"})
                     steps_df = pd.DataFrame(steps_data)
                     # Define column order and drop columns where all values are N/A, "", or None
                     col_order = [
