@@ -215,7 +215,7 @@ async def search_via_serpapi(query: str, engine: str, country_code: str = 'cn', 
     # This is the standard pattern for integrating sync libraries into async code.
 
     if not serpapi_available:
-        # print("Skipping SerpApi search: Not configured.") # Suppress frequent message
+        # print("Skipping Serpapi search: Not configured.") # Suppress frequent message
         return []
     if not query or not isinstance(query, str) or not query.strip():
          print(f"Skipping async Serpapi search ({engine}): Invalid query provided.")
@@ -234,9 +234,9 @@ async def search_via_serpapi(query: str, engine: str, country_code: str = 'cn', 
              # Language is primarily controlled by the query string itself and the engine/country.
 
 
-        print(f"Executing async SerpApi Search ({engine}): q='{query[:50]}...', params={{'engine': '{engine}', 'num': {num}, ...}}") # Log simplified params
+        print(f"Executing async Serpapi Search ({engine}): q='{query[:50]}...', params={{'engine': '{engine}', 'num': {num}, ...}}") # Log simplified params
 
-        # Run the synchronous SerpApiSearch.get_dict() method in a thread pool
+        # Run the synchronous SerpapiSearch.get_dict() method in a thread pool
         loop = asyncio.get_running_loop()
         # Pass keyword arguments directly to get_dict
         # Assuming SerpApiSearch is thread-safe for separate instances
@@ -578,9 +578,9 @@ async def search_for_ownership_docs(entity_name: str,
 
 
     # 3. Check Threshold and Run SerpApi Fallback if Needed (Async)
-    # Only run SerpApi if the number of results is below the fallback threshold AND SerpApi is available
+    # Only run Serpapi if the number of results is below the fallback threshold AND SerpApi is available
     if serpapi_available_bool and len(all_raw_results_map) < fallback_threshold:
-         print(f"Result count ({len(all_raw_results_map)}) below fallback threshold ({fallback_threshold}). Attempting SerpApi fallback search...")
+         print(f"Result count ({len(all_raw_results_map)}) below fallback threshold ({fallback_threshold}). Attempting Serpapi fallback search...")
          serpapi_engine = 'baidu' if country_code.lower() == 'cn' else 'google'
          # Use all generated queries for Serpapi fallback (including Chinese ones if cn)
          # For simplicity, let's use a combined query approach for SerpApi fallback similar to Linkup,
@@ -595,13 +595,13 @@ async def search_for_ownership_docs(entity_name: str,
          serpapi_fallback_tasks.append(search_via_serpapi(query=serpapi_fallback_query_combined, engine=serpapi_engine, country_code=country_code, lang_code=lang_code, num=max(num_per_query, fallback_threshold - len(all_raw_results_map) + 5))) # Request enough results to potentially hit the threshold + buffer
 
          if serpapi_fallback_tasks:
-              print(f"  Running {len(serpapi_fallback_tasks)} SerpApi fallback search task...")
+              print(f"  Running {len(serpapi_fallback_tasks)} Serpapi fallback search task...")
               serpapi_fallback_results_lists = await asyncio.gather(*serpapi_fallback_tasks, return_exceptions=True) # Gather results, capture exceptions
 
               # Process and deduplicate results from Serpapi
               for results_list_or_exc in serpapi_fallback_results_lists:
                    if isinstance(results_list_or_exc, Exception):
-                        print(f"  Warning: The SerpApi fallback search task raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
+                        print(f"  Warning: The Serpapi fallback search task raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
                         traceback.print_exc() # Print traceback for search errors
                         continue # Skip processing this result list
 
@@ -612,10 +612,10 @@ async def search_for_ownership_docs(entity_name: str,
                            if serpapi_engine == 'baidu': standardized['original_language'] = 'zh' # Assume Baidu results are Chinese
 
                         if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
-                             # Add SerpApi results to the main map
+                             # Add Serpapi results to the main map
                              all_raw_results_map[standardized['url']] = standardized
 
-              print(f"  Finished SerpApi fallback search. Total unique results now: {len(all_raw_results_map)}")
+              print(f"  Finished Serpapi fallback search. Total unique results now: {len(all_raw_results_map)}")
          else:
               print("  No Serpapi fallback search tasks were added.")
 
@@ -783,12 +783,12 @@ if __name__ == "__main__":
             print("\nSkipping async Google Official Search test: Configuration missing or client not available.")
 
         if serpapi_available:
-            print("\nTesting async SerpApi Google Search...")
+            print("\nTesting async Serpapi Google Search...")
             serpapi_google_results = await search_via_serpapi("example search query China", engine='google', country_code='cn', num=20)
             print(f"Found {len(serpapi_google_results)} async SerpApi Google results (requested num 20).")
             # print(json.dumps(serpapi_google_results[:2], indent=2)) # Print sample
         else:
-            print("\nSkipping async SerpApi Google Search test: Configuration missing or client not available.")
+            print("\nSkipping async Serpapi Google Search test: Configuration missing or client not available.")
 
         if serpapi_available:
              print("\nTesting async SerpApi Baidu Search...")
@@ -862,7 +862,7 @@ if __name__ == "__main__":
 
         print("\nTesting Targeted Ownership Docs Search (Combines async sources with fallback)...")
         # This function calls the individual async search functions concurrently.
-        # SerpApi is fallback if primary (Linkup+Google) don't hit threshold.
+        # Serpapi is fallback if primary (Linkup+Google) don't hit threshold.
         ownership_docs_results = await search_for_ownership_docs("Example Chinese Company", num_per_query=10, country_code='cn') # num_per_query affects internal search calls
         print(f"Found {len(ownership_docs_results)} unique potential ownership documents across all sources.") # Report total unique found
         # print(json.dumps(ownership_docs_results[:5], indent=2)) # Print sample

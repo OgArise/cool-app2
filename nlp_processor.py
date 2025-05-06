@@ -404,7 +404,7 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
              return None # Return None on error
         else:
              # If parsed_json is not a dict/list (e.g., string, None after fallbacks) or some other issue
-             print(f"--- [{function_name}] ERROR: JSON obtained but not dict/list, or unknown parsing issue. Parsed type: {type(parsed_json).__name__} ---")
+             print(f"--- [{function_name}] ERROR: JSON obtained but not dict/list, or unknown parsing issue. Parsed type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
              # Optionally print the parsed content if not a dict for debugging
              # print(f"--- [{function_name}] Parsed content: {parsed_json} ---")
              return None # Return None if the final result isn't the expected format
@@ -425,8 +425,12 @@ async def translate_keywords_for_context(original_query: str, target_context: st
         print("Warning: Missing LLM config for keyword generation. Skipping.")
         return [original_query]
 
-    prompt = f"""Expert keyword generator: Given the query and context below, provide a list of 3-5 relevant ENGLISH search keywords suitable for the context. If the query already contains Chinese characters and the context implies a Chinese search, you may include relevant Chinese keywords as well.
+    # FIX: Updated prompt to strongly emphasize relevance to the *initial query*
+    prompt = f"""Expert keyword generator: Given the INITIAL QUERY and TARGET SEARCH CONTEXT below, provide a comma-separated list of 3-5 highly relevant ENGLISH search keywords. Prioritize keywords directly related to the INITIAL QUERY. If the INITIAL QUERY or TARGET SEARCH CONTEXT includes non-English terms (like Chinese), you may include relevant non-English keywords suitable for search engines targeting that region.
+INITIAL QUERY: {original_query}
+TARGET SEARCH CONTEXT: {target_context}
 IMPORTANT: Your entire response must contain ONLY the comma-separated list of keywords. Do NOT include any other text, explanation, or formatting."""
+
 
     # Use the async text helper
     raw_content = await _call_llm_and_get_text(
@@ -438,39 +442,42 @@ IMPORTANT: Your entire response must contain ONLY the comma-separated list of ke
          return [original_query]
 
 
-    prefixes_to_remove = ["Sure, here are the keywords:", "Here are the keywords:", "Okay, here is the list:", "Here is the list:", "Of course! Here are the keywords:", "Keywords:"] # Added "Keywords:"
-    cleaned_content = raw_content
-    for prefix in prefixes_to_remove:
-        if cleaned_content.lower().startswith(prefix.lower()):
-            cleaned_content = cleaned_content[len(prefix):].strip()
-            break
-
-    if '\n' in cleaned_content:
-         cleaned_content = cleaned_content.split('\n')[0]
-
-    # Allow Chinese characters, but remove quotes/markdown if they appear
-    cleaned_content = cleaned_content.replace('"', '').replace("'", '').strip()
-    cleaned_content = re.sub(r'^```.*?```', '', cleaned_content, flags=re.DOTALL).strip() # Remove code block if it wasn't fully cleaned
-
-    keywords = [kw.strip() for kw in cleaned_content.split(',') if kw.strip()]
+    cleaned_content = raw_content.strip()
+    # Remove markdown code block syntax if present (more robust)
+    cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL) # Use ignorecase and dotall
+    cleaned_content = re.sub(r'```$', '', cleaned_content)
+    # Remove leading/trailing quotes that some models add
+    cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
+    cleaned_content = cleaned_content.strip()
 
     # FIX: Refined conversational filler check to be more specific and less prone to false positives
     # Only filter out responses that *only* contain conversational text or look like empty/failure states
     # Allow keywords that might contain common words if they are part of a valid phrase
-    conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "provide", "based on the text", "hello", "hi", "greetings"]
-    looks_conversational_only = cleaned_content.lower() in conversational_only_phrases or (len(keywords) <= 1 and any(word in cleaned_content.lower() for word in ["based on", "above", "snippets", "context", "text"]))
+    conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "provide", "based on the text", "hello", "hi", "greetings", "summary"] # Added summary
+    # Check if the entire cleaned response (case-insensitive, stripped) is one of the filler phrases
+    is_pure_filler = cleaned_content.lower() in conversational_only_phrases
+    # Check if the response contains any words *besides* potential fillers. If not, it's likely conversational/empty.
+    words_in_response = [word.strip() for word in cleaned_content.split() if word.strip()]
+    is_only_fillers = all(re.search(r'\b' + re.escape(word) + r'\b', cleaned_content.lower()) for word in conversational_only_phrases) and len(words_in_response) < 5 # Very few words and all look like fillers
 
-    # Also check for obvious signs of failure if the response is short or doesn't contain expected characters
-    looks_like_failure = len(cleaned_content) < 10 # Very short response
-    # Add other checks if needed
+    # Also check for obvious signs of failure if the response is too short to contain meaningful keywords
+    is_too_short_for_keywords = len(cleaned_content) < 10 # Keywords should be longer than ~10 chars
 
 
-    if not keywords or looks_conversational_only or looks_like_failure:
+    if not cleaned_content or is_pure_filler or is_only_fillers or is_too_short_for_keywords:
          print(f"Warning: Keyword response conversational/empty/unhelpful ('{cleaned_content[:100]}...'). Returning original.")
          return [original_query]
 
+
+    keywords = [kw.strip() for kw in cleaned_content.split(',') if kw.strip()]
+
     # Filter out keywords that are just punctuation or very short non-meaningful strings
     keywords = [kw for kw in keywords if len(kw) > 1 and not all(c in '.,!?"\'' for c in kw)]
+
+    # Final check: If after cleaning and splitting, the keywords list is empty, return original query
+    if not keywords:
+        print(f"Warning: Keyword generation resulted in an empty list after cleaning ('{cleaned_content[:100]}...'). Returning original.")
+        return [original_query]
 
 
     print(f"Parsed Keywords: {keywords}")
@@ -527,7 +534,7 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
 
     cleaned_content = raw_content.strip()
     # Remove markdown code block syntax if present (more robust)
-    cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL) # Use ignorecase and dotall
     cleaned_content = re.sub(r'```$', '', cleaned_content)
     # Remove leading/trailing quotes that some models add
     cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
@@ -540,9 +547,13 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
     # Check if the entire cleaned response (case-insensitive, stripped) is one of the filler phrases
     is_pure_filler = cleaned_content.lower() in conversational_only_phrases
     # Check if it's too short compared to the original text, allowing for very short valid translations
-    is_too_short = len(cleaned_content) < max(len(text) * 0.1, 10) # Allow very short translations, but filter if less than 10 chars or <10% of original
+    # This check is complex. Let's simplify: just check if the response is excessively short AND contains few words,
+    # or if it seems to contain only filler words.
+    words_in_response = [word.strip() for word in cleaned_content.split() if word.strip()]
+    is_suspiciously_short = len(cleaned_content) < max(len(text) * 0.1, 5) # Too short (less than 10% of original, or less than 5 chars)
+    is_only_fillers = len(words_in_response) < 5 and any(re.search(r'\b' + re.escape(word) + r'\b', cleaned_content.lower()) for word in conversational_only_phrases) # Very few words AND contain fillers
 
-    if not cleaned_content or is_pure_filler or is_too_short:
+    if not cleaned_content or is_pure_filler or is_suspiciously_short or is_only_fillers:
         print(f"Warning: Translation response short/empty/conversational: '{cleaned_content[:100]}...' for text '{text[:50]}...'.")
         return None
 
@@ -1241,8 +1252,11 @@ Relationship Types:
 
 Focus ONLY on relationships where BOTH entity1 and entity2 are from the provided list of identified entities.
 The relationship_type MUST be one of: REGULATED_BY, ISSUED_BY, SUBJECT_TO, or MENTIONED_WITH.
-Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
+Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. No explanations or markdown.
 
+Begin analysis of text snippets:
+{context_text}
+"""
     # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
@@ -1251,7 +1265,6 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
 
     # Ensure parsed_json is a dictionary and contains the 'relationships' key which is a list
     relationships_list_from_llm = parsed_json.get("relationships", []) if isinstance(parsed_json, dict) else []
-
 
     if isinstance(relationships_list_from_llm, list):
         for rel in relationships_list_from_llm:
@@ -1793,12 +1806,15 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
 
             # FIX: Use the refined conversational and short checks from translate_text
             conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "provide", "based on the text", "hello", "hi", "greetings", "summary"] # Added summary
-            is_pure_filler = cleaned_content.lower() in conversational_only_phrases or (len(cleaned_content.split()) < 10 and any(word in cleaned_content.lower() for word in ["based on", "above", "snippets", "context", "text"])) # Check word count for short responses
+            is_pure_filler = cleaned_content.lower() in conversational_only_phrases
+            # Check if the response contains any words *besides* potential fillers. If not, it's likely conversational/empty.
+            words_in_response = [word.strip() for word in cleaned_content.split() if word.strip()]
+            is_only_fillers = len(words_in_response) < 5 and any(re.search(r'\b' + re.escape(word) + r'\b', cleaned_content.lower()) for word in conversational_only_phrases) # Very few words AND contain fillers
 
             is_too_short = len(cleaned_content) < 50 # Check minimum length for a summary
 
 
-            if not cleaned_summary or is_pure_filler or is_too_short:
+            if not cleaned_summary or is_pure_filler or is_too_short or is_only_fillers:
                 print(f"Warning: Summary short/empty/apologetic: '{cleaned_summary[:100]}...'.");
                 return f"Could not generate a meaningful summary based on the extracted data."
         else:
