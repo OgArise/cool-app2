@@ -541,11 +541,19 @@ async def run_analysis(initial_query: str,
              print(f"  Adding Linkup snippet search task (broad query: '{initial_query}')")
              # search_linkup_snippets handles multiple queries internally and returns a list of results
              # It no longer accepts num as a parameter to the search call itself
-             linkup_query_combined = f'"{initial_query}" OR {" OR ".join([f'"{q}"' for q in step1_all_queries])}' # Use initial query + variants for broad search
-             # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
-             # Based on the implementation, search_linkup_snippets processes multiple queries itself
-             # and might use the num parameter for each.
-             concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=linkup_query_combined, num=max_global_results)) # Pass num
+             # FIX: Build the OR joined string separately to avoid f-string syntax error
+             queries_to_join = [f'"{q}"' for q in step1_all_queries if q] # Ensure queries are not empty strings
+             if queries_to_join:
+                 queries_joined_for_linkup = " OR ".join(queries_to_join)
+                 # linkup_query_combined = f'"{initial_query}" OR {queries_joined_for_linkup}' # Original problem line
+                 linkup_query_combined = f'({queries_joined_for_linkup})' # Simpler query for Linkup using all variants
+
+                 # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+                 # Based on the implementation, search_linkup_snippets processes multiple queries itself
+                 # and might use the num parameter for each.
+                 concurrent_search_tasks_initial.append(search_engines.search_linkup_snippets(query=linkup_query_combined, num=max_global_results)) # Pass num
+             else:
+                  print("  No valid queries to join for Linkup snippet search task, skipping.")
         else:
              print("  Linkup snippet search not available or not async, skipping task.")
 
@@ -585,7 +593,7 @@ async def run_analysis(initial_query: str,
 
 
         # --- SerpApi Fallback Search (Async) ---
-        # Only run Serpapi if the number of results is below the fallback threshold AND Serpapi is available
+        # Only run Serpapi if the number of results is below the fallback threshold AND SerpApi is available
         serpapi_fallback_results = []
         if serpapi_available and len(step1_search_results) < serpapi_fallback_threshold:
             print(f"[Step 1 Search] Result count ({len(step1_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting Serpapi fallback search...")
@@ -599,7 +607,7 @@ async def run_analysis(initial_query: str,
                  serpapi_fallback_tasks = [search_engines.search_via_serpapi(query=q, engine=serpapi_engine, country_code=specific_country_code, lang_code='en', num=max_global_results) for q in serpapi_queries]
 
             if serpapi_fallback_tasks:
-                 print(f"  Running {len(serpapi_fallback_tasks)} SerpApi fallback search tasks...")
+                 print(f"  Running {len(serpapi_fallback_tasks)} Serpapi fallback search tasks...")
                  serpapi_fallback_results_lists = await asyncio.gather(*serpapi_fallback_tasks, return_exceptions=True) # Gather results, capture exceptions
 
                  # Process and deduplicate results from Serpapi
@@ -629,7 +637,7 @@ async def run_analysis(initial_query: str,
         elif serpapi_available:
             print(f"[Step 1 Search] Skipping Serpapi fallback. Initial concurrent searches yielded {len(step1_search_results)} results (>= {serpapi_fallback_threshold} threshold).")
         elif not serpapi_available:
-            print("[Step 1 Search] SerpApi fallback search not available, skipping.")
+            print("[Step 1 Search] Serpapi fallback search not available, skipping.")
 
 
         # Step 1 search results are now finalized (Linkup + Google CSE + optional SerpApi fallback)
@@ -935,11 +943,17 @@ async def run_analysis(initial_query: str,
              print(f"  Adding Linkup snippet search task (specific queries)")
              # search_linkup_snippets handles multiple queries internally and returns a list of results
              # It no longer accepts num as a parameter to the search call itself
-             linkup_query_combined_specific = f'"{specific_query_base}" OR {" OR ".join([f'"{q}"' for q in step3_all_queries])}' # Use specific query + variants for search
-             # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
-             # Based on the implementation, search_linkup_snippets processes multiple queries itself
-             # and might use the num parameter for each.
-             concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=linkup_query_combined_specific, num=max_specific_results)) # Pass num
+             # FIX: Build the OR joined string separately to avoid f-string syntax error
+             queries_to_join_specific = [f'"{q}"' for q in step3_all_queries if q] # Ensure queries are not empty strings
+             if queries_to_join_specific:
+                  queries_joined_for_linkup_specific = " OR ".join(queries_to_join_specific)
+                  linkup_query_combined_specific = f'({queries_joined_for_linkup_specific})' # Use specific query + variants for search
+                  # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+                  # Based on the implementation, search_linkup_snippets processes multiple queries itself
+                  # and might use the num parameter for each.
+                  concurrent_search_tasks_specific.append(search_engines.search_linkup_snippets(query=linkup_query_combined_specific, num=max_specific_results)) # Pass num
+             else:
+                  print("  No valid queries to join for Linkup snippet search task, skipping.")
         else:
              print("  Linkup snippet search not available or not async, skipping task.")
 
@@ -978,7 +992,7 @@ async def run_analysis(initial_query: str,
 
 
         # --- SerpApi Fallback Search (Async) ---
-        # Only run Serpapi if the number of results is below the fallback threshold AND Serpapi is available
+        # Only run Serpapi if the number of results is below the fallback threshold AND SerpApi is available
         serpapi_fallback_results_step3 = []
         if serpapi_available and len(step3_search_results) < serpapi_fallback_threshold:
             print(f"[Step 3 Search] Result count ({len(step3_search_results)}) below fallback threshold ({serpapi_fallback_threshold}). Attempting Serpapi fallback search...")
@@ -992,7 +1006,7 @@ async def run_analysis(initial_query: str,
                  serpapi_fallback_tasks_step3 = [search_engines.search_via_serpapi(query=q, engine=serpapi_engine, country_code=specific_country_code, lang_code='en', num=max_specific_results) for q in serpapi_queries]
 
             if serpapi_fallback_tasks_step3:
-                 print(f"  Running {len(serpapi_fallback_tasks_step3)} SerpApi fallback search tasks...")
+                 print(f"  Running {len(serpapi_fallback_tasks_step3)} Serpapi fallback search tasks...")
                  serpapi_fallback_results_lists_step3 = await asyncio.gather(*serpapi_fallback_tasks_step3, return_exceptions=True) # Gather results, capture exceptions
 
                  # Process and deduplicate results from Serpapi
@@ -1896,7 +1910,6 @@ async def run_analysis(initial_query: str,
                  knowledge_graph.close_driver() # Correctly call the close function
                  # The global driver variable is managed within knowledge_graph.py now
                  # driver = None # No need to set driver to None here, knowledge_graph.close_driver() does it
-                 # print("Neo4j connection closed.") # knowledge_graph.close_driver() already prints this
                  pass # Do nothing if close_driver() handles print and setting driver to None
             except Exception as e:
                  print(f"Error closing Neo4j driver: {e}")
