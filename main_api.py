@@ -4,11 +4,12 @@ from fastapi import FastAPI, Body, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import traceback
+import asyncio # Import asyncio as the orchestrator is now async
 
 import orchestrator
 import config
 
-app = FastAPI(title="China Analyst AI Agent API")
+app = FastAPI(title="AI Analyst Agent API")
 
 class AnalysisRequest(BaseModel):
     query: str
@@ -36,10 +37,11 @@ class AnalysisResponse(BaseModel):
     wayback_results_count: int
 
 
+# Convert the endpoint function to async and await the orchestrator call
 @app.post("/analyze", response_model=AnalysisResponse)
 async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
     """
-    Triggers the AI Analyst analysis pipeline using selected LLM provider/model.
+    Triggers the AI Analyst analysis pipeline using selected LLM provider/model (async).
     API Key is read from backend environment variables based on provider.
     Returns a summary of the analysis results, including exposures, but not all raw extracted data.
     """
@@ -50,8 +52,8 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
          raise HTTPException(status_code=400, detail="Missing required LLM configuration in request (provider, model).")
 
     try:
-        # Call the orchestrator to run the full analysis pipeline
-        full_results = orchestrator.run_analysis(
+        # Call the orchestrator to run the full analysis pipeline and await its completion
+        full_results = await orchestrator.run_analysis(
             initial_query=request.query,
             llm_provider=request.llm_provider,
             llm_model=request.llm_model,
@@ -75,7 +77,7 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
             "query": full_results.get("query", request.query),
             "llm_used": full_results.get("llm_used", f"{request.llm_provider} ({request.llm_model})"),
             "run_duration_seconds": full_results.get("run_duration_seconds"),
-            "analysis_summary": full_results.get("analysis_summary", "Analysis did not complete successfully or summary not generated."),
+            "analysis_summary": full_results.get("analysis_summary", "Summary could not be generated or analysis failed early."), # Default message matches UI expectation
             "kg_update_status": full_results.get("kg_update_status", "not_run"),
             "high_risk_exposures": full_results.get("high_risk_exposures", []), # Return the list of exposures
             "backend_error": full_results.get("error"), # Return the backend error message if any
@@ -89,13 +91,13 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
         # and include the response data in the body.
         if response_data.get("backend_error") and response_data["backend_error"] != "None" and response_data["backend_error"] != "":
             print(f"Orchestrator reported error: {response_data['backend_error']}. Returning 500.")
-            # Create a custom error response body
+            # Create a custom error response body that includes the results summary
             error_response_body = {
                  "detail": f"Analysis failed on backend: {response_data['backend_error']}",
                  "results_summary": response_data # Include the partial/summary results in the error body
             }
             # Note: Returning a custom body requires not using response_model directly for the HTTPException.
-            # We'll structure it to be informative. The Streamlit UI will need to handle the 500 status and parse the detail/results_summary.
+            # The Streamlit UI async handler is designed to parse this.
             raise HTTPException(status_code=500, detail=error_response_body)
 
 
@@ -113,6 +115,7 @@ async def run_analysis_endpoint(request: AnalysisRequest = Body(...)):
         error_traceback = traceback.format_exc()
         print(f"Error Type: {error_type}\nError Message: {error_msg}\nTraceback:\n{error_traceback}")
         # For unexpected errors, return a generic 500 with traceback info
+        # Note: This error won't contain 'results_summary' because the error happened outside the orchestrator's try/finally
         raise HTTPException(status_code=500, detail=f"Internal server error during analysis: {error_type} - {error_msg}\nTraceback: {error_traceback[:500]}...") # Limit traceback length
 
 

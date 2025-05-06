@@ -3,17 +3,20 @@
 from typing import List, Dict, Any, Optional
 import time
 import json
+# Using requests for synchronous Google Sheets interaction
 import requests
 from datetime import datetime
 import os
 import traceback
 import sys
+# Import asyncio as the orchestrator is now async
+import asyncio
 
 # Google Sheets Imports
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    import os
+    # import os # Already imported above
     google_sheets_library_available = True
 except ImportError:
     print("ERROR: Google API libraries not installed (`google-api-python-client google-auth-httplib2 google-auth-oauthlib`). Automation script cannot run.")
@@ -25,6 +28,9 @@ try:
 except ImportError:
      print("ERROR: config.py not found. Make sure it exists and defines necessary variables.")
      config = None
+
+# Import the orchestrator module
+import orchestrator
 
 # --- Google Sheets Setup ---
 # Initialize global gsheet_service variable *before* its usage in functions
@@ -45,11 +51,13 @@ BACKEND_API_URL = os.getenv(
         "http://localhost:8000"
     )
 )
-ANALYZE_ENDPOINT = f"{BACKEND_API_URL}/analyze"
-print(f"Automation targeting Backend API: {BACKEND_API_URL}")
+ANALYZE_ENDPOINT = f"{BACKEND_API_URL.rstrip('/')}/analyze" # Ensure no double slash
+print(f"Automation targeting Backend API: {ANALYZE_ENDPOINT}")
 
 # Increase timeout for the API request to accommodate longer analysis runs
 # Increased to 2000 seconds as requested.
+# Note: This is for the *synchronous* requests library call here.
+# The Streamlit UI uses httpx with its own timeout.
 API_REQUEST_TIMEOUT = 2000
 
 # Initialize Google Sheets related variables to None or False
@@ -105,7 +113,7 @@ DELAY_IF_NO_QUERIES = 600 # Delay when no pending queries are found
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 def _get_gsheet_service_automation():
-    """Authenticates for the automation script. Checks for library availability."""
+    """Authenticates for the automation script (synchronous). Checks for library availability."""
     global gsheet_service
     if not google_sheets_library_available: return None
     if not google_sheets_configured: return None
@@ -113,7 +121,9 @@ def _get_gsheet_service_automation():
     if gsheet_service is None:
         if SERVICE_ACCOUNT_INFO is None: return None
         try:
+            # Use the synchronous service_account.Credentials.from_service_account_info
             creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+            # Use the synchronous googleapiclient.discovery.build
             gsheet_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
             print("Google Sheets service authenticated successfully for automation.")
         except Exception as e:
@@ -123,12 +133,13 @@ def _get_gsheet_service_automation():
     return gsheet_service
 
 def _get_pending_queries(service) -> List[Dict]:
-    """Reads the Queries sheet and returns rows marked 'Pending'. Checks for service."""
+    """Reads the Queries sheet and returns rows marked 'Pending' (synchronous). Checks for service."""
     pending_queries = []
     if service is None: return pending_queries
 
     try:
         header_range = f"{QUERIES_SHEET_NAME}!1:1"
+        # Use synchronous execute()
         header_result = service.spreadsheets().values().get(
              spreadsheetId=SHEET_ID, range=header_range
         ).execute()
@@ -152,7 +163,13 @@ def _get_pending_queries(service) -> List[Dict]:
             summary_col_index = header_map.get(RESULT_SUMMARY_COLUMN)
 
             # Determine the last column index to read data efficiently
-            max_col_index = max( [idx for idx in [query_col_index, status_col_index, provider_col_index, model_col_index, summary_col_index] if idx is not None] )
+            col_indices = [query_col_index, status_col_index, provider_col_index, model_col_index, summary_col_index]
+            max_col_index = max( [idx for idx in col_indices if idx is not None] ) # Ensure None is handled
+            # Check if max_col_index is valid (e.g., headers are present)
+            if max_col_index is None or max_col_index < 0:
+                 print(f"ERROR: Could not determine maximum column index. Headers found: {header_row}")
+                 return pending_queries
+
             data_range_letter = chr(ord('A') + max_col_index)
             data_range = f"{QUERIES_SHEET_NAME}!A:{data_range_letter}"
             # print(f"Debug Reading data range: {data_range}") # Debug print
@@ -166,6 +183,7 @@ def _get_pending_queries(service) -> List[Dict]:
              return pending_queries
 
 
+        # Use synchronous execute()
         data_result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range=data_range).execute()
         rows = data_result.get('values', [])
@@ -177,7 +195,10 @@ def _get_pending_queries(service) -> List[Dict]:
         # Process data rows (skip header row)
         for i, row in enumerate(rows[1:], start=2): # i is the 1-based row index in the sheet
             # Ensure row values are treated as strings and handle rows shorter than max_col_index
-            get_col_value = lambda index: str(row[index]).strip() if index is not None and index < len(row) else None
+            # Pad row with None if it's shorter than expected based on header
+            padded_row = row + [None] * (max_col_index + 1 - len(row))
+            get_col_value = lambda index: str(padded_row[index]).strip() if index is not None and index < len(padded_row) and padded_row[index] is not None else None
+
 
             query = get_col_value(query_col_index)
             status = get_col_value(status_col_index)
@@ -211,7 +232,7 @@ def _get_pending_queries(service) -> List[Dict]:
     return pending_queries
 
 def _update_query_status(service, row_index: int, status_col_letter: str, new_status: str, summary_col_letter: Optional[str], result_summary: Optional[str] = None):
-    """Updates the status (and optionally adds a result summary) for a specific row. Checks for service."""
+    """Updates the status (and optionally adds a result summary) for a specific row (synchronous). Checks for service."""
     if service is None:
         print(f"GSheet service unavailable for status update. Cannot update row {row_index} with status '{new_status}'.")
         return
@@ -235,6 +256,7 @@ def _update_query_status(service, row_index: int, status_col_letter: str, new_st
 
         body = {'value_input_option': 'USER_ENTERED', 'data': update_cells}
 
+        # Use synchronous execute()
         request = service.spreadsheets().values().batchUpdate(
             spreadsheetId=SHEET_ID,
             body=body
@@ -246,7 +268,8 @@ def _update_query_status(service, row_index: int, status_col_letter: str, new_st
         print(f"ERROR updating status/summary for row {row_index} in Google Sheet: {type(e).__name__}: {e}")
         traceback.print_exc()
 
-def run_automation():
+# Convert run_automation to async
+async def run_automation():
     print("Starting AI Analyst Automation...")
 
     # Check essential prerequisites early
@@ -258,6 +281,7 @@ def run_automation():
         print("Exiting: No valid default LLM configuration available from config.py.")
         return
 
+    # Get the synchronous service object
     service = _get_gsheet_service_automation()
     if service is None:
         print("Exiting: Cannot obtain Google Sheets service.")
@@ -268,11 +292,12 @@ def run_automation():
     while True:
         start_loop_time = time.time()
         print(f"\n[{datetime.now().isoformat()}] Checking for pending queries...")
+        # _get_pending_queries is synchronous, no await needed
         pending_queries = _get_pending_queries(service)
 
         if not pending_queries:
             print(f"No pending queries found. Sleeping for {DELAY_IF_NO_QUERIES} seconds...")
-            time.sleep(DELAY_IF_NO_QUERIES)
+            await asyncio.sleep(DELAY_IF_NO_QUERIES) # Use async sleep
             run_counter = 0 # Reset counter when no jobs are found
             continue
 
@@ -307,16 +332,19 @@ def run_automation():
                  # Check if fallback itself is valid
                  if llm_provider_to_send is None or llm_model_to_send is None:
                        print(f"ERROR: Fallback LLM config is also invalid ({FALLBACK_LLM_CONFIG}). Cannot proceed with job.")
+                       # _update_query_status is synchronous, no await needed
                        _update_query_status(service, job['row_index'], job['status_col_letter'], "Error: No Valid LLM Config", job['summary_col_letter'], "Automation failed to get valid LLM config.")
-                       time.sleep(1) # Small delay before next job
+                       time.sleep(1) # Use synchronous time.sleep for short delays between jobs
                        continue # Skip this job and move to the next
 
                  print(f"  Sheet LLM config invalid/missing/corrupted ('{llm_provider_sheet}', '{llm_model_sheet}'). Using fallback default: Provider='{llm_provider_to_send}', Model='{llm_model_to_send}'")
 
 
             # Set status to Processing before API call
+            # _update_query_status is synchronous, no await needed
             _update_query_status(service, job['row_index'], job['status_col_letter'], "Processing...", job['summary_col_letter'])
 
+            # Payload matches the expected input for the backend API
             payload = {
                 "query": job['query'],
                 "global_context": "global financial news and legal filings", # Fixed context for now
@@ -331,31 +359,33 @@ def run_automation():
             # Initialize result summary and status for this job
             result_summary = f"LLM: {llm_provider_to_send} ({llm_model_to_send})"
             new_status = "Error: Unknown" # Default status in case of unexpected failure
+            backend_error = None # Initialize backend error field
 
             try:
                 print(f"Calling backend API: {ANALYZE_ENDPOINT} with Payload LLM: {payload['llm_provider']} / {payload['llm_model']}")
-                # Use the increased timeout value
+                # Use synchronous requests.post for calling the backend API
+                # The backend API itself runs the orchestrator async via asyncio.run
                 response = requests.post(ANALYZE_ENDPOINT, json=payload, timeout=API_REQUEST_TIMEOUT)
 
                 if response.status_code == 200:
-                    results = response.json()
+                    results = response.json() # results is now the subset from main_api
                     print(f"Backend analysis completed successfully (HTTP 200 OK). Duration: {results.get('run_duration_seconds', 'N/A')}s")
 
-                    # Extract relevant info from results for the summary
-                    entities_count = len(results.get("final_extracted_data", {}).get("entities", []))
-                    risks_count = len(results.get("final_extracted_data", {}).get("risks", []))
-                    relationships_count = len(results.get("final_extracted_data", {}).get("relationships", [])) # Add relationships count
-                    exposures_count = len(results.get("high_risk_exposures", []))
+                    # Extract relevant info from the subset results for the summary
+                    entities_count = results.get("extracted_data_counts", {}).get("entities", "N/A")
+                    risks_count = results.get("extracted_data_counts", {}).get("risks", "N/A")
+                    relationships_count = results.get("extracted_data_counts", {}).get("relationships", "N/A") # Add relationships count
+                    exposures_count = len(results.get("high_risk_exposures", [])) # Get count from the list
                     kg_status = results.get('kg_update_status', '?')
                     duration = results.get('run_duration_seconds', 'N/A')
                     backend_llm_used = results.get('llm_used', 'N/A')
-                    backend_error = results.get('error') # Get backend error message
+                    backend_error = results.get('backend_error') # Get backend error message from the subset results
 
                     # Build the result summary string
                     result_summary = f"LLM: {backend_llm_used} | E:{entities_count}, R:{risks_count}, Rel:{relationships_count}, Exp:{exposures_count}, KG:{kg_status}, Time:{duration}s"
 
                     if backend_error and backend_error != "None" and backend_error != "": # Check if backend reported an error
-                        new_status = f"Error: {backend_error}"
+                        new_status = f"Error: {backend_error}" # Use the backend error message as the status
                         # Append backend error message to summary if it exists
                         error_detail_str = backend_error[:100] + '...' if len(backend_error) > 100 else backend_error
                         result_summary += f" | Backend Error: {error_detail_str}"
@@ -372,10 +402,48 @@ def run_automation():
                          summary_text_for_cell = analysis_summary_text[:500] + '...' if len(analysis_summary_text) > 500 else analysis_summary_text
                          result_summary = f"{result_summary} --- Summary: {summary_text_for_cell}"
 
+                elif response.status_code == 500:
+                     # Handle 500 status code from backend, which includes detail and results_summary
+                     print(f"ERROR: Backend API returned status 500.")
+                     new_status = f"Error: Backend HTTP 500"
+                     try:
+                          error_json = response.json()
+                          backend_error = error_json.get('detail', 'Unknown 500 error') # Get the detail message
+                          results_summary_data = error_json.get('results_summary') # Get the nested summary data
+
+                          # Extract summary info from nested results_summary_data if available
+                          if results_summary_data and isinstance(results_summary_data, dict):
+                               entities_count = results_summary_data.get("extracted_data_counts", {}).get("entities", "N/A")
+                               risks_count = results_summary_data.get("extracted_data_counts", {}).get("risks", "N/A")
+                               relationships_count = results_summary_data.get("extracted_data_counts", {}).get("relationships", "N/A")
+                               exposures_count = len(results_summary_data.get("high_risk_exposures", []))
+                               kg_status = results_summary_data.get('kg_update_status', '?')
+                               duration = results_summary_data.get('run_duration_seconds', 'N/A')
+                               backend_llm_used = results_summary_data.get('llm_used', 'N/A')
+                               analysis_summary_text = results_summary_data.get("analysis_summary") # Get the summary text
+
+                               result_summary = f"LLM: {backend_llm_used} | E:{entities_count}, R:{risks_count}, Rel:{relationships_count}, Exp:{exposures_count}, KG:{kg_status}, Time:{duration}s"
+                               if analysis_summary_text and isinstance(analysis_summary_text, str):
+                                     summary_text_for_cell = analysis_summary_text[:500] + '...' if len(analysis_summary_text) > 500 else analysis_summary_text
+                                     result_summary = f"{result_summary} --- Summary: {summary_text_for_cell}"
+
+                          # Append the backend error detail to the summary
+                          error_detail_str = backend_error[:200] + '...' if len(backend_error) > 200 else backend_error
+                          result_summary += f" | Backend Error: {error_detail_str}"
+
+                     except json.JSONDecodeError:
+                          # If response is not JSON, use raw text
+                          error_detail = response.text[:200] + '...'
+                          result_summary += f" | Response: {error_detail}"
+                     except Exception as parse_500_e:
+                          print(f"ERROR parsing 500 response body: {parse_500_e}")
+                          result_summary += f" | Parsing 500 Error: {type(parse_500_e).__name__}"
+
+
                 else:
-                     # Handle non-200 status codes from the API
+                     # Handle other non-200/non-500 status codes from the API
                      print(f"ERROR: Backend API returned status {response.status_code}.")
-                     new_status = f"Error: Backend HTTP {response.status_code}"
+                     new_status = f"Error: Backend HTTP {response.status_code}";
                      error_detail = f"HTTP {response.status_code}"
                      try:
                           # Try to get error detail from JSON response
@@ -395,43 +463,59 @@ def run_automation():
                  print(f"ERROR: Timeout calling backend API after {API_REQUEST_TIMEOUT} seconds.")
                  new_status = "Error: Backend Timeout";
                  result_summary += f" | Timeout ({API_REQUEST_TIMEOUT}s)"
+                 backend_error = f"Backend Timeout ({API_REQUEST_TIMEOUT}s)" # Set backend_error for consistency
             except requests.exceptions.ConnectionError as e:
                  print(f"ERROR: Connection Error calling backend: {e}. Is backend running at {ANALYZE_ENDPOINT}?")
                  new_status = "Error: Backend Connect";
                  result_summary += f" | Connect Error: {type(e).__name__}"
+                 backend_error = f"Backend Connect Error: {type(e).__name__}" # Set backend_error
             except requests.exceptions.RequestException as e:
                  print(f"ERROR: Request Exception calling backend: {type(e).__name__}: {e}")
                  new_status = f"Error: Backend Request ({type(e).__name__})";
                  result_summary += f" | Request Failed: {type(e).__name__}"
+                 backend_error = f"Backend Request Failed: {type(e).__name__}" # Set backend_error
             except Exception as e:
                  print(f"ERROR: Unexpected error during job processing: {type(e).__name__}: {e}")
                  traceback.print_exc()
                  new_status = f"Error: Script Error ({type(e).__name__})";
                  result_summary += f" | Script Error: {type(e).__name__}"
+                 backend_error = f"Script Error: {type(e).__name__}" # Set backend_error
+
 
             # Update the status and summary in the Google Sheet for the current job
+            # _update_query_status is synchronous, no await needed
             _update_query_status(service, job['row_index'], job['status_col_letter'], new_status, job['summary_col_letter'], result_summary)
 
             # Implement batch processing delay
             if run_counter % 10 == 0: # Apply batch delay after every 10 queries processed in this batch
                  print(f"Completed {run_counter} queries in this batch. Sleeping for {DELAY_AFTER_BATCH} seconds before next query...")
-                 time.sleep(DELAY_AFTER_BATCH)
+                 await asyncio.sleep(DELAY_AFTER_BATCH) # Use async sleep
             else:
                  # Apply delay between individual queries
                  print(f"Sleeping for {DELAY_BETWEEN_QUERIES} seconds before next query...")
-                 time.sleep(DELAY_BETWEEN_QUERIES)
+                 await asyncio.sleep(DELAY_BETWEEN_QUERIES) # Use async sleep
 
         # This point is reached after processing all pending queries found in the current sheet check
         print("Finished processing current batch of pending queries.")
         # The loop will continue, checking the sheet again after the delay_if_no_queries if no new ones are found.
 
 if __name__ == "__main__":
+    # Wrap the async run_automation function in asyncio.run()
     print("\n--- Running Automated Queries Script ---")
     print("NOTE: This script continuously checks a Google Sheet for 'Pending' queries and runs them via the backend API.")
     print("Ensure API keys are configured in .env and the backend API is running.")
 
-    # Optional: Add a small initial delay before the first sheet check
-    # time.sleep(5)
+    # Optional: Add a small initial async delay before the first sheet check
+    # asyncio.run(asyncio.sleep(5))
 
-    run_automation()
+    try:
+        # Run the main async automation loop
+        asyncio.run(run_automation())
+    except KeyboardInterrupt:
+        print("\nAutomated Queries Script interrupted and stopping.")
+    except Exception as e:
+        print(f"\n--- Critical Automation Script Failure ---")
+        print(f"An unhandled exception occurred during the main automation loop: {type(e).__name__}: {e}")
+        traceback.print_exc()
+
     print("\n--- Automated Queries Script Finished ---")

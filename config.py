@@ -22,7 +22,7 @@ OPENROUTER_HEADERS = {
 # --- Search/DB Configuration ---
 GOOGLE_API_KEY_SEARCH = os.getenv("GOOGLE_API_KEY_SEARCH")
 GOOGLE_CX = os.getenv("GOOGLE_CX")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY") # Ensure SerpApi key is still read
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
@@ -50,7 +50,9 @@ print(f"Google Search API Key Found: {'Yes' if GOOGLE_API_KEY_SEARCH else 'No'}"
 print(f"Google Search CX ID Found: {'Yes' if GOOGLE_CX else 'No'}")
 if not GOOGLE_API_KEY_SEARCH or not GOOGLE_CX: print("ERROR: Google Search API Key or CX ID missing. Google Search WILL fail.")
 
-print(f"SerpApi Key Found: {'Yes' if SERPAPI_KEY else 'No'} (Used as backup or for Baidu)")
+print(f"SerpApi Key Found: {'Yes' if SERPAPI_KEY else 'No'} (Used as backup or for Baidu)") # Keep this check
+if not SERPAPI_KEY: print("Warning: SerpApi Key missing. SerpApi searches WILL fail.") # Add warning if missing
+
 print(f"Neo4j URI Found: {'Yes' if NEO4J_URI else 'No'}")
 print(f"Linkup API Key Found: {'Yes' if LINKUP_API_KEY else 'No'}")
 if not LINKUP_API_KEY: print("Warning: Linkup API Key missing. Linkup searches WILL fail.")
