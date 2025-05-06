@@ -4,7 +4,8 @@ from fastapi import FastAPI, Body, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import traceback
-import asyncio # Import asyncio as the orchestrator is now async
+import asyncio # Import asyncio
+import search_engines # Import search_engines to access check_linkup_balance
 
 import orchestrator
 import config
@@ -35,6 +36,25 @@ class AnalysisResponse(BaseModel):
     extracted_data_counts: Dict[str, int]
     linkup_structured_data_count: int
     wayback_results_count: int
+
+# Add an async startup event handler to check Linkup balance
+@app.on_event("startup")
+async def startup_event():
+    print("\n--- Running API Startup Tasks ---")
+    if search_engines.linkup_library_available and search_engines.linkup_search_enabled:
+        print("Checking Linkup balance during API startup...")
+        try:
+            balance = await search_engines.check_linkup_balance()
+            if balance is not None:
+                print(f"Linkup Available Credits: {balance:.4f}")
+            else:
+                print("Could not retrieve Linkup credit balance.")
+        except Exception as e:
+            print(f"Error during Linkup balance check at startup: {e}")
+            traceback.print_exc()
+    else:
+        print("Linkup search not enabled or library not available. Skipping balance check.")
+    print("--- API Startup Tasks Complete ---\n")
 
 
 # Convert the endpoint function to async and await the orchestrator call
@@ -128,4 +148,5 @@ def read_root():
 if __name__ == "__main__":
     import uvicorn
     print("Running FastAPI application with uvicorn...")
+    # Uvicorn automatically handles running the @app.on_event("startup") async function
     uvicorn.run("main_api:app", host="0.0.0.0", port=8000, reload=True)

@@ -52,15 +52,10 @@ DEFAULT_LLM_CONCURRENCY_LIMIT = 5 # Limit concurrent LLM calls
 # Initialize the semaphore
 LLM_SEMAPHORE = asyncio.Semaphore(DEFAULT_LLM_CONCURRENCY_LIMIT)
 
-# Define delays (might be less critical with semaphore, but can add buffer)
-# LLM_RELATIONSHIP_CHECK_DELAY = 0.2 # Adjusted for async - small delay between relation checks *if not using gather within*
-# LLM_TRANSLATION_DELAY = 0.1 # Adjusted for async - small delay between translation checks *if not using gather within*
-# With asyncio.gather and semaphore, these per-item delays might not be needed or should be managed differently.
-# Let's primarily rely on the semaphore for rate limiting now.
-
 
 def _get_llm_client_and_model(provider: str, model_name: str):
     """Initializes and returns the LLM client and effective model name. Checks for library availability."""
+    # This function remains synchronous as it's purely initialization and config check
     api_key = None
     client_or_lib = None
     client_type = None
@@ -123,7 +118,7 @@ def _get_llm_client_and_model(provider: str, model_name: str):
         try:
             genai.configure(api_key=api_key)
             try:
-                # Check models asynchronously if the SDK allows, or rely on sync method here.
+                # Check models synchronously if the SDK allows, or rely on sync method here.
                 # The current genai.list_models is sync.
                 list_models_response = genai.list_models()
                 available_models = [m.name for m in list_models_response if m.name.startswith('models/')]
@@ -159,7 +154,256 @@ def _get_llm_client_and_model(provider: str, model_name: str):
 
     return client_or_lib, client_type, effective_model_name
 
+# --- Async LLM Call Helper for Text Responses ---
+async def _call_llm_and_get_text(prompt: str, llm_provider: str, llm_model: str, function_name: str, max_tokens: int = 2000) -> Optional[str]:
+    """Helper function to call LLM expecting a text response (async). Acquires semaphore."""
+    raw_content = None
+    api_error = None
+    try:
+        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
+        if client_or_lib is None:
+            print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping LLM call. ---")
+            return None
+
+        # start_time = time.time() # Optional timing
+        async with LLM_SEMAPHORE: # Acquire the semaphore - limits concurrent LLM calls
+            if client_type == "openai_compatible":
+                if not openai_available: raise ImportError("OpenAI library not available")
+                request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": max_tokens}
+                try:
+                    response = await client_or_lib.chat.completions.create(**request_params)
+                    raw_content = response.choices[0].message.content
+                except Exception as e_call:
+                     print(f"--- [{function_name}] ERROR during async OpenAI call: {type(e_call).__name__}: {e_call} ---")
+                     api_error = e_call
+
+            elif client_type == "google_ai":
+                if not google_genai_available: raise ImportError("Google GenAI not available")
+                safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
+                generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=max_tokens);
+                try:
+                    response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
+                    if response_obj and response_obj.candidates and response_obj.candidates[0].content and response_obj.candidates[0].content.parts:
+                         raw_content = response_obj.text
+                    else:
+                         feedback = getattr(response_obj, 'prompt_feedback', None)
+                         block_reason = getattr(feedback, 'block_reason', 'Unknown')
+                         print(f"--- ERROR: Google AI BLOCKED for text response. Reason: {block_reason}. ---")
+                         api_error = ValueError(f"Google AI blocked: {block_reason}")
+
+                except Exception as e_google:
+                    print(f"--- [{function_name}] ERROR during async Google AI call: {type(e_google).__name__}: {e_google} ---")
+                    api_error = e_google
+            else:
+                raise ValueError("Unknown client type.")
+
+        # duration = time.time() - start_time # Optional timing
+        # if raw_content: print(f"--- [{function_name}] LLM text call took {duration:.2f} seconds. ---") # Optional timing log
+
+
+        if raw_content:
+            cleaned_content = raw_content.strip()
+            # Remove markdown code block syntax if present (more robust)
+            cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+            cleaned_content = re.sub(r'```$', '', cleaned_content)
+            # Remove leading/trailing quotes that some models add
+            cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
+            cleaned_content = cleaned_content.strip()
+            return cleaned_content
+
+        else:
+             print(f"--- [{function_name}] ERROR: Raw content from LLM was None or empty. Cannot return text. ---")
+             # Set a generic error if no API error occurred but content was empty
+             if api_error is None:
+                 api_error = ValueError("LLM returned None or empty content")
+             return None
+
+    except Exception as e:
+        print(f"--- [{function_name}] ERROR during async LLM text call setup/outer catch: {type(e).__name__}: {e} ---")
+        traceback.print_exc()
+        return None
+
+
+# --- Async LLM Call Helper for JSON Responses ---
+async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: str,
+                             function_name: str, attempt_json_mode: bool = True, max_tokens: int = 4000) -> Optional[Dict]:
+    """Helper function to call LLM expecting a JSON response and parse it (async). Acquires semaphore."""
+    raw_content = None
+    api_error = None
+    parsed_json = None
+    try:
+        # Check for LLM availability before making the call
+        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
+        if client_or_lib is None:
+             print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping LLM call. ---")
+             return None
+
+        # start_time = time.time() # Optional timing
+
+        async with LLM_SEMAPHORE: # Acquire the semaphore - limits concurrent LLM calls
+            if client_type == "openai_compatible":
+                if not openai_available: raise ImportError("OpenAI library not available")
+
+                request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": max_tokens}
+                # Attempt JSON mode only if the provider is OpenAI OR OpenRouter AND the model supports it
+                if attempt_json_mode and (llm_provider == "openai" or llm_provider == "openrouter") and any(m in model_name_used.lower() for m in ["gpt-4", "gpt-3.5-turbo", "gpt-4o", "gemini", "qwen", "command"]): # Added more model name indicators
+                     request_params["response_format"] = {"type": "json_object"}
+                     # Add a hint to the prompt for models that might need it (e.g. some OpenAI models require "json" keyword)
+                     # Although the response_format parameter is primary, this can help.
+                     if "json" not in prompt.lower() and "json object" not in prompt.lower() and "json array" not in prompt.lower():
+                          prompt = "Provide the response as a JSON object.\n\n" + prompt
+                          request_params["messages"] = [{"role": "user", "content": prompt}] # Update messages with new prompt
+
+
+                try:
+                     response = await client_or_lib.chat.completions.create(**request_params)
+                     raw_content = response.choices[0].message.content
+                     # response_obj = response # Optional: store response object for debugging
+                except Exception as e_call:
+                     # Retry without JSON mode if the error suggests response_format issue
+                     if attempt_json_mode and "response_format" in request_params and \
+                        any(err_txt in str(e_call).lower() for err_txt in ["response_format", "json_object", "messages must contain the word 'json", "invalid response format", "model is not available with this response_format type"]): # Added more error indicators
+                         print(f"--- [{function_name}] WARNING: LLM JSON mode likely failed ({type(e_call).__name__}). Retrying WITHOUT JSON mode... ---")
+                         del request_params["response_format"]
+                         # Restore original prompt for retry if we modified it
+                         if "Provide the response as a JSON object." in prompt:
+                             request_params["messages"] = [{"role": "user", "content": prompt.replace("Provide the response as a JSON object.\n\n", "", 1)}]
+                             print("--- [{function_name}] Restored original prompt for retry.")
+
+                         try:
+                             response = await client_or_lib.chat.completions.create(**request_params)
+                             raw_content = response.choices[0].message.content
+                             # response_obj = response
+                         except Exception as e_retry:
+                             print(f"--- [{function_name}] ERROR on retry without JSON mode: {type(e_retry).__name__}: {e_retry} ---")
+                             # traceback.print_exc() # Suppress verbose retry traceback
+                             api_error = e_retry
+                             raw_content = None
+                     else:
+                          # Log other OpenAI API call errors
+                          print(f"--- [{llm_provider}] API call error: {type(e_call).__name__}: {e_call} ---")
+                          traceback.print_exc() # Print traceback for unexpected API errors
+                          api_error = e_call
+                          raw_content = None
+
+            elif client_type == "google_ai":
+                if not google_genai_available: raise ImportError("Google GenAI not available")
+                safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
+                # Attempt JSON mime type only if the model name suggests it supports it (e.g., Gemini 1.5)
+                try_json_mime = attempt_json_mode and "gemini-1.5" in model_name_used.lower()
+                generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=max_tokens, response_mime_type="application/json" if try_json_mime else None )
+
+                try:
+                    response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
+                    if not response_obj.candidates:
+                        feedback = getattr(response_obj, 'prompt_feedback', None)
+                        block_reason = getattr(feedback, 'block_reason', 'Unknown')
+                        print(f"--- ERROR: Google AI BLOCKED for JSON response. Reason: {block_reason}. ---")
+                        api_error = ValueError(f"Google AI blocked: {block_reason}")
+                        raw_content = None
+                    elif hasattr(response_obj, 'text'):
+                         raw_content = response_obj.text
+                    else:
+                        # Handle cases where response_obj.text is missing but candidates exist
+                        print(f"--- WARNING: Google AI response has candidates but no text attribute. Response object: {response_obj} ---")
+                        raw_content = None # Treat as empty response
+
+                except Exception as e_google:
+                    print(f"--- [{function_name}] ERROR Google AI call: {type(e_google).__name__}: {e_google} ---")
+                    traceback.print_exc()
+                    api_error = e_google
+                    raw_content = None
+            else:
+                raise ValueError("Unknown client type.")
+
+        # duration = time.time() - start_time # Optional timing
+        # if raw_content: print(f"--- [{function_name}] LLM JSON call took {duration:.2f} seconds. ---") # Optional timing log
+
+
+        if raw_content:
+            # Clean and parse JSON from the raw content
+            try:
+                cleaned_content = raw_content.strip()
+                # Remove markdown code block syntax if present (more robust)
+                cleaned_content = re.sub(r'^```json\s*', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL) # Use ignorecase and dotall
+                cleaned_content = re.sub(r'```$', '', cleaned_content)
+                # Remove leading/trailing quotes that some models add
+                cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
+                cleaned_content = cleaned_content.strip()
+
+                # Find the first '{' or '[' and last '}' or ']' to isolate the JSON
+                json_start = min(cleaned_content.find('{') if '{' in cleaned_content else float('inf'),
+                                 cleaned_content.find('[') if '[' in cleaned_content else float('inf'))
+                json_end_obj = cleaned_content.rfind('}') + 1
+                json_end_array = cleaned_content.rfind(']') + 1
+                json_end = max(json_end_obj if json_end_obj > json_start else -1,
+                               json_end_array if json_end_array > json_start else -1)
+
+
+                if json_start != float('inf') and json_end != -1 and json_end > json_start:
+                    json_str = cleaned_content[json_start:json_end]
+                    # Basic check that it looks like a JSON object or array
+                    if (json_str.startswith('{') and json_str.endswith('}')) or (json_str.startswith('[') and json_str.endswith(']')):
+                         parsed_json = json.loads(json_str)
+                    else:
+                         # If braces/brackets were found but don't form a valid JSON string,
+                         # try parsing the whole cleaned content as a fallback.
+                         print(f"--- [{function_name}] WARNING: Found JSON delimiters, but string doesn't look like valid JSON. Attempting full cleaned content parse.")
+                         try:
+                              parsed_json = json.loads(cleaned_content)
+                         except Exception as e_fallback_parse:
+                              print(f"--- [{function_name}] ERROR fallback parsing cleaned content: {type(e_fallback_parse).__name__}: {e_fallback_parse} ---")
+                              api_error = e_fallback_parse
+                              parsed_json = None
+                else:
+                    # If no JSON delimiters were found, assume the whole cleaned content should be JSON
+                    print(f"--- [{function_name}] WARNING: Could not find JSON delimiters. Attempting full cleaned content parse.")
+                    try:
+                         parsed_json = json.loads(cleaned_content)
+                    except Exception as e_full_parse:
+                         print(f"--- [{function_name}] ERROR parsing cleaned content: {type(e_full_parse).__name__}: {e_full_parse} ---")
+                         api_error = e_full_parse
+                         parsed_json = None
+
+            except json.JSONDecodeError as json_e:
+                print(f"--- [{function_name}] ERROR decoding JSON: {json_e} ---")
+                # Print the content that failed to decode (potentially large)
+                print(f"--- [{function_name}] Content that failed to decode (first 500 chars): {cleaned_content[:500]} ---")
+                api_error = json_e
+                parsed_json = None
+            except Exception as parse_e:
+                print(f"--- [{function_name}] ERROR during JSON parsing: {type(parse_e).__name__}: {parse_e} ---")
+                traceback.print_exc()
+                api_error = parse_e
+                parsed_json = None
+        else:
+             print(f"--- [{function_name}] ERROR: Raw content from LLM was None or empty. Cannot parse. ---")
+             # Set a generic error if no API error occurred but content was empty
+             if api_error is None:
+                 api_error = ValueError("LLM returned None or empty content")
+
+        # Final check: ensure the parsed result is a dictionary as expected by most extraction functions
+        if parsed_json is not None and isinstance(parsed_json, dict):
+             # print(f"--- [{function_name}] Successfully Parsed JSON response. ---") # Suppress frequent log
+             return parsed_json
+        elif api_error is not None:
+             # If an API error occurred, report it
+             print(f"--- [{function_name}] ERROR: LLM call/parsing failed. Error: {type(api_error).__name__} ---")
+             return None # Return None on error
+        else:
+             # If parsed_json is not a dict (e.g., list, string, None after fallbacks) or some other issue
+             print(f"--- [{function_name}] ERROR: JSON obtained but not a dict, or unknown parsing issue. Parsed type: {type(parsed_json).__name__} ---")
+             # Optionally print the parsed content if not a dict for debugging
+             # print(f"--- [{function_name}] Parsed content: {parsed_json} ---")
+             return None # Return None if the final result isn't the expected format
+
+    except Exception as e:
+        print(f"--- [{function_name}] ERROR during async LLM call/setup (outer catch): {type(e).__name__}: {e} ---")
+        traceback.print_exc()
+        return None
+
 # --- Keyword Generation ---
+# This function now uses the async _call_llm_and_get_text helper
 async def translate_keywords_for_context(original_query: str, target_context: str,
                                    llm_provider: str, llm_model: str) -> List[str]:
     """Generates search keywords for a given context (async). Checks for LLM availability."""
@@ -168,104 +412,49 @@ async def translate_keywords_for_context(original_query: str, target_context: st
         print("Warning: Missing LLM config for keyword generation. Skipping.")
         return [original_query]
 
-    # Check for LLM availability before making the call
-    try:
-        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
-        if client_or_lib is None:
-            print(f"Warning: LLM client not available for keyword generation using {llm_provider}. Skipping keyword generation.")
-            return [original_query]
-    except Exception as e:
-         print(f"Error getting LLM client for keyword generation: {e}. Skipping keyword generation.")
+    prompt = f"""Expert keyword generator: Given the query and context below, provide a list of 3-5 relevant ENGLISH search keywords suitable for the context. If the query already contains Chinese characters and the context implies a Chinese search, you may include relevant Chinese keywords as well.
+IMPORTANT: Your entire response must contain ONLY the comma-separated list of keywords. Do NOT include any other text, explanation, or formatting."""
+
+    # Use the async text helper
+    raw_content = await _call_llm_and_get_text(
+         prompt, llm_provider, llm_model, "Keyword Generation", max_tokens=150
+    )
+
+    if not raw_content:
+         print("Warning: Keyword generation returned no content. Returning original query.")
          return [original_query]
 
 
-    prompt = f"""Expert keyword generator: Given the query and context below, provide a list of 3-5 relevant ENGLISH search keywords suitable for the context. If the query already contains Chinese characters and the context implies a Chinese search, you may include relevant Chinese keywords as well.
-Initial Query: {original_query}
-Target Search Context: {target_context}
-IMPORTANT: Your entire response must contain ONLY the comma-separated list of keywords. Do NOT include any other text, explanation, or formatting."""
+    prefixes_to_remove = ["Sure, here are the keywords:", "Here are the keywords:", "Okay, here is the list:", "Here is the list:", "Of course! Here are the keywords:", "Keywords:"] # Added "Keywords:"
+    cleaned_content = raw_content
+    for prefix in prefixes_to_remove:
+        if cleaned_content.lower().startswith(prefix.lower()):
+            cleaned_content = cleaned_content[len(prefix):].strip()
+            break
 
-    raw_content = ""
-    try:
-        # Use the async LLM call helper
-        parsed_json_response = await _call_llm_and_parse_json(
-             prompt, llm_provider, llm_model, "Keyword Generation", attempt_json_mode=False # Don't expect JSON here
-        )
+    if '\n' in cleaned_content:
+         cleaned_content = cleaned_content.split('\n')[0]
 
-        # _call_llm_and_parse_json returns a dict or None. We didn't expect JSON, so we need the raw text.
-        # We can get the raw text from the parsed_json_response if _call_llm_and_parse_json
-        # was modified to return the raw text instead of parsing, OR we can add a specific
-        # async LLM call helper that just returns raw text.
-        # Let's add a simpler async helper just for text responses without JSON parsing.
+    # Allow Chinese characters, but remove quotes/markdown if they appear
+    cleaned_content = cleaned_content.replace('"', '').replace("'", '').strip()
+    cleaned_content = re.sub(r'^```.*?```', '', cleaned_content, flags=re.DOTALL).strip() # Remove code block if it wasn't fully cleaned
 
-        # Reverting to a direct async call here for text response, without the JSON parsing helper.
-        # This requires getting the client again, but avoids complicating the JSON helper.
-        try:
-            client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
-            if client_or_lib is None: raise ValueError("LLM Client unavailable")
+    keywords = [kw.strip() for kw in cleaned_content.split(',') if kw.strip()]
 
-            async with LLM_SEMAPHORE: # Acquire semaphore for text calls too
-                 if client_type == "openai_compatible":
-                     request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 150}
-                     response = await client_or_lib.chat.completions.create(**request_params)
-                     raw_content = response.choices[0].message.content.strip()
+    conversational_fillers = ["sorry", "apologize", "cannot", "unable", "provide", "based", "above", "snippets", "context", "hello", "hi", "greetings", "list of keywords"] # Added "list of keywords"
+    if not keywords or len(cleaned_content) < 10 or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers):
+         print(f"Warning: Keyword response conversational/empty/unhelpful ('{cleaned_content[:100]}...'). Returning original.")
+         return [original_query]
 
-                 elif client_type == "google_ai":
-                     if not google_genai_available: raise ImportError("Google GenAI not available")
-                     safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
-                     generation_config = genai.types.GenerationConfig(temperature=0.2, max_output_tokens=150);
-                     response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
-
-                     if not response_obj.candidates:
-                         feedback = getattr(response_obj, 'prompt_feedback', None)
-                         block_reason = getattr(feedback, 'block_reason', 'Unknown')
-                         print(f"--- ERROR: Google AI BLOCKED for Keyword Gen. Reason: {block_reason}. ---")
-                         raw_content = ""
-                     else:
-                         raw_content = response_obj.text.strip()
-
-                 else:
-                     raise ValueError("Unknown client type.")
-
-        except Exception as e_call:
-            print(f"ERROR during async LLM call for keyword generation: {type(e_call).__name__}: {e_call}")
-            # traceback.print_exc() # Suppress verbose traceback for expected API errors
-            raw_content = "" # Ensure raw_content is empty on error
+    # Filter out keywords that are just punctuation or very short non-meaningful strings
+    keywords = [kw for kw in keywords if len(kw) > 1 and not all(c in '.,!?"\'' for c in kw)]
 
 
-        prefixes_to_remove = ["Sure, here are the keywords:", "Here are the keywords:", "Okay, here is the list:", "Here is the list:", "Of course! Here are the keywords:", "Keywords:"] # Added "Keywords:"
-        cleaned_content = raw_content
-        for prefix in prefixes_to_remove:
-            if cleaned_content.lower().startswith(prefix.lower()):
-                cleaned_content = cleaned_content[len(prefix):].strip()
-                break
-
-        if '\n' in cleaned_content:
-             cleaned_content = cleaned_content.split('\n')[0]
-
-        # Allow Chinese characters, but remove quotes/markdown if they appear
-        cleaned_content = cleaned_content.replace('"', '').replace("'", '').strip()
-        cleaned_content = re.sub(r'^```.*?```', '', cleaned_content, flags=re.DOTALL).strip() # Remove code block if it wasn't fully cleaned
-
-        keywords = [kw.strip() for kw in cleaned_content.split(',') if kw.strip()]
-
-        conversational_fillers = ["sorry", "apologize", "cannot", "unable", "provide", "based", "above", "snippets", "context", "hello", "hi", "greetings", "list of keywords"] # Added "list of keywords"
-        if not keywords or len(cleaned_content) < 10 or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers):
-             print(f"Warning: Keyword response conversational/empty/unhelpful ('{cleaned_content[:100]}...'). Returning original.")
-             return [original_query]
-
-        # Filter out keywords that are just punctuation or very short non-meaningful strings
-        keywords = [kw for kw in keywords if len(kw) > 1 and not all(c in '.,!?"\'' for c in kw)]
-
-
-        print(f"Parsed Keywords: {keywords}")
-        return keywords
-
-    except Exception as e:
-        print(f"ERROR during async keyword generation (outer catch): {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return [original_query]
+    print(f"Parsed Keywords: {keywords}")
+    return keywords
 
 # --- Translation Functions ---
+# This function now uses the async _call_llm_and_get_text helper
 async def translate_text(text: str, target_language: str, llm_provider: str, llm_model: str) -> Optional[str]:
     """Translates a single piece of text using the LLM (async). Checks for LLM availability."""
     if not text or not isinstance(text, str) or not llm_provider or not llm_model:
@@ -303,72 +492,31 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
     # Put text to translate separately to avoid issues with f-string and user text
     full_prompt = f"{prompt}\n\nText to translate:\n{text}"
 
+    # Use the async text helper
+    raw_content = await _call_llm_and_get_text(
+        full_prompt, llm_provider, llm_model, "Translation", max_tokens=min(len(text) * 3, 2000) # Adjust max tokens based on input size
+    )
 
-    raw_content = None
-    api_error = None
-    try:
-        # Use the async LLM call helper for text response
-        # This re-implements the text-only part from the keyword generation function
-        try:
-            client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
-            if client_or_lib is None: raise ValueError("LLM Client unavailable")
-
-            async with LLM_SEMAPHORE: # Acquire semaphore
-                 if client_type == "openai_compatible":
-                     # Adjust max_tokens based on input text length
-                     request_params = {"model": model_name_used, "messages": [{"role": "user", "content": full_prompt}], "temperature": 0.1, "max_tokens": min(len(text) * 3, 2000)}
-                     response = await client_or_lib.chat.completions.create(**request_params)
-                     raw_content = response.choices[0].message.content
-
-                 elif client_type == "google_ai":
-                     if not google_genai_available: raise ImportError("Google GenAI not available")
-                     safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
-                     # Adjust max_output_tokens based on input text length
-                     generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=min(len(text) * 3, 2000));
-                     response_obj = await client_or_lib.generate_content(full_prompt, generation_config=generation_config, safety_settings=safety_settings);
-
-                     if response_obj and response_obj.candidates and response_obj.candidates[0].content and response_obj.candidates[0].content.parts:
-                          raw_content = response_obj.text
-                     else:
-                          feedback = getattr(response_obj, 'prompt_feedback', None)
-                          block_reason = getattr(feedback, 'block_reason', 'Unknown')
-                          print(f"Warning: Google AI Translation BLOCKED or EMPTY. Reason: {block_reason}.");
-                          api_error = ValueError(f"Google AI blocked: {block_reason}")
-                          raw_content = None # Ensure raw_content is None if blocked/empty
-
-                 else:
-                     raise ValueError("Unknown client type.")
-
-        except Exception as e_call:
-             print(f"ERROR during async LLM call for translation: {type(e_call).__name__}: {e_call}")
-             # traceback.print_exc() # Suppress verbose traceback for expected API errors
-             api_error = e_call
-             raw_content = None # Ensure raw_content is None on error
+    if not raw_content:
+         print(f"Warning: Translation returned no content for text: '{text[:50]}...'.")
+         return None
 
 
-        if raw_content:
-            cleaned_content = raw_content.strip()
-            # Remove markdown code block syntax if present
-            cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.DOTALL) # More robust removal
-            cleaned_content = re.sub(r'```$', '', cleaned_content)
-            # Remove leading/trailing quotes that some models add
-            cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
-            cleaned_content = cleaned_content.strip()
+    cleaned_content = raw_content.strip()
+    # Remove markdown code block syntax if present (more robust)
+    cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_content = re.sub(r'```$', '', cleaned_content)
+    # Remove leading/trailing quotes that some models add
+    cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
+    cleaned_content = cleaned_content.strip()
 
 
-            conversational_fillers = ["sorry", "apologize", "cannot", "unable", "translate", "based on", "above", "text", "hello", "hi", "greetings"]
-            if not cleaned_content or len(cleaned_content) < min(len(text) * 0.5, 20) or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers): # Check minimum length relative to original
-                print(f"Warning: Translation response short/empty/conversational: '{cleaned_content[:100]}...'")
-                return None
+    conversational_fillers = ["sorry", "apologize", "cannot", "unable", "translate", "based on", "above", "text", "hello", "hi"]
+    if not cleaned_content or len(cleaned_content) < min(len(text) * 0.5, 20) or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers): # Check minimum length relative to original
+        print(f"Warning: Translation response short/empty/conversational: '{cleaned_content[:100]}...' for text '{text[:50]}...'.")
+        return None
 
-            return cleaned_content
-
-    except Exception as e:
-        print(f"ERROR during async translation (outer catch): {type(e).__name__}: {e}")
-        traceback.print_exc()
-        # Use the API error if one occurred, otherwise report the outer catch error
-        return None if api_error else None
-
+    return cleaned_content
 
 async def translate_snippets(snippets: List[Dict[str, Any]], target_language: str, llm_provider: str, llm_model: str) -> List[Dict[str, Any]]:
     """Translates a list of snippets to the target language (async). Checks for LLM availability."""
@@ -395,6 +543,7 @@ async def translate_snippets(snippets: List[Dict[str, Any]], target_language: st
               return snippet_data # Return invalid/empty snippets as is
 
          original_snippet = snippet_data['snippet']
+         # Await the async translate_text call
          translated_snippet_content = await translate_text(original_snippet, target_language, llm_provider, llm_model)
 
          if translated_snippet_content is not None:
@@ -417,6 +566,7 @@ async def translate_snippets(snippets: List[Dict[str, Any]], target_language: st
     translation_tasks = [translate_single_snippet(s) for s in snippets]
 
     # Run translation tasks concurrently
+    # asyncio.gather automatically respects the semaphore used within translate_single_snippet's call to _call_llm_and_get_text
     translated_snippets = await asyncio.gather(*translation_tasks)
 
 
@@ -469,187 +619,10 @@ def _prepare_context_text(search_results: List[Dict[str, Any]]) -> Tuple[str, in
                 break
     return context_text, added_snippets
 
-async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: str,
-                             function_name: str, attempt_json_mode: bool = True) -> Optional[Dict]:
-    """Helper function to call LLM expecting a JSON response and parse it (async). Checks for LLM availability and uses semaphore."""
-    raw_content = None
-    api_error = None
-    parsed_json = None
-    try:
-        # Check for LLM availability before making the call
-        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
-        if client_or_lib is None:
-             print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping LLM call. ---")
-             return None
-
-        start_time = time.time()
-        response_obj = None
-
-        async with LLM_SEMAPHORE: # Acquire the semaphore - limits concurrent LLM calls
-            if client_type == "openai_compatible":
-                # Check for library availability
-                if not openai_available:
-                     print(f"--- [{function_name}] OpenAI library not available. Skipping LLM call. ---")
-                     return None
-
-                request_params = {"model": model_name_used, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
-                # Attempt JSON mode only if the provider is OpenAI OR OpenRouter AND the model supports it
-                # OpenRouter often supports JSON mode even with non-OpenAI models via their API layer.
-                if attempt_json_mode and (llm_provider == "openai" or llm_provider == "openrouter") and any(m in model_name_used.lower() for m in ["gpt-4", "gpt-3.5-turbo", "gpt-4o", "gemini", "qwen", "command"]): # Added more model name indicators
-                     request_params["response_format"] = {"type": "json_object"}
-                     # Add a hint to the prompt for models that might need it (e.g. some OpenAI models require "json" keyword)
-                     # Although the response_format parameter is primary, this can help.
-                     if "json" not in prompt.lower() and "json object" not in prompt.lower():
-                          prompt = "Provide the response as a JSON object.\n\n" + prompt
-                          request_params["messages"] = [{"role": "user", "content": prompt}] # Update messages with new prompt
+# _call_llm_and_parse_json is already an async helper now
 
 
-                try:
-                     response = await client_or_lib.chat.completions.create(**request_params)
-                     raw_content = response.choices[0].message.content
-                     response_obj = response
-                except Exception as e_call:
-                     # Retry without JSON mode if the error suggests response_format issue
-                     if attempt_json_mode and "response_format" in request_params and \
-                        any(err_txt in str(e_call).lower() for err_txt in ["response_format", "json_object", "messages must contain the word 'json", "invalid response format", "model is not available with this response_format type"]): # Added more error indicators
-                         print(f"--- [{function_name}] WARNING: LLM JSON mode likely failed ({type(e_call).__name__}). Retrying WITHOUT JSON mode... ---")
-                         del request_params["response_format"]
-                         # Restore original prompt for retry if we modified it
-                         if "Provide the response as a JSON object." in prompt:
-                             request_params["messages"] = [{"role": "user", "content": prompt.replace("Provide the response as a JSON object.\n\n", "", 1)}]
-                             print("--- [{function_name}] Restored original prompt for retry.")
-
-                         try:
-                             response = await client_or_lib.chat.completions.create(**request_params)
-                             raw_content = response.choices[0].message.content
-                             response_obj = response
-                         except Exception as e_retry:
-                             print(f"--- [{function_name}] ERROR on retry without JSON mode: {type(e_retry).__name__}: {e_retry} ---")
-                             # traceback.print_exc() # Suppress verbose retry traceback
-                             api_error = e_retry
-                             raw_content = None
-                     else:
-                          # Log other OpenAI API call errors
-                          print(f"--- [{llm_provider}] API call error: {type(e_call).__name__}: {e_call} ---")
-                          traceback.print_exc() # Print traceback for unexpected API errors
-                          api_error = e_call
-                          raw_content = None
-
-            elif client_type == "google_ai":
-                # Check for library availability
-                if not google_genai_available:
-                     print(f"--- [{function_name}] Google Generative AI library not available. Skipping LLM call. ---")
-                     return None
-
-                safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
-                # Attempt JSON mime type only if the model name suggests it supports it (e.g., Gemini 1.5)
-                try_json_mime = attempt_json_mode and "gemini-1.5" in model_name_used.lower()
-                generation_config = genai.types.GenerationConfig(temperature=0.1, response_mime_type="application/json" if try_json_mime else None )
-
-                try:
-                    response = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
-                    response_obj = response
-                    if not response.candidates:
-                        feedback = getattr(response, 'prompt_feedback', None)
-                        block_reason = getattr(feedback, 'block_reason', 'Unknown')
-                        print(f"--- ERROR: Google AI BLOCKED. Reason: {block_reason}. ---")
-                        api_error = ValueError(f"Google AI blocked: {block_reason}")
-                        raw_content = None
-                    elif hasattr(response_obj, 'text'):
-                         raw_content = response_obj.text
-                    else:
-                        # Handle cases where response_obj.text is missing but candidates exist
-                        print(f"--- WARNING: Google AI response has candidates but no text attribute. Response object: {response_obj} ---")
-                        raw_content = None # Treat as empty response
-
-                except Exception as e_google:
-                    print(f"--- [{function_name}] ERROR Google AI call: {type(e_google).__name__}: {e_google} ---")
-                    traceback.print_exc()
-                    api_error = e_google
-                    raw_content = None
-            else:
-                raise ValueError("Unknown client type.")
-
-        duration = time.time() - start_time
-        # print(f"--- [{function_name}] LLM call took {duration:.2f} seconds. ---") # Optional timing log
-
-
-        if raw_content:
-            # Clean and parse JSON from the raw content
-            try:
-                cleaned_content = raw_content.strip()
-                # Remove markdown code block syntax if present
-                cleaned_content = re.sub(r'^```json\s*', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL) # Use ignorecase and dotall
-                cleaned_content = re.sub(r'```$', '', cleaned_content)
-                cleaned_content = cleaned_content.strip()
-
-                # Find the first '{' and last '}' to isolate the JSON object
-                json_start = cleaned_content.find('{')
-                json_end = cleaned_content.rfind('}') + 1
-
-                if json_start != -1 and json_end != -1 and json_end > json_start:
-                    json_str = cleaned_content[json_start:json_end]
-                    # Basic check that it looks like a JSON object
-                    if json_str.startswith('{') and json_str.endswith('}'):
-                         parsed_json = json.loads(json_str)
-                    else:
-                         # If braces were found but don't form a valid JSON object string,
-                         # try parsing the whole cleaned content as a fallback.
-                         print(f"--- [{function_name}] WARNING: Found braces, but string doesn't look like a valid JSON object. Attempting full cleaned content parse.")
-                         try:
-                              parsed_json = json.loads(cleaned_content)
-                         except Exception as e_fallback_parse:
-                              print(f"--- [{function_name}] ERROR fallback parsing cleaned content: {type(e_fallback_parse).__name__}: {e_fallback_parse} ---")
-                              api_error = e_fallback_parse
-                              parsed_json = None
-                else:
-                    # If no braces were found, assume the whole cleaned content should be JSON
-                    print(f"--- [{function_name}] WARNING: Could not find JSON braces. Attempting full cleaned content parse.")
-                    try:
-                         parsed_json = json.loads(cleaned_content)
-                    except Exception as e_full_parse:
-                         print(f"--- [{function_name}] ERROR parsing cleaned content: {type(e_full_parse).__name__}: {e_full_parse} ---")
-                         api_error = e_full_parse
-                         parsed_json = None
-
-            except json.JSONDecodeError as json_e:
-                print(f"--- [{function_name}] ERROR decoding JSON: {json_e} ---")
-                # Print the content that failed to decode (potentially large)
-                print(f"--- [{function_name}] Content that failed to decode (first 500 chars): {cleaned_content[:500]} ---")
-                api_error = json_e
-                parsed_json = None
-            except Exception as parse_e:
-                print(f"--- [{function_name}] ERROR during JSON parsing: {type(parse_e).__name__}: {parse_e} ---")
-                traceback.print_exc()
-                api_error = parse_e
-                parsed_json = None
-        else:
-             print(f"--- [{function_name}] ERROR: Raw content from LLM was None or empty. Cannot parse. ---")
-             # Set a generic error if no API error occurred but content was empty
-             if api_error is None:
-                 api_error = ValueError("LLM returned None or empty content")
-
-        # Final check: ensure the parsed result is a dictionary as expected
-        if parsed_json is not None and isinstance(parsed_json, dict):
-             # print(f"--- [{function_name}] Successfully Parsed JSON response. ---") # Suppress frequent log
-             return parsed_json
-        elif api_error is not None:
-             # If an API error occurred, report it
-             print(f"--- [{function_name}] ERROR: LLM call/parsing failed. Error: {type(api_error).__name__} ---")
-             return None # Return None on error
-        else:
-             # If parsed_json is not a dict (e.g., list, string, None after fallbacks) or some other issue
-             print(f"--- [{function_name}] ERROR: JSON obtained but not a dict, or unknown parsing issue. Parsed type: {type(parsed_json).__name__} ---")
-             # Optionally print the parsed content if not a dict for debugging
-             # print(f"--- [{function_name}] Parsed content: {parsed_json} ---")
-             return None # Return None if the final result isn't the expected format
-
-    except Exception as e:
-        print(f"--- [{function_name}] ERROR during LLM call/setup (outer catch): {type(e).__name__}: {e} ---")
-        traceback.print_exc()
-        return None
-
-
+# Extraction functions using _call_llm_and_parse_json now need to be async
 async def extract_entities_only(search_results: List[Dict[str, Any]], extraction_context: str,
                           llm_provider: str, llm_model: str) -> List[Dict]:
     """Extracts entities (COMPANY, ORGANIZATION, REGULATORY_AGENCY, SANCTION) based on schema (async). Checks for LLM availability."""
@@ -660,7 +633,7 @@ async def extract_entities_only(search_results: List[Dict[str, Any]], extraction
     try:
         client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
         if client_or_lib is None:
-             print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping entity extraction. ---")
+             print(f"Warning: LLM client not available for {llm_provider}. Skipping entity extraction. ---")
              return []
     except Exception as e:
          print(f"Error getting LLM client for entity extraction: {e}. Skipping entity extraction.")
@@ -689,8 +662,7 @@ Response MUST be ONLY a single valid JSON object like {{"entities": [...]}}. Use
 Begin analysis of text snippets:
 {context_text}
 """
-    # No chunking needed here as we're sending the whole context at once to the LLM
-    # for initial entity extraction.
+    # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_entities = []
@@ -737,6 +709,7 @@ Begin analysis of text snippets:
     print(f"--- [{function_name}] Returning {len(validated_entities)} validated entities ({', '.join(allowed_entity_types)} only). ---")
     return validated_entities
 
+# Extraction functions using _call_llm_and_parse_json now need to be async
 async def extract_risks_only(search_results: List[Dict[str, Any]], extraction_context: str,
                        llm_provider: str, llm_model: str) -> List[Dict]:
     """Extracts only risks (desc, severity, source_urls) based on the schema (async). Checks for LLM availability."""
@@ -773,7 +746,7 @@ Response MUST be ONLY a single valid JSON object like {{"risks": [...]}}. Use em
 Begin analysis of text snippets:
 {context_text}
 """
-    # No chunking needed here as we're sending the whole context at once to the LLM
+    # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_risks = []
@@ -807,6 +780,7 @@ Begin analysis of text snippets:
     print(f"--- [{function_name}] Returning {len(validated_risks)} validated risks (initially without related_entities). ---")
     return validated_risks
 
+# Risk linking function uses _call_llm_and_parse_json and can process risks concurrently
 async def link_entities_to_risk(risks: List[Dict],
                           list_of_entity_names: List[str],
                           all_snippets_map: Mapping[str, Dict[str, Any]],
@@ -921,7 +895,8 @@ Your response MUST be ONLY a single valid JSON object with a single key "related
 
         related_entity_names = []
         # Use async LLM call helper for this risk
-        parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
+        # Max tokens for this call might be less than overall JSON calls, as it's just a list of names
+        parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True, max_tokens=500) # Limited tokens
 
         if parsed_json is not None and isinstance(parsed_json.get("related_entities"), list):
              entity_list_from_llm = parsed_json["related_entities"]
@@ -947,6 +922,7 @@ Your response MUST be ONLY a single valid JSON object with a single key "related
     linking_tasks = [link_single_risk(i, risk) for i, risk in enumerate(snippet_risks_to_link)]
 
     # Run linking tasks concurrently
+    # asyncio.gather automatically respects the semaphore used within link_single_risk's call to _call_llm_and_parse_json
     updated_risks_from_linking = await asyncio.gather(*linking_tasks)
 
     print(f"--- [{function_name}] Finished async entity linking. ---")
@@ -954,6 +930,7 @@ Your response MUST be ONLY a single valid JSON object with a single key "related
     # Return the combined list of risks that were updated and those that were not snippet risks
     return updated_risks_from_linking + other_risks
 
+# Extraction functions using _call_llm_and_parse_json now need to be async
 async def extract_relationships_only(search_results: List[Dict[str, Any]], extraction_context: str,
                                entities: List[Dict],
                                llm_provider: str, llm_model: str) -> List[Dict]:
@@ -1004,7 +981,7 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
 Begin analysis of text snippets:
 {context_text}
 """
-    # No chunking needed here as we're sending the whole context at once
+    # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_relationships = []
@@ -1044,6 +1021,7 @@ Begin analysis of text snippets:
     print(f"--- [{function_name}] Returning {len(validated_relationships)} validated relationships (Ownership/Affiliate/JV only). ---")
     return validated_relationships
 
+# Extraction functions using _call_llm_and_parse_json now need to be async
 async def extract_ownership_involving_entity(text_snippets: List[Dict[str, Any]], target_entity_name: str,
                                        llm_provider: str, llm_model: str) -> List[Dict]:
     """
@@ -1111,7 +1089,7 @@ Schema:
 Ensure BOTH entity1 and entity2 are COMPANY or ORGANIZATION names. If the exact nature isn't clear but they are mentioned together in a corporate/financial context suggesting a link, use "RELATED_COMPANY".
 Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
 
-    # No chunking needed here as we're sending the whole context at once
+    # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_relationships = []
@@ -1130,12 +1108,19 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
 
              if entity1_name and isinstance(entity1_name, str) and entity2_name and isinstance(entity2_name, str) and \
                 rel_type_raw and isinstance(rel_type_raw, str) and rel_type_raw.lower() in allowed_types_lower and \
-                isinstance(context_urls, list) and context_urls and all(isinstance(u, str) for u in context_urls) and \
-                (entity1_name.strip().lower() == target_entity_name.lower() or entity2_name.strip().lower() == target_entity_name.lower()):
+                isinstance(context_urls, list) and context_urls and all(isinstance(u, str) for u in context_urls):
 
-                 rel['_source_type'] = 'targeted_snippet_llm' # Add internal source type
-                 validated_relationships.append(rel)
-             else: print(f"--- [{function_name}] Skipping invalid or incomplete relationship item (doesn't match schema, not allowed type, or doesn't involve target entity): {rel} ---")
+                 e1_name_lower = entity1_name.strip().lower()
+                 e2_name_lower = entity2_name.strip().lower()
+
+                 # Double check that AT LEAST ONE entity is the target entity (case-insensitive)
+                 if e1_name_lower == target_entity_name.lower() or e2_name_lower == target_entity_name.lower():
+                      rel['_source_type'] = 'targeted_snippet_llm' # Add internal source type
+                      validated_relationships.append(rel)
+                 else:
+                      # This shouldn't happen if the LLM followed instructions, but safety check
+                      print(f"--- [{function_name}] Skipping relationship item because neither entity ('{entity1_name}', '{entity2_name}') is the target entity '{target_entity_name}': {rel} ---")
+             else: print(f"--- [{function_name}] Skipping invalid or incomplete relationship item (doesn't match schema, not allowed type, or missing mandatory fields): {rel} ---")
     else:
          # Log if the expected 'relationships' list was not found or was not a list
          print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
@@ -1145,6 +1130,7 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
     return validated_relationships
 
 
+# Extraction functions using _call_llm_and_parse_json now need to be async
 async def extract_regulatory_sanction_relationships(search_results: List[Dict[str, Any]], extraction_context: str,
                                               entities: List[Dict],
                                               llm_provider: str, llm_model: str) -> List[Dict]:
@@ -1207,9 +1193,12 @@ Relationship Types:
 
 Focus ONLY on relationships where BOTH entity1 and entity2 are from the provided list of identified entities.
 The relationship_type MUST be one of: REGULATED_BY, ISSUED_BY, SUBJECT_TO, or MENTIONED_WITH.
-Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
+Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. No explanations or markdown.
 
-    # No chunking needed here as we're sending the whole context at once
+Begin analysis of text snippets:
+{context_text}
+"""
+    # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_relationships = []
@@ -1258,7 +1247,7 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
                       elif r_type_upper == "SUBJECT_TO":
                            if e1_type not in ["COMPANY", "ORGANIZATION"] or e2_type not in ["SANCTION", "REGULATORY_AGENCY"]: is_valid_rel_type = False
                       elif r_type_upper == "MENTIONED_WITH":
-                          # MENTIONED_WITH can be between any of the allowed entity types (COMPANY, ORGANIZATION, REGULATORY_AGENCY, SANCTION)
+                          # MENTIONED_WITH can be between any of the allowed entity types
                           if e1_type not in allowed_entity_types or e2_type not in allowed_entity_types: is_valid_rel_type = False
 
 
@@ -1518,6 +1507,7 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
     }
 
 
+# Summary generation needs to be async
 async def generate_analysis_summary(results: Dict[str, Any], query: str, exposures_count: int,
                               llm_provider: str, llm_model: str) -> str:
     """Generates a concise analysis summary using the LLM (async). Accepts the full results dict."""
@@ -1528,7 +1518,7 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
     try:
         client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
         if client_or_lib is None:
-             print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping summary generation. ---")
+             print(f"Warning: LLM client not available for {llm_provider}. Skipping summary generation. ---")
              return "Summary generation skipped: LLM client not available."
     except Exception as e:
          print(f"Error getting LLM client for summary generation: {e}. Skipping.")
@@ -1702,45 +1692,11 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
 
     try:
         llm_to_use = llm_model; provider_to_use = llm_provider
-        client_or_lib, client_type, model_name_used = _get_llm_client_and_model(provider_to_use, llm_to_use); raw_content = ""
-        print(f"Sending summary request to {provider_to_use} ({model_name_used})...")
 
-        messages = [{"role": "user", "content": prompt}]
-        temperature = 0.5
-        max_tokens = 350
-
-        async with LLM_SEMAPHORE: # Acquire semaphore for summary call
-            if client_type == "openai_compatible":
-                 if not openai_available:
-                     print("Warning: OpenAI library not available for summary generation.")
-                     return "Summary generation skipped: OpenAI library missing."
-
-                 response = await client_or_lib.chat.completions.create(
-                     model=model_name_used,
-                     messages=messages,
-                     temperature=temperature,
-                     max_tokens=max_tokens
-                 )
-                 raw_content = response.choices[0].message.content.strip()
-
-            elif client_type == "google_ai":
-                if not google_genai_available:
-                     print("Warning: Google Generative AI library not available for summary generation.")
-                     return "Summary generation skipped: Google Generative AI library missing."
-
-                safety_settings = [ {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"} for c in genai.types.HarmCategory if c != genai.types.HarmCategory.HARM_CATEGORY_UNSPECIFIED]
-                generation_config = genai.types.GenerationConfig(temperature=temperature, max_output_tokens=max_tokens);
-                response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
-
-                if response_obj and response_obj.candidates and response_obj.candidates[0].content and response_obj.candidates[0].content.parts:
-                     raw_content = response_obj.text.strip()
-                else:
-                     feedback = getattr(response_obj, 'prompt_feedback', None)
-                     block_reason = getattr(feedback, 'block_reason', 'Unknown')
-                     print(f"Warning: Google AI summary blocked/empty. Reason: {block_reason}.");
-                     raw_content = "Summary generation skipped: Google AI response error."
-            else:
-                raise ValueError("Unknown client type")
+        # Use the async text helper for summary generation
+        raw_content = await _call_llm_and_get_text(
+             prompt, llm_provider, llm_model, function_name, max_tokens=350 # Limit tokens for summary
+        )
 
         cleaned_summary = ""
         if raw_content:
@@ -1810,20 +1766,23 @@ if __name__ == "__main__":
 
 
             print("\nTesting async Keyword Translation...")
-            # Pass provider/model to the function call
-            kws = await translate_keywords_for_context("supply chain compliance issues 2023", "Baidu search in China", provider_to_test, model_to_test); print(f"Keywords: {kws}"); time.sleep(1)
+            # Pass provider/model to the function call and await
+            kws = await translate_keywords_for_context("supply chain compliance issues 2023", "Baidu search in China", provider_to_test, model_to_test); print(f"Keywords: {kws}"); time.sleep(1) # Use sync sleep in test
+
 
             print("\nTesting async Text Translation (English to Chinese)...")
             test_english_text = "Hello, world! This is a test snippet."
-            # Pass provider/model to the function call
+            # Pass provider/model to the function call and await
             translated_chinese = await translate_text(test_english_text, 'zh', provider_to_test, model_to_test)
-            print(f"Original: {test_english_text}\nTranslated (Chinese): {translated_chinese}"); time.sleep(1)
+            print(f"Original: {test_english_text}\nTranslated (Chinese): {translated_chinese}"); time.sleep(1) # Use sync sleep in test
+
 
             print("\nTesting async Text Translation (Chinese to English)...")
             test_chinese_text = "你好，世界！这是一个测试片段。"
-            # Pass provider/model to the function call
+            # Pass provider/model to the function call and await
             translated_english = await translate_text(test_chinese_text, 'en', provider_to_test, model_to_test)
-            print(f"Original: {test_chinese_text}\nTranslated (English): {translated_english}"); time.sleep(1)
+            print(f"Original: {test_chinese_text}\nTranslated (English): {translated_english}"); time.sleep(1) # Use sync sleep in test
+
 
             print("\nTesting async Snippet Translation (Chinese to English)...")
             test_snippets_zh = [
@@ -1832,10 +1791,10 @@ if __name__ == "__main__":
                  # Add an English one to test it's not translated
                  {"title": "English Article", "url": "https://example.com/en1", "snippet": "This is an English test snippet.", "source": "google_cse", "original_language": "en"}
             ]
-            # Pass provider/model to the function call
+            # Pass provider/model to the function call and await
             translated_snippets_list = await translate_snippets(test_snippets_zh, 'en', provider_to_test, model_to_test)
             print("\nTranslated Snippets:")
-            print(json.dumps(translated_snippets_list, indent=2)); time.sleep(1)
+            print(json.dumps(translated_snippets_list, indent=2)); time.sleep(1) # Use sync sleep in test
 
 
             print("\nTesting async Multi-Call Data Extraction & Linking (using sample snippets including translated)...")
@@ -1847,55 +1806,59 @@ if __name__ == "__main__":
             test_context = "financial sector compliance, regulatory actions, and sanctions"
 
             print("\nExtracting Entities (COMPANY, ORGANIZATION, REGULATORY_AGENCY, SANCTION) from Combined/Translated Snippets...")
-            # Pass provider/model to the function call
+            # Pass provider/model to the function call and await
             test_entities = await extract_entities_only(sample_results_combined, test_context, provider_to_test, model_to_test);
             print("\nExtracted Entities:")
-            print(json.dumps(test_entities, indent=2)); time.sleep(1)
+            print(json.dumps(test_entities, indent=2)); time.sleep(1) # Use sync sleep in test
+
 
             print("\nExtracting Risks (Initial) from Combined/Translated Snippets...")
-            # Pass provider/model to the function call
+            # Pass provider/model to the function call and await
             test_risks_initial = await extract_risks_only(sample_results_combined, test_context, provider_to_test, model_to_test);
             print("\nExtracted Risks (Initial):")
-            print(json.dumps(test_risks_initial, indent=2)); time.sleep(1)
+            print(json.dumps(test_risks_initial, indent=2)); time.sleep(1) # Use sync sleep in test
+
 
             print("\nLinking Entities to Risks (using filtered entity names and the combined map)...")
             # Use only entities from the validated list with names for linking
             test_entity_names = [e['name'] for e in test_entities if isinstance(e, dict) and e.get('name')]
             test_risks_linked = [];
             if test_risks_initial and test_entity_names:
-                # Pass provider/model to the function call and the combined map
+                # Pass provider/model to the function call, the combined map, and await
                 test_risks_linked = await link_entities_to_risk(test_risks_initial, test_entity_names, all_test_snippets_map_combined, provider_to_test, model_to_test);
                 print("\nRisks after Linking:")
                 print(json.dumps(test_risks_linked, indent=2))
             else:
-                print("\nSkipping entity linking (no initial risks or entities with names).")
+                print("\nSkipping async entity linking (no initial risks or entities with names).")
                 test_risks_linked = test_risks_initial # Return initial risks if linking skipped
-            time.sleep(1)
+            time.sleep(1) # Use sync sleep in test
+
 
             print("\nExtracting Relationships (Ownership only) from Combined/Translated Snippets...")
             # Use only Company and Organization entities from the validated list for ownership relationships
             test_entities_company_org = [e for e in test_entities if isinstance(e, dict) and e.get('type') in ["COMPANY", "ORGANIZATION"]]
             test_relationships_ownership = [];
             if test_entities_company_org:
-                # Pass provider/model to the function call and the combined list of snippets
+                # Pass provider/model to the function call and the combined list of snippets, and await
                 test_relationships_ownership = await extract_relationships_only(sample_results_combined, test_context, test_entities_company_org, provider_to_test, model_to_test);
                 print("\nExtracted Relationships (Ownership/Affiliate/JV only):")
                 print(json.dumps(test_relationships_ownership, indent=2))
             else:
                 print("\nSkipping ownership relationship extraction.")
-            time.sleep(1)
+            time.sleep(1) # Use sync sleep in test
+
 
             print("\nExtracting Regulatory/Sanction Relationships from Combined/Translated Snippets...")
             # Use all validated entities for Regulatory/Sanction relationships
             test_relationships_reg_sanc = [];
             if test_entities:
-                # Pass provider/model to the function call and the combined list of snippets
+                # Pass provider/model to the function call and the combined list of snippets, and await
                 test_relationships_reg_sanc = await extract_regulatory_sanction_relationships(sample_results_combined, test_context, test_entities, provider_to_test, model_to_test);
                 print("\nExtracted Regulatory/Sanction Relationships:")
                 print(json.dumps(test_relationships_reg_sanc, indent=2))
             else:
                 print("\nSkipping regulatory/sanction relationship extraction.")
-            time.sleep(1)
+            time.sleep(1) # Use sync sleep in test
 
             # Combine all relationships for the test output
             test_relationships_combined = test_relationships_ownership + test_relationships_reg_sanc
@@ -1980,7 +1943,8 @@ if __name__ == "__main__":
             # Process the hypothetical structured data (sync function)
             processed_structured = process_linkup_structured_data(hypothetical_structured_data_list, "Test Structured Data Query");
             print("\nProcessed Structured Data (NLP Output):");
-            print(json.dumps(processed_structured, indent=2)); time.sleep(1)
+            print(json.dumps(processed_structured, indent=2)); time.sleep(1) # Use sync sleep in test
+
 
             # Example of combining processed structured data with snippet data for a final view
             # Note: Orchestrator handles actual merging, this is just to show the combined format

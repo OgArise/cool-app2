@@ -31,6 +31,9 @@ except ImportError:
 
 # Import the orchestrator module
 import orchestrator
+# Import search_engines to access check_linkup_balance
+import search_engines
+
 
 # --- Google Sheets Setup ---
 # Initialize global gsheet_service variable *before* its usage in functions
@@ -287,6 +290,22 @@ async def run_automation():
         print("Exiting: Cannot obtain Google Sheets service.")
         return
 
+    # FIX: Add async Linkup balance check here after service initialization
+    if search_engines.linkup_library_available and search_engines.linkup_search_enabled:
+        print("Checking Linkup balance at automation script startup...")
+        try:
+            balance = await search_engines.check_linkup_balance()
+            if balance is not None:
+                print(f"Linkup Available Credits: {balance:.4f}")
+            else:
+                print("Could not retrieve Linkup credit balance.")
+        except Exception as e:
+            print(f"Error during Linkup balance check at startup: {e}")
+            traceback.print_exc()
+    else:
+        print("Linkup search not enabled or library not available. Skipping balance check.")
+
+
     run_counter = 0 # Counter for queries processed in the current loop cycle
 
     while True:
@@ -517,5 +536,3 @@ if __name__ == "__main__":
         print(f"\n--- Critical Automation Script Failure ---")
         print(f"An unhandled exception occurred during the main automation loop: {type(e).__name__}: {e}")
         traceback.print_exc()
-
-    print("\n--- Automated Queries Script Finished ---")

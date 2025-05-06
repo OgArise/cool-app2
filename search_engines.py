@@ -2,14 +2,16 @@
 
 import time
 import asyncio # Import asyncio
-from typing import List, Dict, Any, Optional, Union
-import traceback
+import urllib.parse # Import urllib.parse for URL quoting
+import httpx # Import httpx for asynchronous HTTP requests
 import json
 import re
+import traceback
 
-import httpx # Import httpx for asynchronous HTTP requests
+from typing import List, Dict, Any, Optional, Union # Import Union
 
 import config
+
 # We need nlp_processor for targeted search keyword translation in search_for_ownership_docs
 # Import it conditionally or ensure it's available if search_for_ownership_docs is called.
 # Given orchestrator imports nlp_processor and then search_engines, it should be available.
@@ -25,15 +27,18 @@ LinkupClient = None
 linkup_library_available = False
 LinkupSearchResults = None
 LinkupSearchTextResult = None
+# FIX: Removed import of LinkupSearchStructuredResult as it doesn't exist in the SDK
+
 
 try:
-    # Attempt to import Linkup components
-    # Assuming the installed linkup-sdk uses httpx and provides async methods
+    # FIX: Corrected the import statement for the Linkup library based on user confirmation
     from linkup import LinkupClient as _LinkupClient
     from linkup import LinkupSearchResults as _LinkupSearchResults
     from linkup import LinkupSearchTextResult as _LinkupSearchTextResult
+    # FIX: Removed import of LinkupSearchStructuredResult
 
     # Check if the imported components are valid (optional but good practice)
+    # FIX: Adjusted check as LinkupSearchStructuredResult is removed
     if _LinkupClient is not None and _LinkupSearchResults is not None and _LinkupSearchTextResult is not None:
          LinkupClient = _LinkupClient
          LinkupSearchResults = _LinkupSearchResults
@@ -41,14 +46,17 @@ try:
          linkup_library_available = True
     else:
          # If imports didn't fail but components are None, something is still wrong
-         print("Warning: Imported Linkup library but required components are None. Linkup searches disabled.")
+         print("Warning: Imported Linkup library (linkup) but required components are None. Linkup searches disabled.")
          linkup_library_available = False
 except ImportError:
+    # FIX: Updated error message to reflect the correct library name
     print("Warning: linkup library not installed. Linkup searches disabled.")
     linkup_library_available = False
 except Exception as e:
      # Catch any other potential import errors
-     print(f"Error importing Linkup library: {e}. Linkup searches disabled.")
+     # FIX: Updated error message to reflect the correct library name
+     print(f"Error importing Linkup library (linkup): {e}. Linkup searches disabled.")
+     traceback.print_exc()
      linkup_library_available = False
 
 
@@ -108,6 +116,7 @@ async def check_linkup_balance() -> Optional[float]:
         return None
     except Exception as e:
         print(f"Warning: Unexpected error checking Linkup credits: {e}")
+        traceback.print_exc()
         return None
 
 linkup_client = None
@@ -121,23 +130,18 @@ if linkup_library_available:
         try:
             # Initialize the async client
             linkup_client = LinkupClient(api_key=config.LINKUP_API_KEY)
-            # Optional: Verify connectivity if SDK provides an async method, or just proceed.
+            # FIX: Removed the synchronous call to check_linkup_balance from here.
+            # The balance will be checked asynchronously during application startup.
             # print("Linkup client initialized successfully.")
-            # We don't await balance check here, it's done in orchestrator's startup
-            # balance = await check_linkup_balance() # Can't await at module level
-            # if balance is not None:
-            linkup_search_enabled = True # Assume enabled if client initialized, orchestrator will check balance
-            print("Linkup searches enabled (subject to balance).")
-            # else:
-            #     print("Could not retrieve Linkup credit balance or initialization failed. Linkup searches disabled.")
-            #     linkup_client = None # Set client to None if balance check fails
+            linkup_search_enabled = True # Assume enabled if client initialized and key is present
+            print("Linkup searches enabled (subject to balance check during startup).")
         except Exception as e:
             print(f"ERROR initializing Linkup client with API key: {type(e).__name__}: {e}")
             traceback.print_exc()
             linkup_client = None
             print("Warning: Linkup client initialization failed. Linkup searches disabled.")
 else:
-     print("Linkup library not available, Linkup searches disabled.") # Re-iterate if library import failed
+     print("Linkup library (linkup) not available, Linkup searches disabled.") # Re-iterate if library import failed
 
 
 serpapi_available = False
@@ -214,7 +218,7 @@ async def search_via_serpapi(query: str, engine: str, country_code: str = 'cn', 
         # print("Skipping SerpApi search: Not configured.") # Suppress frequent message
         return []
     if not query or not isinstance(query, str) or not query.strip():
-         print(f"Skipping async SerpApi search ({engine}): Invalid query provided.")
+         print(f"Skipping async Serpapi search ({engine}): Invalid query provided.")
          return []
 
     try:
@@ -270,7 +274,7 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
          print("No valid queries provided for async Linkup Snippet Search.")
          return []
 
-    print(f"Executing async Linkup Snippet Search for {len(queries_to_run)} queries (num parameter per query: {num}, requested_country_code={country_code})...")
+    print(f"Executing async Linkup Snippet Search for {len(queries_to_run)} queries (num parameter passed per query: {num}, requested_country_code={country_code})...")
 
     # We can make multiple Linkup calls concurrently for different queries if the SDK supports it.
     # LinkupClient.search should be async. Let's gather tasks.
@@ -282,7 +286,9 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
                   "depth": "standard", # or "deep" depending on desired depth
                   "output_type": "searchResults",
                   "include_images": False,
-                  "num": num # Passing num here as per Linkup docs if supported
+                  # FIX: Removed 'num' parameter as it caused TypeError.
+                  # Rely on Linkup's internal limits or default SDK behavior.
+                  # "num": num # Removed
               }
               # country_code is NOT a direct parameter according to previous errors.
               # Country context should ideally be in the query string itself.
@@ -293,8 +299,11 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
               if isinstance(response, LinkupSearchResults) and hasattr(response, 'results') and isinstance(response.results, list):
                    print(f"    Linkup API returned {len(response.results)} results for query '{q[:50]}...'.")
                    return response.results # Return the list of results
+              elif isinstance(response, list) and all(isinstance(item, (LinkupSearchTextResult, dict)) for item in response): # Handle if Linkup returns a list directly
+                   print(f"    Linkup API returned a list directly for query '{q[:50]}...'. Found {len(response)} items.")
+                   return response
               else:
-                   print(f"    Linkup Snippet Search for query '{q[:50]}...' returned no results or unexpected format.")
+                   print(f"    Linkup Snippet Search for query '{q[:50]}...' returned no results or unexpected format (Type: {type(response)}).")
                    return [] # Return empty list on failure/no results
 
          except Exception as e:
@@ -306,11 +315,21 @@ async def search_linkup_snippets(query: Union[str, List[str]], num: int = 20, co
     # Gather all the async query tasks
     query_tasks = [_perform_single_linkup_snippet_query(q) for q in queries_to_run]
     # Run them concurrently
-    list_of_results_lists = await asyncio.gather(*query_tasks)
+    list_of_results_lists = await asyncio.gather(*query_tasks, return_exceptions=True) # Gather results, capture exceptions
 
     # Process and deduplicate results from all concurrent queries
-    for results_list_for_query in list_of_results_lists:
-        for item in results_list_for_query:
+    for results_list_or_exc in list_of_results_lists:
+        if isinstance(results_list_or_exc, Exception):
+             print(f"  Warning: One of the Linkup snippet search tasks raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
+             traceback.print_exc() # Print traceback for search errors
+             continue # Skip processing this result list
+
+        for item in results_list_or_exc:
+             # Ensure item is not an exception if return_exceptions was used above
+             if isinstance(item, Exception):
+                 print(f"  Warning: Item in Linkup results list was an exception: {type(item).__name__}: {item}")
+                 continue
+
              # Standardize each item. standardize_result handles LinkupSDK objects.
              standardized = standardize_result(item, source='linkup_snippet_search')
              if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in processed_urls:
@@ -341,42 +360,45 @@ async def search_linkup_structured(query: str, structured_output_schema: str, de
 
     try:
         print(f"Executing async Linkup Structured Search: q='{query[:50]}...', depth='{depth}', requested_country_code={country_code}") # Print truncated query
-        # Construct parameters dictionary *excluding* 'country_code' as a direct keyword argument
+        # Construct parameters dictionary
         params = {
             "query": query,
             "depth": depth,
             "output_type": "structured",
             "structured_output_schema": structured_output_schema,
             "include_images": False,
-            # Removed country_code here as it caused TypeError. Rely on query string.
+            # Removed country_code and num here as per previous errors
         }
 
         # Pass the parameters to the async Linkup search method using **params
-        response = await linkup_client.search(**params) # Corrected params no longer include 'country_code'
+        response = await linkup_client.search(**params)
 
         if response is not None:
-            # Linkup structured search can return a dict, a list of LinkupSDK objects, or other formats.
-            # We expect a dict representing the structured data OR a list of dicts.
+            # Linkup structured search can return various types.
+            # Based on Linkup docs/examples, structured search *can* return:
+            # 1. A raw dict matching the schema (often for 'extract' depth?)
+            # 2. A LinkupSearchResults object containing LinkupSearchTextResult objects (where the structured data is in item.data)
+            # 3. A list of dicts or LinkupSearchTextResult objects
+
             if isinstance(response, dict):
-                 # If the response is a dict, return it directly
+                 # Case 1: Raw dict matching the schema
                  return response
-            elif hasattr(response, 'data') and isinstance(response.data, dict):
-                 # If the response is an object with a 'data' attribute that is a dict, return that
-                 return response.data
-            # Add handling for LinkupSearchResults type if a structured search could potentially return it
-            elif isinstance(response, LinkupSearchResults) and hasattr(response, 'results') and isinstance(response.results, list) and len(response.results) > 0:
-                 # If it returns a LinkupSearchResults object containing a list of results,
-                 # it might be a list of structured items, each with a 'data' attribute.
-                 # Let's check if items in the list have a 'data' attribute that is a dict.
+            elif isinstance(response, (LinkupSearchResults, list)): # Handle SearchResults object or a direct list
                  valid_structured_data_list = []
-                 for item in response.results:
-                      if hasattr(item, 'data') and isinstance(getattr(item, 'data', None), dict):
+                 # Iterate through the list of results
+                 results_list_to_process = response.results if isinstance(response, LinkupSearchResults) else response # Handle both SearchResults object and direct list
+                 for item in results_list_to_process:
+                      # Check if the item is a LinkupSearchTextResult with a data attribute (structured content)
+                      if isinstance(item, LinkupSearchTextResult) and hasattr(item, 'data') and isinstance(getattr(item, 'data', None), dict):
                            valid_structured_data_list.append(item.data)
+                      # Check if the item is a dict, assume it's structured data content
+                      elif isinstance(item, dict):
+                          valid_structured_data_list.append(item)
                       # else: # Optional: log items that don't fit the expected structured format
-                      #      print(f"Warning: Linkup Structured list item lacks valid 'data' attribute: {item}")
+                      #      print(f"Warning: Linkup Structured list item lacks valid 'data' attribute or is not a dict: {item}")
 
                  if valid_structured_data_list:
-                      print(f"Linkup async Structured Search returned LinkupSearchResults list, extracted {len(valid_structured_data_list)} structured data items.")
+                      print(f"Linkup async Structured Search returned list, extracted {len(valid_structured_data_list)} structured data items.")
                       # If there's only one structured data item in the list, return it directly as a dict for consistency
                       if len(valid_structured_data_list) == 1:
                            return valid_structured_data_list[0]
@@ -384,11 +406,11 @@ async def search_linkup_structured(query: str, structured_output_schema: str, de
                            # If there are multiple structured data items, return the list
                            return valid_structured_data_list
                  else:
-                      print(f"Linkup async Structured Search returned LinkupSearchResults list, but no valid structured data items found within.")
+                      print(f"Linkup async Structured Search returned a list, but no valid structured data items found within.")
                       return None
 
             elif isinstance(response, str):
-                 # If the response is a string, attempt to parse it as JSON
+                 # If the response is a string, attempt to parse it as JSON (fallback)
                  print(f"Linkup async Structured Search returned string. Attempting JSON parse.")
                  try:
                       parsed_response = json.loads(response)
@@ -427,9 +449,10 @@ async def search_linkup_structured(query: str, structured_output_schema: str, de
 async def check_wayback_machine(url_to_check: str) -> dict:
     """Check Wayback Machine Availability API (async)."""
     if not url_to_check or not isinstance(url_to_check, str) or not url_to_check.strip():
-        # print("Skipping Wayback check for invalid or empty URL.")
+        # print("Skipping Wayback check for invalid or empty URL.") # Suppress frequent message
         return {"status": "skipped_invalid_url", "original_url": url_to_check, "message": "Invalid URL provided"}
-    api_url = f"https://archive.org/wayback/available?url={httpx.quoting.quote(url_to_check)}" # Use httpx quoting
+    # FIX: Use urllib.parse.quote instead of httpx.quoting.quote
+    api_url = f"https://archive.org/wayback/available?url={urllib.parse.quote(url_to_check)}" # Use urllib.parse for quoting
     try:
         async with httpx.AsyncClient() as client:
              response = await client.get(api_url, timeout=30) # Added timeout
@@ -486,9 +509,12 @@ async def search_for_ownership_docs(entity_name: str,
     search_source_prefix = "ownership_multi" # Used for tracking source in standardized results
 
     # Check availability of async search functions
-    google_cse_available_bool = bool(google_api_client_available_and_configured and hasattr(search_google_official, '__call__'))
-    serpapi_available_bool = bool(serpapi_available and hasattr(search_via_serpapi, '__call__'))
-    linkup_search_enabled_bool = bool(linkup_search_enabled and hasattr(search_linkup_snippets, '__call__'))
+    google_cse_available_bool = bool(google_api_client_available_and_configured and hasattr(search_google_official, '__call__') and asyncio.iscoroutinefunction(search_google_official))
+    serpapi_available_bool = bool(serpapi_available and hasattr(search_via_serpapi, '__call__') and asyncio.iscoroutinefunction(search_via_serpapi))
+    linkup_search_enabled_bool = bool(linkup_library_available and linkup_search_enabled and hasattr(search_linkup_snippets, '__call__') and asyncio.iscoroutinefunction(search_linkup_snippets))
+    # Note: linkup_structured_search_available is not directly used here, but included for completeness
+    linkup_structured_search_available_bool = bool(linkup_library_available and linkup_search_enabled_orchestrator and hasattr(search_engines, 'search_linkup_structured') and callable(search_engines.search_linkup_structured) and asyncio.iscoroutinefunction(search_engines.search_linkup_structured))
+
 
     # Define a reasonable target for this specific type of search before using fallback
     fallback_threshold = max(num_per_query * 2, 20) # e.g., try fallback if we don't find at least 20 results
@@ -500,124 +526,107 @@ async def search_for_ownership_docs(entity_name: str,
 
     # 1. Add Linkup Snippet Search Task (Async)
     if linkup_search_enabled_bool:
-         # Use a combined query approach for Linkup snippet search
-         # Add country code to query string as Linkup API doesn't take it as a parameter
+         print(f"  Adding Linkup snippet search task (broad query: '{entity_name} ownership...')")
+         # search_linkup_snippets handles multiple queries internally and returns a list of results
+         # It no longer accepts num as a parameter to the search call itself
          linkup_query_combined = f'"{entity_name}" ownership OR subsidiary OR affiliate OR stake OR filing OR "joint venture" OR "acquired" OR parent OR "equity method" {country_code}'
-         # Schedule the Linkup search task
+         # Ensure num_per_query is passed to search_linkup_snippets if it uses it internally for EACH query
+         # Based on the implementation, search_linkup_snippets processes multiple queries itself
+         # and might use the num parameter for each.
          concurrent_tasks.append(search_linkup_snippets(query=linkup_query_combined, num=num_per_query))
-         print("  Added Linkup snippet search task.")
     else:
-         print("  Linkup searches not enabled, skipping task.")
+         print("  Linkup snippet search not enabled or not async, skipping task.")
 
 
     # 2. Add Google CSE Search Tasks (Async - one task per query variant)
     if google_cse_available_bool:
-        google_tasks = [search_google_official(q, lang=lang_code, num=num_per_query) for q in web_search_queries]
+        print(f"  Adding Google CSE search tasks ({len(web_search_queries)} English queries)")
+        # Create a task for each Google query
+        google_tasks = [search_google_official(query=q, num=num_per_query) for q in web_search_queries]
         concurrent_tasks.extend(google_tasks)
-        print(f"  Added {len(google_tasks)} Google CSE search tasks.")
     else:
-        print("  Google CSE searches not enabled, skipping tasks.")
+        print("  Google CSE searches not enabled or not async, skipping tasks.")
 
 
-    # Run Linkup and Google CSE tasks concurrently
+    # Run initial concurrent searches
+    initial_concurrent_results_lists = []
     if concurrent_tasks:
         print("  Running initial concurrent searches...")
         # asyncio.gather preserves order of results corresponding to tasks
-        concurrent_results_lists = await asyncio.gather(*concurrent_tasks)
+        initial_concurrent_results_lists = await asyncio.gather(*concurrent_tasks, return_exceptions=True) # Gather results, capture exceptions
 
         # Process and deduplicate results from Linkup and Google CSE
-        for results_list in concurrent_results_lists:
-             for r in results_list:
+        for result_list_or_exc in initial_concurrent_results_lists:
+             if isinstance(result_list_or_exc, Exception):
+                  print(f"  Warning: One of the initial concurrent search tasks raised an exception: {type(result_list_or_exc).__name__}: {result_list_or_exc}")
+                  traceback.print_exc() # Print traceback for search errors
+                  continue # Skip processing this result list
+
+             for r in result_list_or_exc:
                   # standardize_result handles various formats including LinkupSDK objects
                   standardized = standardize_result(r, source=f'{search_source_prefix}_initial') # Generic source for initial concurrent batch
                   if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
+                       # We are building a map here first, convert to list at the end
                        all_raw_results_map[standardized['url']] = standardized # Store standardized result directly
-        print(f"  Finished initial concurrent searches. Found {len(all_raw_results_map)} unique results.")
+
+        print(f"  Finished initial concurrent searches (Linkup + Google CSE). Found {len(all_raw_results_map)} unique results.")
     else:
         print("  No initial concurrent search tasks were added.")
 
 
     # 3. Check Threshold and Run SerpApi Fallback if Needed (Async)
+    # Only run SerpApi if the number of results is below the fallback threshold AND SerpApi is available
     if serpapi_available_bool and len(all_raw_results_map) < fallback_threshold:
          print(f"Result count ({len(all_raw_results_map)}) below fallback threshold ({fallback_threshold}). Attempting SerpApi fallback search...")
          serpapi_engine = 'baidu' if country_code.lower() == 'cn' else 'google'
-         serpapi_queries = queries_base # Use base queries for Serpapi fallback
+         # Use all generated queries for Serpapi fallback (including Chinese ones if cn)
+         # For simplicity, let's use a combined query approach for SerpApi fallback similar to Linkup,
+         # using the main initial query and adding relevant terms/country.
+         # A more sophisticated approach could use the translated keywords from Step 2 if available.
+         serpapi_fallback_query_combined = f'"{entity_name}" ownership OR subsidiary OR affiliate OR stake OR filing OR "joint venture" OR "acquired" OR parent OR "equity method" {country_name}' # Use country name for Google SerpApi
 
-         # Attempt to get Chinese keywords via NLP only if country is China and NLP is available
-         # Note: NLP calls here would also need to be async or run in executor if synchronous
-         # For simplicity now, assuming NLP calls made here are simple/cached or we accept brief blocking.
-         # A full async implementation would make these NLP calls awaitable.
-         if country_code.lower() == 'cn' and nlp_processor_available_search and hasattr(nlp_processor, 'translate_keywords_for_context') and callable(nlp_processor.translate_keywords_for_context):
-              try:
-                   # Use a default LLM config for this internal call if main config is not available
-                   # Need to ensure config is available and has the default models before using them
-                   nlp_llm_provider = 'openai' # Default fallback provider name
-                   nlp_llm_model = 'gpt-4o-mini' # Default fallback model name
+         serpapi_fallback_tasks = []
+         # Create a task for the SerpApi query. Pass the combined query.
+         # search_via_serpapi accepts num and country_code, but uses engine parameter to handle them.
+         # We can call search_via_serpapi directly with the combined query.
+         serpapi_fallback_tasks.append(search_via_serpapi(query=serpapi_fallback_query_combined, engine=serpapi_engine, country_code=country_code, lang_code=lang_code, num=max(num_per_query, fallback_threshold - len(all_raw_results_map) + 5))) # Request enough results to potentially hit the threshold + buffer
 
-                   if config and hasattr(config, 'OPENROUTER_API_KEY') and getattr(config, 'OPENROUTER_API_KEY', None):
-                        nlp_llm_provider = 'openrouter'
-                        nlp_llm_model = getattr(config, 'DEFAULT_OPENROUTER_MODEL', 'google/gemini-flash-1.5')
-                   elif config and hasattr(config, 'GOOGLE_AI_API_KEY') and getattr(config, 'GOOGLE_AI_API_KEY', None):
-                        nlp_llm_provider = 'google_ai'
-                        nlp_llm_model = getattr(config, 'DEFAULT_GOOGLE_AI_MODEL', 'models/gemini-1.5-flash-latest')
-                   elif config and hasattr(config, 'OPENAI_API_KEY') and getattr(config, 'OPENAI_API_KEY', None):
-                         nlp_llm_provider = 'openai'
-                         nlp_llm_model = getattr(config, 'DEFAULT_OPENAI_MODEL', 'gpt-4o-mini')
-                   else:
-                        # No LLM keys found via config for NLP translation
-                        print("Warning: No LLM API keys found in config for NLP translation in search_for_ownership_docs.")
-                        nlp_llm_provider = None # Explicitly set to None to skip NLP call
+         if serpapi_fallback_tasks:
+              print(f"  Running {len(serpapi_fallback_tasks)} SerpApi fallback search task...")
+              serpapi_fallback_results_lists = await asyncio.gather(*serpapi_fallback_tasks, return_exceptions=True) # Gather results, capture exceptions
 
-                   # Add check if the chosen NLP LLM config is valid before calling NLP
-                   if nlp_llm_provider:
-                        try:
-                             # Assume translate_keywords_for_context is now async or handled appropriately
-                             chinese_keywords = await nlp_processor.translate_keywords_for_context(f'"{entity_name}" ownership structure', f"Baidu search for {entity_name} ownership in {country_code}", nlp_llm_provider, nlp_llm_model) # Use specific context for translation
-                             serpapi_queries.extend(chinese_keywords)
-                        except Exception as nlp_llm_e:
-                             print(f"Warning: Failed to initialize/use NLP LLM for Chinese keyword generation for Serpapi ownership search: {nlp_llm_e}")
+              # Process and deduplicate results from Serpapi
+              for results_list_or_exc in serpapi_fallback_results_lists:
+                   if isinstance(results_list_or_exc, Exception):
+                        print(f"  Warning: The SerpApi fallback search task raised an exception: {type(results_list_or_exc).__name__}: {results_list_or_exc}")
+                        traceback.print_exc() # Print traceback for search errors
+                        continue # Skip processing this result list
 
-
-              except Exception as e:
-                   print(f"Warning: Failed to get Chinese keywords for Serpapi ownership search: {e}")
-
-
-         serpapi_queries = list(set([q.strip() for q in serpapi_queries if q.strip()])) # Deduplicate again
-
-
-         # Schedule SerpApi search tasks concurrently if multiple queries are generated
-         serpapi_tasks = [search_via_serpapi(query_text, serpapi_engine, country_code, lang_code='en', num=num_per_query) for query_text in serpapi_queries]
-
-         if serpapi_tasks:
-              print(f"  Running {len(serpapi_tasks)} SerpApi fallback search tasks...")
-              serpapi_results_lists = await asyncio.gather(*serpapi_tasks)
-
-              # Process and deduplicate results from SerpApi
-              for results_list in serpapi_results_lists:
-                   for r in results_list:
+                   for r in results_list_or_exc:
                         standardized = standardize_result(r, source=f'serpapi_{serpapi_engine}_ownership_fallback')
                         # standardize_result attempts to set original_language. If not set, default based on engine
                         if standardized and standardized.get('original_language') is None:
                            if serpapi_engine == 'baidu': standardized['original_language'] = 'zh' # Assume Baidu results are Chinese
 
                         if standardized and isinstance(standardized, dict) and standardized.get('url') and isinstance(standardized.get('url'), str) and standardized['url'] not in all_raw_results_map:
+                             # Add SerpApi results to the main map
                              all_raw_results_map[standardized['url']] = standardized
 
               print(f"  Finished SerpApi fallback search. Total unique results now: {len(all_raw_results_map)}")
          else:
               print("  No SerpApi fallback search tasks were added.")
 
-    elif serpapi_available_bool and not config.SERPAPI_KEY:
-         print("Skipping SerpApi search - not configured.")
-    # Note: We removed the check for exceeding the threshold to skip SerpApi,
-    # because SerpApi is now explicitly a fallback *only* if the threshold isn't met by the primary sources.
+    elif serpapi_available_bool:
+        print(f"Skipping Serpapi fallback. Initial concurrent searches yielded {len(all_raw_results_map)} results (>= {fallback_threshold} threshold).")
+    elif not serpapi_available_bool:
+        print("SerpApi fallback search not available, skipping.")
 
 
     final_results = list(all_raw_results_map.values())
 
     # No final truncation here, return all unique results found across sources up to their individual limits/thresholds.
 
-    print(f"Found {len(final_results)} unique potential ownership documents across all sources (Linkup, Google CSE, SerpApi fallback).")
+    print(f"Found {len(final_results)} unique potential ownership documents across all sources (Linkup, Google CSE, optional Serpapi fallback).")
     return final_results
 
 def standardize_result(item: Any, source: str) -> dict | None:
@@ -637,7 +646,7 @@ def standardize_result(item: Any, source: str) -> dict | None:
     translated_from = None # Default to None
     source_type = None # e.g., 'snippet', 'structured'
 
-    # Check for Linkup SDK object first
+    # Check for Linkup SDK object first (TextResult, SearchResults)
     if linkup_library_available and isinstance(item, (LinkupSearchTextResult, LinkupSearchResults)):
          # Handle LinkupSearchTextResult (from searchResults output)
          if isinstance(item, LinkupSearchTextResult):
@@ -646,59 +655,54 @@ def standardize_result(item: Any, source: str) -> dict | None:
               snippet = getattr(item, 'content', '')
               date_str = getattr(item, 'date', '') # Linkup TextResult might have a date attribute
               original_language = getattr(item, 'language', None)
-              source_type = 'snippet'
+              source_type = 'linkup_snippet_sdk'
 
-         # Handle LinkupSearchResults (which contains a list of TextResults) - Although search_linkup_snippets
-         # extracts items from the list, this is a safeguard if LinkupSearchResults object itself is passed.
-         # It's unlikely this branch will be hit with current search_linkup_snippets logic.
+         # Handle LinkupSearchResults (which contains a list of TextResults or StructuredResults) - Less likely to be passed directly after processing
          elif isinstance(item, LinkupSearchResults) and hasattr(item, 'results') and isinstance(item.results, list) and item.results:
-             # Process the first item as a representative
+             # Process the first item as a representative - ideally search functions return the inner list items
              first_item = item.results[0]
-             if isinstance(first_item, LinkupSearchTextResult):
-                  title = getattr(first_item, 'name', '') + " (from SearchResults list)"
-                  link = getattr(first_item, 'url', '')
-                  snippet = getattr(first_item, 'content', '')
-                  date_str = getattr(first_item, 'date', '')
-                  original_language = getattr(first_item, 'language', None)
-                  source_type = 'snippet_list_item'
-             # Add handling for structured results within LinkupSearchResults if needed
-             # elif hasattr(first_item, 'data') and isinstance(first_item.data, dict):
-             #     title = "Linkup Structured Result"
-             #     link = getattr(first_item, 'url', '') # Structured results might not have a direct URL
-             #     snippet = json.dumps(getattr(first_item, 'data', {}))[:200] + '...' # Summarize data
-             #     source_type = 'structured_list_item'
+             return standardize_result(first_item, source) # Recursively standardize the first item
 
+        # FIX: Removed handling for LinkupSearchStructuredResult as it doesn't exist
 
     elif isinstance(item, dict):
         # Handle dictionary-based results from Google CSE, SerpApi, or raw Linkup JSON/dictionary outputs
         title = item.get("title", item.get("Title", ""))
         link = item.get("link", item.get("url", item.get("displayed_link", item.get("Link", item.get("Url", item.get("sourceUrl", item.get("source_url", ""))))))) # Added source_url from Linkup structured
-        # Corrected the unmatched parenthesis in the snippet get chain by ensuring balance
         snippet = item.get("snippet", item.get("description", item.get("Snippet", item.get("Description", item.get("Summary", item.get("textSnippet", item.get("excerpt", item.get("content", ""))))))))
         date_str = item.get("date", item.get("published_date", item.get("Date", item.get("PublishedDate", item.get("publish_date", item.get("timestamp", item.get("source_date", ""))))))) # Added source_date from Linkup structured
         # Attempt to get language from known keys if available
         original_language = item.get("language", item.get("lang", item.get("original_language", None))) # Added original_language
 
-        # Check if this dict item looks like structured data rather than a snippet
-        if item.get("schema") and item.get("data") is not None:
-             source_type = 'structured_item'
-             # For structured items, use a summary of the data as the snippet
-             snippet = f"Structured Data ({item['schema']}): {json.dumps(item['data'])[:200]}..."
-             # Title might be less relevant, maybe use entity name if available
+        # Check if this dict item looks like raw structured data content rather than a snippet
+        # Check for schema/data keys (from our wrapper dict format) or keys typical of structured data content
+        # Linkup structured search often returns a dict that IS the schema payload, not nested in "data".
+        # It might also return a list of LinkupSearchTextResult where the schema payload is in item.data.
+        # Let's check for keys typical of the schema payloads directly.
+        if item.get("ownership_relationships") is not None or item.get("key_risks_identified") is not None or item.get("actions_found") is not None: # Added check for hypothetical types
+             # This dict appears to be structured data content directly
+             source_type = 'linkup_structured_content' # Mark as structured content
+             # Use a summary of the data content as the snippet
+             snippet = f"Structured Data Content: {json.dumps(item)[:200]}..."
+             title = item.get("company_name", item.get("regulator_name", "Structured Data Content")) # Try company_name or regulator_name
+             # Link/date might be extracted from items within these lists by process_linkup_structured_data
+             link = item.get("source_url", link) # Maybe a top-level source_url exists?
+
+        # Check for the wrapper format we might have created earlier in the pipeline if processing lists of structured results
+        elif item.get("schema") and item.get("data") is not None:
+             source_type = 'linkup_structured_raw' # From our wrapper dict format
+             # Use a summary of the data content as the snippet
+             data_content = item.get('data', {})
+             snippet = f"Structured Data ({item['schema']}): {json.dumps(data_content)[:200]}..."
+             # Title might be the entity name from the wrapper
              title = item.get("entity", "Structured Data")
              # Link might be a source_url within the data itself, extracted later in processing
-
-        elif item.get("ownership_relationships") is not None or item.get("key_risks_identified") is not None:
-             # This dict might be the 'data' part of a structured item itself
-             source_type = 'structured_data_content'
-             snippet = f"Structured Data Content: {json.dumps(item)[:200]}..."
-             title = item.get("company_name", "Structured Data Content")
-             # Link/date would be extracted from items within these lists by process_linkup_structured_data
+             link = data_content.get("source_url", link) # Try to get source_url from data if not top-level
 
 
         else:
              # Default to snippet if it doesn't look like known structured data formats
-             source_type = 'snippet'
+             source_type = 'snippet' # Assume it's a snippet from a search engine
 
 
     else:
@@ -706,30 +710,32 @@ def standardize_result(item: Any, source: str) -> dict | None:
          return None
 
     # Basic validation for critical fields after determining type
-    if not link or not isinstance(link, str) or not link.strip():
-        # print(f"Skipping item from source '{source}' due to missing or invalid URL: {item}")
-        # Decide whether to keep items without URLs. For now, dropping them as they can't be sourced/verified.
-        return None
+    # Decide whether to keep items without URLs. For now, dropping them as they can't be sourced/verified snippets.
+    # But structured data items might not have a direct URL at the top level. Keep those.
+    if source_type not in ['linkup_structured_sdk', 'linkup_structured_raw', 'linkup_structured_content']:
+        # Apply URL validation only to snippet-like results
+        if not link or not isinstance(link, str) or not link.strip():
+             # print(f"Skipping item from source '{source}' due to missing or invalid URL: {item}") # Optional logging
+             return None
+        pass # URL exists for snippet types
+
+
     # Allow items with just a link and either title OR snippet OR date
-    if not title.strip() and not snippet.strip() and not date_str.strip():
-         # print(f"Skipping item from source '{source}' with URL '{link}' due to missing title, snippet, and date.")
-         # Decide whether to keep items with just a URL. Dropping for now unless they have some minimal info.
-         # return None # Keep for now, let NLP handle empty snippets
+    # This logic might need adjustment if we strictly require snippets for NLP
+    # But for standardization, let's allow it if it has a URL (for snippets) or is structured data
+    if (source_type in ['snippet', 'linkup_snippet_sdk', 'snippet_list_item'] and (not title.strip() and not snippet.strip() and not date_str.strip())):
+         # Keep if URL exists, even if other fields are empty for snippets
+         pass
+    elif (source_type in ['linkup_structured_sdk', 'linkup_structured_raw', 'linkup_structured_content'] and (not title.strip() and not snippet.strip())):
+         # For structured data, require at least a title or the generated snippet summary
+         pass # Keep if it's structured data
 
-        pass # Keep if URL exists, even if other fields are empty
 
-    # Ensure title and snippet are strings
+    # Ensure fields are strings if not None
     title = str(title).strip() if title is not None else ""
     snippet = str(snippet).strip() if snippet is not None else ""
     link = str(link).strip()
-
-    # Ensure date_str is a string if not None
-    if date_str is not None and not isinstance(date_str, str):
-        date_str = str(date_str).strip()
-    elif date_str is None:
-        date_str = ""
-    else:
-         date_str = date_str.strip()
+    date_str = str(date_str).strip() if date_str is not None else ""
 
 
     standardized_item = {
@@ -811,7 +817,7 @@ if __name__ == "__main__":
                  multi_queries = ["Apple Inc China", "Apple compliance China", "Apple tax China", "Apple regulatory China"]
                  # Removed num=20 from here to rely on Linkup's default per query
                  linkup_snippets_multi_results = await search_linkup_snippets(multi_queries)
-                 print(f"Found {len(linkup_snippets_multi_results)} async Linkup Snippet Search unique results (multiple queries).")
+                 print(f"Found {len(linkup_snippets_multi_results)} Linkup Snippet Search unique results (multiple queries).")
                  # Print sample to verify no truncation occurred in the function itself
                  print(json.dumps(linkup_snippets_multi_results[:5], indent=2))
              except Exception as e:
