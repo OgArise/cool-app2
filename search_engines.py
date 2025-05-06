@@ -615,9 +615,9 @@ async def search_for_ownership_docs(entity_name: str,
                              # Add SerpApi results to the main map
                              all_raw_results_map[standardized['url']] = standardized
 
-              print(f"  Finished Serpapi fallback search. Total unique results now: {len(all_raw_results_map)}")
+              print(f"  Finished SerpApi fallback search. Total unique results now: {len(all_raw_results_map)}")
          else:
-              print("  No SerpApi fallback search tasks were added.")
+              print("  No Serpapi fallback search tasks were added.")
 
     elif serpapi_available_bool:
         print(f"Skipping Serpapi fallback. Initial concurrent searches yielded {len(all_raw_results_map)} results (>= {fallback_threshold} threshold).")

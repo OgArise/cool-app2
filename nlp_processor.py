@@ -118,7 +118,7 @@ def _get_llm_client_and_model(provider: str, model_name: str):
         try:
             genai.configure(api_key=api_key)
             try:
-                # Check models synchronously if the SDK allows, or rely on sync method here.
+                # Check models asynchronously if the SDK allows, or rely on sync method here.
                 # The current genai.list_models is sync.
                 list_models_response = genai.list_models()
                 available_models = [m.name for m in list_models_response if m.name.startswith('models/')]
@@ -183,13 +183,19 @@ async def _call_llm_and_get_text(prompt: str, llm_provider: str, llm_model: str,
                 generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=max_tokens);
                 try:
                     response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
-                    if response_obj and response_obj.candidates and response_obj.candidates[0].content and response_obj.candidates[0].content.parts:
+                    if response_obj and not response_obj.candidates: # Check if response_obj is valid and has candidates
+                        feedback = getattr(response_obj, 'prompt_feedback', None)
+                        block_reason = getattr(feedback, 'block_reason', 'Unknown')
+                        print(f"--- ERROR: Google AI BLOCKED for text response. Reason: {block_reason}. ---")
+                        api_error = ValueError(f"Google AI blocked: {block_reason}")
+                        raw_content = None # Ensure raw_content is None if blocked
+
+                    elif response_obj and hasattr(response_obj, 'text'): # Check if response_obj is valid and has text attribute
                          raw_content = response_obj.text
                     else:
-                         feedback = getattr(response_obj, 'prompt_feedback', None)
-                         block_reason = getattr(feedback, 'block_reason', 'Unknown')
-                         print(f"--- ERROR: Google AI BLOCKED for text response. Reason: {block_reason}. ---")
-                         api_error = ValueError(f"Google AI blocked: {block_reason}")
+                        # Handle cases where response_obj is not valid or text is missing but no block
+                        print(f"--- WARNING: Google AI response invalid or missing text attribute. Response object: {response_obj} ---")
+                        raw_content = None # Treat as empty response
 
                 except Exception as e_google:
                     print(f"--- [{function_name}] ERROR during async Google AI call: {type(e_google).__name__}: {e_google} ---")
@@ -204,7 +210,7 @@ async def _call_llm_and_get_text(prompt: str, llm_provider: str, llm_model: str,
         if raw_content:
             cleaned_content = raw_content.strip()
             # Remove markdown code block syntax if present (more robust)
-            cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL)
+            cleaned_content = re.sub(r'^```.*?(\n|$)', '', cleaned_content, flags=re.IGNORECASE | re.DOTALL) # Use ignorecase and dotall
             cleaned_content = re.sub(r'```$', '', cleaned_content)
             # Remove leading/trailing quotes that some models add
             cleaned_content = re.sub(r'^["\']|["\']$', '', cleaned_content)
@@ -232,7 +238,6 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
     api_error = None
     parsed_json = None
     try:
-        # Check for LLM availability before making the call
         client_or_lib, client_type, model_name_used = _get_llm_client_and_model(llm_provider, llm_model)
         if client_or_lib is None:
              print(f"--- [{function_name}] LLM client not available for {llm_provider}. Skipping LLM call. ---")
@@ -295,17 +300,18 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
 
                 try:
                     response_obj = await client_or_lib.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings);
-                    if not response_obj.candidates:
+                    if response_obj and not response_obj.candidates: # Check if response_obj is valid and has candidates
                         feedback = getattr(response_obj, 'prompt_feedback', None)
                         block_reason = getattr(feedback, 'block_reason', 'Unknown')
                         print(f"--- ERROR: Google AI BLOCKED for JSON response. Reason: {block_reason}. ---")
                         api_error = ValueError(f"Google AI blocked: {block_reason}")
-                        raw_content = None
-                    elif hasattr(response_obj, 'text'):
+                        raw_content = None # Ensure raw_content is None if blocked
+
+                    elif response_obj and hasattr(response_obj, 'text'): # Check if response_obj is valid and has text attribute
                          raw_content = response_obj.text
                     else:
-                        # Handle cases where response_obj.text is missing but candidates exist
-                        print(f"--- WARNING: Google AI response has candidates but no text attribute. Response object: {response_obj} ---")
+                        # Handle cases where response_obj is not valid or text is missing but no block
+                        print(f"--- WARNING: Google AI response invalid or missing text attribute. Response object: {response_obj} ---")
                         raw_content = None # Treat as empty response
 
                 except Exception as e_google:
@@ -346,7 +352,7 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
                     if (json_str.startswith('{') and json_str.endswith('}')) or (json_str.startswith('[') and json_str.endswith(']')):
                          parsed_json = json.loads(json_str)
                     else:
-                         # If braces/brackets were found but don't form a valid JSON string,
+                         # If braces/brackets were found but don't form a valid JSON object string,
                          # try parsing the whole cleaned content as a fallback.
                          print(f"--- [{function_name}] WARNING: Found JSON delimiters, but string doesn't look like valid JSON. Attempting full cleaned content parse.")
                          try:
@@ -381,18 +387,24 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
              # Set a generic error if no API error occurred but content was empty
              if api_error is None:
                  api_error = ValueError("LLM returned None or empty content")
+             return None
 
         # Final check: ensure the parsed result is a dictionary as expected by most extraction functions
         if parsed_json is not None and isinstance(parsed_json, dict):
              # print(f"--- [{function_name}] Successfully Parsed JSON response. ---") # Suppress frequent log
              return parsed_json
+        # Allow list for certain expected JSON outputs (like relationship lists if schema changes)
+        # Wrap list in dict for consistent return type expectation (most functions expect dict)
+        elif parsed_json is not None and isinstance(parsed_json, list):
+             # print(f"--- [{function_name}] Successfully Parsed JSON response as list. ---") # Suppress frequent log
+             return {"items": parsed_json} # Returning a dict with 'items' key
         elif api_error is not None:
              # If an API error occurred, report it
              print(f"--- [{function_name}] ERROR: LLM call/parsing failed. Error: {type(api_error).__name__} ---")
              return None # Return None on error
         else:
-             # If parsed_json is not a dict (e.g., list, string, None after fallbacks) or some other issue
-             print(f"--- [{function_name}] ERROR: JSON obtained but not a dict, or unknown parsing issue. Parsed type: {type(parsed_json).__name__} ---")
+             # If parsed_json is not a dict/list (e.g., string, None after fallbacks) or some other issue
+             print(f"--- [{function_name}] ERROR: JSON obtained but not dict/list, or unknown parsing issue. Parsed type: {type(parsed_json).__name__} ---")
              # Optionally print the parsed content if not a dict for debugging
              # print(f"--- [{function_name}] Parsed content: {parsed_json} ---")
              return None # Return None if the final result isn't the expected format
@@ -401,6 +413,7 @@ async def _call_llm_and_parse_json(prompt: str, llm_provider: str, llm_model: st
         print(f"--- [{function_name}] ERROR during async LLM call/setup (outer catch): {type(e).__name__}: {e} ---")
         traceback.print_exc()
         return None
+
 
 # --- Keyword Generation ---
 # This function now uses the async _call_llm_and_get_text helper
@@ -441,8 +454,18 @@ IMPORTANT: Your entire response must contain ONLY the comma-separated list of ke
 
     keywords = [kw.strip() for kw in cleaned_content.split(',') if kw.strip()]
 
-    conversational_fillers = ["sorry", "apologize", "cannot", "unable", "provide", "based", "above", "snippets", "context", "hello", "hi", "greetings", "list of keywords"] # Added "list of keywords"
-    if not keywords or len(cleaned_content) < 10 or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers):
+    # FIX: Refined conversational filler check to be more specific and less prone to false positives
+    # Only filter out responses that *only* contain conversational text or look like empty/failure states
+    # Allow keywords that might contain common words if they are part of a valid phrase
+    conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "provide", "based on the text", "hello", "hi", "greetings"]
+    looks_conversational_only = cleaned_content.lower() in conversational_only_phrases or (len(keywords) <= 1 and any(word in cleaned_content.lower() for word in ["based on", "above", "snippets", "context", "text"]))
+
+    # Also check for obvious signs of failure if the response is short or doesn't contain expected characters
+    looks_like_failure = len(cleaned_content) < 10 # Very short response
+    # Add other checks if needed
+
+
+    if not keywords or looks_conversational_only or looks_like_failure:
          print(f"Warning: Keyword response conversational/empty/unhelpful ('{cleaned_content[:100]}...'). Returning original.")
          return [original_query]
 
@@ -511,8 +534,15 @@ IMPORTANT: Provide ONLY the translated text. Do NOT include any introductory phr
     cleaned_content = cleaned_content.strip()
 
 
-    conversational_fillers = ["sorry", "apologize", "cannot", "unable", "translate", "based on", "above", "text", "hello", "hi"]
-    if not cleaned_content or len(cleaned_content) < min(len(text) * 0.5, 20) or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers): # Check minimum length relative to original
+    # FIX: Refined conversational filler check for translation specifically
+    # Check if the entire response looks like only conversational fillers or is too short/empty
+    conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "translate", "based on the text", "hello", "hi", "greetings"]
+    # Check if the entire cleaned response (case-insensitive, stripped) is one of the filler phrases
+    is_pure_filler = cleaned_content.lower() in conversational_only_phrases
+    # Check if it's too short compared to the original text, allowing for very short valid translations
+    is_too_short = len(cleaned_content) < max(len(text) * 0.1, 10) # Allow very short translations, but filter if less than 10 chars or <10% of original
+
+    if not cleaned_content or is_pure_filler or is_too_short:
         print(f"Warning: Translation response short/empty/conversational: '{cleaned_content[:100]}...' for text '{text[:50]}...'.")
         return None
 
@@ -662,7 +692,8 @@ Response MUST be ONLY a single valid JSON object like {{"entities": [...]}}. Use
 Begin analysis of text snippets:
 {context_text}
 """
-    # Await the async LLM call helper
+    # No chunking needed here as we're sending the whole context at once to the LLM
+    # for initial entity extraction.
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_entities = []
@@ -672,8 +703,12 @@ Begin analysis of text snippets:
     # Add known broad non-Chinese organizations that might be misidentified as companies or regulators
     common_non_chinese_orgs_lower = {"oecd", "nato", "un", "world bank", "imf", "european union", "eu"}
 
-    if parsed_json is not None and isinstance(parsed_json.get("entities"), list):
-        for entity in parsed_json["entities"]:
+    # Ensure parsed_json is a dictionary and contains the 'entities' key which is a list
+    entities_list_from_llm = parsed_json.get("entities", []) if isinstance(parsed_json, dict) else []
+
+
+    if isinstance(entities_list_from_llm, list):
+        for entity in entities_list_from_llm:
              # Ensure the item is a dictionary before trying to access keys
              if not isinstance(entity, dict):
                   print(f"--- [{function_name}] Skipping invalid entity item (not a dictionary): {entity} ---")
@@ -703,7 +738,7 @@ Begin analysis of text snippets:
              else: print(f"--- [{function_name}] Skipping invalid or incomplete entity item (missing name/type/mentions or invalid types): {entity} ---")
     else:
          # Log if the expected 'entities' list was not found or was not a list
-         print(f"--- [{function_name}] Failed to parse valid 'entities' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
+         print(f"--- [{function_name}] Failed to parse valid 'entities' list from LLM response. Parsed content type: {type(parsed_json.get('entities')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
     print(f"--- [{function_name}] Returning {len(validated_entities)} validated entities ({', '.join(allowed_entity_types)} only). ---")
@@ -750,8 +785,11 @@ Begin analysis of text snippets:
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_risks = []
-    if parsed_json is not None and isinstance(parsed_json.get("risks"), list):
-        for risk in parsed_json["risks"]:
+    # Ensure parsed_json is a dictionary and contains the 'risks' key which is a list
+    risks_list_from_llm = parsed_json.get("risks", []) if isinstance(parsed_json, dict) else []
+
+    if isinstance(risks_list_from_llm, list):
+        for risk in risks_list_from_llm:
             # Ensure the item is a dictionary before checking keys
             if not isinstance(risk, dict):
                  print(f"--- [{function_name}] Skipping invalid risk item (not a dictionary): {risk} ---")
@@ -774,7 +812,7 @@ Begin analysis of text snippets:
             else: print(f"--- [{function_name}] Skipping invalid risk item (missing desc/urls or invalid types): {risk} ---")
     else:
          # Log if the expected 'risks' list was not found or was not a list
-         print(f"--- [{function_name}] Failed to parse valid 'risks' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
+         print(f"--- [{function_name}] Failed to parse valid 'risks' list from LLM response. Parsed content type: {type(parsed_json.get('risks')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
     print(f"--- [{function_name}] Returning {len(validated_risks)} validated risks (initially without related_entities). ---")
@@ -898,8 +936,10 @@ Your response MUST be ONLY a single valid JSON object with a single key "related
         # Max tokens for this call might be less than overall JSON calls, as it's just a list of names
         parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True, max_tokens=500) # Limited tokens
 
-        if parsed_json is not None and isinstance(parsed_json.get("related_entities"), list):
-             entity_list_from_llm = parsed_json["related_entities"]
+        # Ensure parsed_json is a dictionary and contains the 'related_entities' key which is a list
+        entity_list_from_llm = parsed_json.get("related_entities", []) if isinstance(parsed_json, dict) else []
+
+        if isinstance(entity_list_from_llm, list):
              # Validate that all items in the list are strings
              if all(isinstance(item, str) for item in entity_list_from_llm):
                  # Filter the list from LLM to only include names that were in the input list of potential entities
@@ -907,9 +947,9 @@ Your response MUST be ONLY a single valid JSON object with a single key "related
                  related_entity_names = [name.strip() for name in entity_list_from_llm if isinstance(name, str) and name.strip().lower() in input_names_lower]
                  # print(f"--- [{function_name}] Parsed and filtered related entities: {related_entity_names} ---") # Suppress frequent log
              else: print(f"--- [{function_name}] WARNING: 'related_entities' array contained non-string items: {entity_list_from_llm} ---")
-        elif parsed_json is not None:
-             print(f"--- [{function_name}] WARNING: LLM response JSON did not contain a valid 'related_entities' list (got type {type(parsed_json.get('related_entities')).__name__}). Full response: {parsed_json} ---")
-        else: print(f"--- [{function_name}] WARNING: LLM call or parsing failed for risk linking. ---")
+        else: # Log if the expected 'related_entities' list was not found or was not a list
+             print(f"--- [{function_name}] WARNING: LLM response JSON did not contain a valid 'related_entities' list (got type {type(parsed_json.get('related_entities')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}). Full response: {parsed_json} ---")
+
 
         risk_copy = risk.copy() # Work on a copy to avoid modifying the original list during concurrent processing
         risk_copy["related_entities"] = related_entity_names # Update the risk dictionary with the linked entities
@@ -988,8 +1028,12 @@ Begin analysis of text snippets:
     # Updated allowed relationship types for validation
     allowed_types_lower = {"subsidiary_of", "parent_company_of", "affiliate_of", "joint_venture_partner"}
 
-    if parsed_json is not None and isinstance(parsed_json.get("relationships"), list):
-        for rel in parsed_json["relationships"]:
+    # Ensure parsed_json is a dictionary and contains the 'relationships' key which is a list
+    relationships_list_from_llm = parsed_json.get("relationships", []) if isinstance(parsed_json, dict) else []
+
+
+    if isinstance(relationships_list_from_llm, list):
+        for rel in relationships_list_from_llm:
              # Ensure the item is a dictionary before checking keys
              if not isinstance(rel, dict):
                   print(f"--- [{function_name}] Skipping invalid relationship item (not a dictionary): {rel} ---")
@@ -1015,7 +1059,7 @@ Begin analysis of text snippets:
              else: print(f"--- [{function_name}] Skipping invalid or incomplete relationship item (doesn't match schema, not allowed type, or missing mandatory fields): {rel} ---")
     else:
          # Log if the expected 'relationships' list was not found or was not a list
-         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
+         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json.get('relationships')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
     print(f"--- [{function_name}] Returning {len(validated_relationships)} validated relationships (Ownership/Affiliate/JV only). ---")
@@ -1096,8 +1140,12 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
     # Define allowed types for this specific function's output
     allowed_types_lower = {"parent_company_of", "subsidiary_of", "affiliate_of", "acquired", "joint_venture_partner", "related_company"}
 
-    if parsed_json is not None and isinstance(parsed_json.get("relationships"), list):
-        for rel in parsed_json["relationships"]:
+    # Ensure parsed_json is a dictionary and contains the 'relationships' key which is a list
+    relationships_list_from_llm = parsed_json.get("relationships", []) if isinstance(parsed_json, dict) else []
+
+
+    if isinstance(relationships_list_from_llm, list):
+        for rel in relationships_list_from_llm:
              # Ensure the item is a dictionary before checking keys
              if not isinstance(rel, dict):
                   print(f"--- [{function_name}] Skipping invalid relationship item (not a dictionary): {rel} ---")
@@ -1123,7 +1171,7 @@ Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}
              else: print(f"--- [{function_name}] Skipping invalid or incomplete relationship item (doesn't match schema, not allowed type, or missing mandatory fields): {rel} ---")
     else:
          # Log if the expected 'relationships' list was not found or was not a list
-         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
+         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json.get('relationships')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
     print(f"--- [{function_name}] Returning {len(validated_relationships)} validated relationships involving '{target_entity_name}'. ---")
@@ -1193,19 +1241,20 @@ Relationship Types:
 
 Focus ONLY on relationships where BOTH entity1 and entity2 are from the provided list of identified entities.
 The relationship_type MUST be one of: REGULATED_BY, ISSUED_BY, SUBJECT_TO, or MENTIONED_WITH.
-Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. No explanations or markdown.
+Response MUST be ONLY a single valid JSON object like {{"relationships": [...]}}. Use empty array [] if no relationships found. Do not include any other text, explanation, or formatting."""
 
-Begin analysis of text snippets:
-{context_text}
-"""
     # Await the async LLM call helper
     parsed_json = await _call_llm_and_parse_json(prompt, llm_provider, llm_model, function_name, attempt_json_mode=True)
 
     validated_relationships = []
     allowed_types_lower = {"regulated_by", "issued_by", "subject_to", "mentioned_with"}
 
-    if parsed_json is not None and isinstance(parsed_json.get("relationships"), list):
-        for rel in parsed_json["relationships"]:
+    # Ensure parsed_json is a dictionary and contains the 'relationships' key which is a list
+    relationships_list_from_llm = parsed_json.get("relationships", []) if isinstance(parsed_json, dict) else []
+
+
+    if isinstance(relationships_list_from_llm, list):
+        for rel in relationships_list_from_llm:
              # Ensure the item is a dictionary before checking keys
              if not isinstance(rel, dict):
                   print(f"--- [{function_name}] Skipping invalid relationship item (not a dictionary): {rel} ---")
@@ -1263,7 +1312,7 @@ Begin analysis of text snippets:
              else: print(f"--- [{function_name}] Skipping invalid or incomplete relationship item (doesn't match schema, not allowed type, or missing mandatory fields): {rel} ---")
     else:
          # Log if the expected 'relationships' list was not found or was not a list
-         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json).__name__}. Content: {parsed_json} ---")
+         print(f"--- [{function_name}] Failed to parse valid 'relationships' list from LLM response. Parsed content type: {type(parsed_json.get('relationships')).__name__ if isinstance(parsed_json, dict) else type(parsed_json).__name__}. Content: {parsed_json} ---")
 
 
     print(f"--- [{function_name}] Returning {len(validated_relationships)} validated relationships (Regulatory/Sanction). ---")
@@ -1303,17 +1352,38 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
 
     for result_item in linkup_structured_results_list:
         # Expecting items like {"entity": "Entity Name", "schema": "schema_name", "data": {...}}
+        # Or the raw structured content dict itself from LinkupStructuredSearch
         if not isinstance(result_item, dict):
              print(f"Warning: Skipping invalid structured result item format (not a dict): {result_item}")
              continue
 
-        entity_name_context = result_item.get("entity") # The entity name the search was targeted for
-        schema_name = result_item.get("schema")       # The schema name (e.g., "ownership", "key_risks")
-        structured_data_content = result_item.get("data") # The actual structured data dictionary
+        entity_name_context = result_item.get("entity") # The entity name the search was targeted for (if using our wrapper format)
+        schema_name = result_item.get("schema")       # The schema name (e.g., "ownership", "key_risks") (if using our wrapper format)
+        structured_data_content = result_item.get("data") # The actual structured data dictionary (if using our wrapper format)
+
+        # Determine the actual data content and schema name based on the format received
+        if structured_data_content is not None and isinstance(structured_data_content, dict) and schema_name is not None and isinstance(schema_name, str):
+             # This looks like our wrapper format {"entity": ..., "schema": ..., "data": {...}}
+             pass # Use the extracted variables as they are
+        elif result_item.get("ownership_relationships") is not None or result_item.get("key_risks_identified") is not None or result_item.get("actions_found") is not None: # Added check for hypothetical types
+             # This looks like the raw structured content dict itself
+             structured_data_content = result_item # The data is the item itself
+             # Try to infer schema name from keys
+             if result_item.get("ownership_relationships") is not None: schema_name = "ownership"
+             elif result_item.get("key_risks_identified") is not None: schema_name = "key_risks"
+             elif result_item.get("actions_found") is not None: schema_name = "regulatory_actions" # Assuming this key for a hypothetical schema
+             else: schema_name = "unknown_structured" # Fallback
+             entity_name_context = result_item.get("company_name", result_item.get("regulator_name", "Unknown Entity")) # Try getting entity name from content
+
+        else:
+             print(f"Warning: Skipping invalid structured result item format (doesn't match known structured formats): {result_item}")
+             continue # Skip this item
+
 
         if not entity_name_context or not isinstance(entity_name_context, str) or not schema_name or not isinstance(schema_name, str) or not structured_data_content or not isinstance(structured_data_content, dict):
-            print(f"Warning: Skipping invalid structured result item format (missing keys or data not dict): {result_item}")
-            continue
+             print(f"Warning: Skipping structured result item after format check (missing crucial data: entity_name_context='{entity_name_context}', schema_name='{schema_name}', structured_data_content is dict? {isinstance(structured_data_content, dict)}): {result_item}")
+             continue
+
 
         print(f"--- [NLP Structured Processor] Processing structured data for query entity '{entity_name_context}' using schema '{schema_name}' ---")
 
@@ -1434,7 +1504,7 @@ def process_linkup_structured_data(linkup_structured_results_list: List[Dict[str
         #                       for affected_entity_name in affected_entities:
         #                            if affected_entity_name and isinstance(affected_entity_name, str):
         #                                 # Relationship: Company SUBJECT_TO Sanction
-        #                                 processed_relationships.append({"entity1": affected_entity_name.strip(), "relationship_type": "SUBJECT_TO", "entity2": reg_name.strip(), "context_urls": [source_url] if source_url and isinstance(source_url, str) else [], "_source_type": "linkup_structured"})
+        #                                 processed_relationships.append({"entity1": target_entity_name.strip(), "relationship_type": "SUBJECT_TO", "entity2": reg_name.strip(), "context_urls": [source_url] if source_url and isinstance(source_url, str) else [], "_source_type": "linkup_structured"})
         #                                 # Can also add a risk related to this entity and sanction
         #                                 # internal_risk = {
         #                                 #      "description": f"Subject to sanction: {sanc_name.strip()}",
@@ -1665,9 +1735,24 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
     if structured_raw_data_list:
          schema_counts = {}
          for item in structured_raw_data_list:
-              schema_name = item.get("schema", "unknown")
-              schema_counts[schema_name] = schema_counts.get(schema_name, 0) + 1
-         structured_summary = f"- Linkup Structured Data Found: {len(structured_raw_data_list)} results across {len(schema_counts)} schemas."
+              # Use the 'schema' key if present, fallback to inferring from 'data' content keys if item is raw content
+              schema_name_for_count = item.get("schema", "unknown")
+              if schema_name_for_count == "unknown" and isinstance(item.get("data"), dict): # If wrapper format and schema is missing
+                   data_content = item["data"]
+                   if data_content.get("ownership_relationships") is not None: schema_name_for_count = "ownership"
+                   elif data_content.get("key_risks_identified") is not None: schema_name_for_count = "key_risks"
+                   elif data_content.get("actions_found") is not None: schema_name_for_count = "regulatory_actions" # Assuming this key
+                   else: schema_name_for_count = "unknown_content"
+
+              elif schema_name_for_count == "unknown" and isinstance(item, dict): # If item is raw content dict
+                   if item.get("ownership_relationships") is not None: schema_name_for_count = "ownership"
+                   elif item.get("key_risks_identified") is not None: schema_name_for_count = "key_risks"
+                   elif item.get("actions_found") is not None: schema_name_for_count = "regulatory_actions"
+                   else: schema_name_for_count = "unknown_raw"
+
+
+              schema_counts[schema_name_for_count] = schema_counts.get(schema_name_for_count, 0) + 1
+         structured_summary = f"- Linkup Structured Data Found: {len(structured_raw_data_list)} items across {len(schema_counts)} schemas."
          if schema_counts:
               structured_summary += " Schemas: " + ", ".join([f"{name} ({count})" for name, count in schema_counts.items()])
          summary_parts.append(structured_summary)
@@ -1706,9 +1791,15 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
             cleaned_content = re.sub(r'\n```$', '', cleaned_content)
             cleaned_summary = cleaned_content.strip()
 
-            conversational_fillers = ["sorry", "apologize", "cannot", "unable", "provide", "based", "above", "text", "hello", "hi"]
-            if not cleaned_summary or len(cleaned_summary) < 50 or any(re.search(r'\b' + word + r'\b', cleaned_content.lower()) for word in conversational_fillers):
-                print("Warning: Summary short/empty/apologetic.");
+            # FIX: Use the refined conversational and short checks from translate_text
+            conversational_only_phrases = ["sorry", "apologize", "cannot", "unable", "provide", "based on the text", "hello", "hi", "greetings", "summary"] # Added summary
+            is_pure_filler = cleaned_content.lower() in conversational_only_phrases or (len(cleaned_content.split()) < 10 and any(word in cleaned_content.lower() for word in ["based on", "above", "snippets", "context", "text"])) # Check word count for short responses
+
+            is_too_short = len(cleaned_content) < 50 # Check minimum length for a summary
+
+
+            if not cleaned_summary or is_pure_filler or is_too_short:
+                print(f"Warning: Summary short/empty/apologetic: '{cleaned_summary[:100]}...'.");
                 return f"Could not generate a meaningful summary based on the extracted data."
         else:
              return f"Could not generate a meaningful summary based on the extracted data."
