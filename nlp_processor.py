@@ -1752,6 +1752,8 @@ async def generate_analysis_summary(results: Dict[str, Any], query: str, exposur
          exposure_summary = f"- Identified {exposures_count_filtered} potential High/Severe Risk Exposures linked to Chinese Companies/Orgs via Ownership/Affiliate/JV relationships." # Use filtered count in text
          if sample_exposures: exposure_summary += f" (Examples: {'; '.join(sample_exposures)})"
          summary_parts.append(exposure_summary)
+    else: # Explicitly state if no exposures were found
+        summary_parts.append("- Identified 0 potential High/Severe Risk Exposures.")
 
 
     if structured_raw_data_list:
@@ -1838,92 +1840,197 @@ Output ONLY the summary paragraph. Do not include headings, bullet points, or co
         return f"Could not generate summary due to error: {type(e).__name__}"
 
 if __name__ == "__main__":
-    # Main execution block needs to run the async orchestrator
-    async def main_test_run():
-        print("\n--- Running Local Orchestrator Tests ---")
-        print("NOTE: Requires LLM API keys and search API keys in .env.")
-        print("Ensure Neo4j is running if KG update is enabled.")
-        print("Ensure Google Sheets is configured if saving is enabled.")
+    # Main execution block needs to run an async test suite
+    async def main_nlp_test_run():
+        print("\n--- Running Local NLP Processor Tests ---")
+        print("NOTE: Requires LLM API keys configured in .env.")
 
-        test_query = "Corporate tax evasion cases in China 2023"
-        test_country = "cn"
-
+        # --- Test LLM Config ---
         test_llm_provider = "openai"
-        # Ensure config is loaded for default model
-        if config:
-            test_llm_model = config.DEFAULT_OPENAI_MODEL if hasattr(config, 'DEFAULT_OPENAI_MODEL') else "gpt-4o-mini"
-        else:
-            test_llm_model = "gpt-4o-mini"
+        test_llm_model = config.DEFAULT_OPENAI_MODEL if hasattr(config, 'DEFAULT_OPENAI_MODEL') else "gpt-4o-mini"
+        if not config.OPENAI_API_KEY and test_llm_provider == "openai":
+            print("WARNING: OpenAI API Key missing. Defaulting OpenRouter for tests if available.")
+            if config.OPENROUTER_API_KEY:
+                test_llm_provider = "openrouter"
+                test_llm_model = config.DEFAULT_OPENROUTER_MODEL if hasattr(config, 'DEFAULT_OPENROUTER_MODEL') else "qwen/qwen3-235b-a22b:free"
+            else:
+                print("ERROR: No OpenAI or OpenRouter API key found. Cannot run NLP tests that require LLM.")
+                return # Exit if no key for LLM tests
+
+        print(f"Using LLM for tests: {test_llm_provider} ({test_llm_model})")
 
 
-        print(f"\nRunning analysis for query: '{test_query}' in country: '{test_country}'")
-
-        try:
-            # Await the async run_analysis function
-            test_run_results = await run_analysis(
-                initial_query=test_query,
-                llm_provider=test_llm_provider,
-                llm_model=test_llm_model,
-                specific_country_code=test_country,
-                max_global_results=20,
-                max_specific_results=20
-            )
-
-            print("\n--- Test Run Results ---")
-            # Print results nicely, but avoid printing huge lists directly
-            printable_results = test_run_results.copy()
-            # FIX: These counts should now match the filtered data in final_extracted_data
-            # Use the counts already present in the results dict from Step 5Prep/main_api
-            # if 'linkup_structured_data' in printable_results: # Removed raw list from UI response
-            #      printable_results['linkup_structured_data_count'] = len(printable_results['linkup_structured_data'])
-            #      del printable_results['linkup_structured_data']
-            if 'wayback_results' in printable_results:
-                 # The UI receives the limited list, so len is correct
-                 printable_results['wayback_results_count'] = len(printable_results['wayback_results'])
-                 # Optionally truncate or remove details if the list is very long
-                 # printable_results['wayback_results_sample'] = printable_results['wayback_results'][:3]
-                 # del printable_results['wayback_results'] # Kept limited list in UI response
-            # FIX: final_extracted_data now contains filtered data in results dict sent to UI
-            if 'final_extracted_data' in printable_results:
-                 # Summarize counts from the filtered lists
-                 printable_results['final_extracted_data_counts'] = {
-                     k: len(v) for k, v in printable_results['final_extracted_data'].items()
-                 }
-                 # Optionally remove the full lists if they are large (UI now expects counts + exposures list)
-                 del printable_results['final_extracted_data']
-            # FIX: high_risk_exposures now contains the filtered list in results dict sent to UI
-            if 'high_risk_exposures' in printable_results:
-                 # UI receives the list, so len is correct
-                 printable_results['high_risk_exposures_count'] = len(printable_results['high_risk_exposures'])
-                 # The UI needs the list for the table, so don't delete the original list
-                 # del printable_results['high_risk_exposures'] # Removed deletion
+        # --- Test Keyword Generation ---
+        print("\n--- Testing Keyword Generation ---")
+        keywords = await translate_keywords_for_context(
+            "sanctions on Chinese tech companies",
+            "global news and regulatory filings",
+            test_llm_provider, test_llm_model
+        )
+        print(f"Generated Keywords: {keywords}")
+        assert isinstance(keywords, list) and len(keywords) > 0, "Keyword generation failed or returned empty list."
 
 
-            # Clean up steps data to show counts rather than full extracted_data lists
-            if 'steps' in printable_results:
-                 for step in printable_results['steps']:
-                      if isinstance(step, dict) and 'extracted_data' in step:
-                           # These counts should already be in 'extracted_data_counts' added in Step 5Prep
-                           if isinstance(step.get('extracted_data'), dict): # Check if it's a dict before accessing keys
-                                step['extracted_data_counts'] = {k: len(v) for k,v in step['extracted_data'].items()}
-                           del step['extracted_data']
+        # --- Test Translation ---
+        print("\n--- Testing Text Translation ---")
+        translated_text = await translate_text(
+            "你好世界", "en", test_llm_provider, test_llm_model
+        )
+        print(f"Translated '你好世界' to English: {translated_text}")
+        assert translated_text and "hello world" in translated_text.lower(), "Translation to English failed."
+
+        # --- Test Snippet Translation ---
+        print("\n--- Testing Snippet Translation ---")
+        sample_snippets_for_translation = [
+            {"url": "url1", "snippet": "这是一个测试片段。", "original_language": "zh"},
+            {"url": "url2", "snippet": "This is an English snippet.", "original_language": "en"},
+            {"url": "url3", "snippet": "你好，这是一个重要的公告。", "original_language": "zh"}
+        ]
+        translated_snippets_list = await translate_snippets(
+            sample_snippets_for_translation, "en", test_llm_provider, test_llm_model
+        )
+        print(f"Translated Snippets: {json.dumps(translated_snippets_list, indent=2, ensure_ascii=False)}")
+        assert len(translated_snippets_list) == 3, "Snippet translation did not return expected number of items."
+        for snip in translated_snippets_list:
+            if snip["original_language"] == "zh":
+                assert snip.get("translated_from") == "zh", f"Snippet {snip['url']} was not marked as translated_from zh."
+                assert "测试片段" not in snip["snippet"] or "公告" not in snip["snippet"], f"Chinese text still present in translated snippet {snip['url']}"
 
 
-            print(json.dumps(printable_results, indent=2))
+        # --- Test Entity Extraction ---
+        print("\n--- Testing Entity Extraction ---")
+        sample_search_results_entities = [
+            {"url": "url1", "title": "OFAC Sanctions Huawei", "snippet": "The Office of Foreign Assets Control (OFAC) has sanctioned Huawei Technologies Co., Ltd. for national security reasons."},
+            {"url": "url2", "title": "Apple Inc. quarterly report", "snippet": "Apple Inc. reported strong earnings. This is unrelated to China."},
+            {"url": "url3", "title": "China Regulator SAMR Fines Alibaba", "snippet": "China's State Administration for Market Regulation (SAMR) fined Alibaba Group Holding Ltd."}
+        ]
+        entities = await extract_entities_only(
+            sample_search_results_entities, "Focus on sanctions and regulatory actions.",
+            test_llm_provider, test_llm_model
+        )
+        print(f"Extracted Entities: {json.dumps(entities, indent=2)}")
+        assert any(e.get("name") == "Huawei Technologies Co., Ltd." and e.get("type") == "COMPANY" for e in entities), "Huawei not extracted as COMPANY."
+        assert any(e.get("name") == "OFAC" and e.get("type") == "REGULATORY_AGENCY" for e in entities), "OFAC not extracted as REGULATORY_AGENCY."
+        assert any(e.get("name") == "Alibaba Group Holding Ltd." and e.get("type") == "COMPANY" for e in entities), "Alibaba not extracted as COMPANY."
+        assert any(e.get("name") == "SAMR" and e.get("type") == "REGULATORY_AGENCY" for e in entities), "SAMR not extracted as REGULATORY_AGENCY."
 
-        except Exception as e:
-            print(f"\n--- Test Run Exception ---")
-            print(f"An exception occurred during the test run: {type(e).__name__}: {e}")
-            traceback.print_exc()
 
-        print("\n--- Local Orchestrator Tests Complete ---")
+        # --- Test Risk Extraction and Linking ---
+        print("\n--- Testing Risk Extraction and Linking ---")
+        sample_search_results_risks = [
+            {"url": "url_risk1", "title": "Huawei Faces Severe Sanctions", "snippet": "Huawei is facing severe sanctions from OFAC, impacting its global operations. This is a major compliance risk."},
+            {"url": "url_risk2", "title": "Alibaba Fined by SAMR", "snippet": "Alibaba was fined by SAMR for anti-monopoly violations. This financial risk is high."}
+        ]
+        # Assume entities were extracted correctly from a previous step or this step
+        entities_for_risk_linking = [
+            {"name": "Huawei", "type": "COMPANY"}, # Simplified for testing
+            {"name": "OFAC", "type": "REGULATORY_AGENCY"},
+            {"name": "Alibaba", "type": "COMPANY"},
+            {"name": "SAMR", "type": "REGULATORY_AGENCY"}
+        ]
+        entity_names_for_linking = [e["name"] for e in entities_for_risk_linking]
+
+        # Create a snippet map for the linking function
+        snippets_map_for_linking = {s["url"]: s for s in sample_search_results_risks}
+
+
+        risks_initial = await extract_risks_only(
+            sample_search_results_risks, "Focus on compliance and financial risks.",
+            test_llm_provider, test_llm_model
+        )
+        print(f"Extracted Risks (Initial): {json.dumps(risks_initial, indent=2)}")
+        assert len(risks_initial) > 0, "No risks extracted initially."
+
+        linked_risks = await link_entities_to_risk(
+            risks_initial, entity_names_for_linking, snippets_map_for_linking, test_llm_provider, test_llm_model
+        )
+        print(f"Linked Risks: {json.dumps(linked_risks, indent=2)}")
+        huawei_risk_found = False
+        alibaba_risk_found = False
+        for r in linked_risks:
+            if "huawei" in r.get("description","").lower() or any("Huawei" in e_name for e_name in r.get("related_entities",[])):
+                huawei_risk_found = True
+                assert "Huawei" in r.get("related_entities", []), "Huawei not linked to its risk."
+            if "alibaba" in r.get("description","").lower() or any("Alibaba" in e_name for e_name in r.get("related_entities",[])):
+                alibaba_risk_found = True
+                assert "Alibaba" in r.get("related_entities", []), "Alibaba not linked to its risk."
+        assert huawei_risk_found and alibaba_risk_found, "Expected risks for Huawei and Alibaba not found or not linked."
+
+
+        # --- Test Relationship Extraction ---
+        print("\n--- Testing Relationship Extraction (Ownership) ---")
+        sample_search_results_rels_owner = [
+            {"url": "url_rel1", "title": "Alibaba Owns Lazada", "snippet": "Alibaba Group Holding Ltd. is the parent company of Lazada Group."},
+            {"url": "url_rel2", "title": "Tencent and JD Affiliate", "snippet": "Tencent Holdings Ltd. and JD.com Inc. are close affiliates."}
+        ]
+        entities_for_rels_owner = [
+            {"name": "Alibaba Group Holding Ltd.", "type": "COMPANY"},
+            {"name": "Lazada Group", "type": "COMPANY"},
+            {"name": "Tencent Holdings Ltd.", "type": "COMPANY"},
+            {"name": "JD.com Inc.", "type": "COMPANY"}
+        ]
+        rels_owner = await extract_relationships_only(
+            sample_search_results_rels_owner, "Focus on ownership structures.",
+            entities_for_rels_owner, test_llm_provider, test_llm_model
+        )
+        print(f"Extracted Ownership Relationships: {json.dumps(rels_owner, indent=2)}")
+        assert any(r.get("entity1") == "Alibaba Group Holding Ltd." and r.get("entity2") == "Lazada Group" and r.get("relationship_type") == "PARENT_COMPANY_OF" for r in rels_owner) or \
+               any(r.get("entity2") == "Alibaba Group Holding Ltd." and r.get("entity1") == "Lazada Group" and r.get("relationship_type") == "SUBSIDIARY_OF" for r in rels_owner), \
+               "Alibaba-Lazada ownership relationship not extracted correctly."
+
+
+        print("\n--- Testing Relationship Extraction (Regulatory/Sanction) ---")
+        sample_search_results_rels_reg = [
+            {"url": "url_reg1", "title": "Huawei Sanctioned by OFAC", "snippet": "Huawei Technologies Co., Ltd. was placed on the Entity List by OFAC."},
+            {"url": "url_reg2", "title": "Alibaba under SAMR Scrutiny", "snippet": "Alibaba Group is regulated by China's SAMR."}
+        ]
+        entities_for_rels_reg = [
+            {"name": "Huawei Technologies Co., Ltd.", "type": "COMPANY"},
+            {"name": "OFAC", "type": "REGULATORY_AGENCY"},
+            {"name": "Entity List", "type": "SANCTION"}, # Assuming Entity List is identified as a SANCTION
+            {"name": "Alibaba Group", "type": "COMPANY"},
+            {"name": "SAMR", "type": "REGULATORY_AGENCY"}
+        ]
+        rels_reg = await extract_regulatory_sanction_relationships(
+             sample_search_results_rels_reg, "Focus on regulatory and sanction events.",
+             entities_for_rels_reg, test_llm_provider, test_llm_model
+        )
+        print(f"Extracted Regulatory/Sanction Relationships: {json.dumps(rels_reg, indent=2)}")
+        # Example assertion - refine based on expected output for SUBJECT_TO and REGULATED_BY
+        assert any("Huawei Technologies Co., Ltd." in [r.get("entity1"), r.get("entity2")] and \
+                   ("OFAC" in [r.get("entity1"), r.get("entity2")] or "Entity List" in [r.get("entity1"), r.get("entity2")]) and \
+                   r.get("relationship_type") in ["SUBJECT_TO", "MENTIONED_WITH"] for r in rels_reg), \
+                   "Huawei sanction/regulatory relationship not extracted correctly."
+
+
+        # --- Test Summary Generation ---
+        print("\n--- Testing Summary Generation ---")
+        mock_results_for_summary = {
+            "final_extracted_data": {
+                "entities": entities_for_rels_reg, # Use some entities
+                "risks": linked_risks,          # Use some risks
+                "relationships": rels_reg       # Use some relationships
+            },
+            "high_risk_exposures": [{"Entity": "Huawei Technologies Co., Ltd.", "Risk_Type": "Sanction", "Risk_Severity": "SEVERE"}], # Mock one exposure
+            "linkup_structured_data": [{"schema": "ownership", "data": {"company_name": "TestCo"}}],
+            "kg_update_status": "success"
+        }
+        summary = await generate_analysis_summary(
+            mock_results_for_summary, "Test query for summary", 1,
+            test_llm_provider, test_llm_model
+        )
+        print(f"Generated Summary: {summary}")
+        assert summary and "Could not generate" not in summary and "No significant" not in summary and len(summary) > 50, "Summary generation failed or too short."
+
+
+        print("\n--- Local NLP Processor Tests Complete ---")
 
     # Run the async main test function
     try:
-        asyncio.run(main_test_run())
+        asyncio.run(main_nlp_test_run())
     except KeyboardInterrupt:
-        print("\nOrchestrator test run interrupted.")
+        print("\nNLP Processor test run interrupted.")
     except Exception as e:
-        print(f"\n--- Critical Orchestrator Test Failure ---")
+        print(f"\n--- Critical NLP Processor Test Failure ---")
         print(f"An unhandled exception occurred during the main async test run: {type(e).__name__}: {e}")
         traceback.print_exc()
